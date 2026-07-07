@@ -1,0 +1,56 @@
+# Log Source Inventory — documents all log sources, their collection method,
+# volume estimates, retention requirements, and reliability tier.
+#
+# This inventory is loaded by the pipeline health monitor and displayed
+# on the dashboard for operational awareness.
+
+sources:
+  - name: "wazuh-manager"
+    type: "wazuh_agent"
+    description: "Wazuh manager self-monitoring"
+    collection_method: "agent"
+    volume_eps_estimate: 5
+    retention_days: 90
+    reliability: "critical"
+    parser: "wazuh-decoder"
+    notes: "Manager node — alerts about agent status, rule changes"
+
+  - name: "linux-servers"
+    type: "wazuh_agent"
+    description: "Linux server endpoints with Wazuh agents"
+    collection_method: "agent"
+    volume_eps_estimate: 20
+    retention_days: 90
+    reliability: "critical"
+    parser: "syslog/auditd"
+    notes: "Syslog, auditd, syscheck (FIM), vulnerability detector"
+
+  - name: "windows-endpoints"
+    type: "wazuh_agent"
+    description: "Windows endpoints with Wazuh agents"
+    collection_method: "agent"
+    volume_eps_estimate: 30
+    retention_days: 90
+    reliability: "critical"
+    parser: "windows-eventlog"
+    notes: "Security/Sysmon event logs, PowerShell script block logging"
+
+  - name: "network-devices"
+    type: "syslog"
+    description: "Firewalls, switches, routers via syslog"
+    collection_method: "syslog_tcp"
+    volume_eps_estimate: 50
+    retention_days: 30
+    reliability: "standard"
+    parser: "custom-decoder"
+    notes: "Firewall permit/deny, NAT translations"
+
+  - name: "cloud-trail"
+    type: "cloud_api"
+    description: "AWS CloudTrail management events"
+    collection_method: "api_pull"
+    volume_eps_estimate: 10
+    retention_days: 365
+    reliability: "critical"
+    parser: "aws-cloudtrail"
+    notes: "IAM, S3, EC2 management events via Wazuh AWS module"

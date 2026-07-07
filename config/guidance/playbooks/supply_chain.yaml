@@ -1,0 +1,69 @@
+name: "Supply Chain Compromise Investigation"
+trigger_rule_groups: ["syscheck", "rootcheck", "fim"]
+trigger_rule_ids: []
+
+investigation_steps:
+  - step: 1
+    name: "Identify the compromised component"
+    query_template: |
+      Review the triggering alert for file integrity changes, package
+      modifications, or unexpected binary execution. Check syscheck alerts.
+    assess: |
+      - What software component or package triggered the alert?
+      - Is this a known vendor update or unexpected modification?
+      - Does the file hash match known-good or known-bad indicators?
+
+  - step: 2
+    name: "Verify package integrity"
+    query_template: |
+      Check package manager logs (apt, yum, npm, pip) for recent installs
+      or updates. Verify package signatures and checksums against official repos.
+    assess: |
+      - Was the package installed from an official repository?
+      - Does the package version match expected/approved versions?
+      - Are there any unsigned or modified packages?
+
+  - step: 3
+    name: "Check for malicious behavior"
+    query_template: |
+      Review process execution logs from the compromised host. Look for
+      unexpected network connections, file drops, or privilege escalation
+      originating from the suspicious package or binary.
+    assess: |
+      - Is the compromised component making unexpected network connections?
+      - Has it dropped additional files or created new processes?
+      - Is there evidence of credential harvesting or data collection?
+
+  - step: 4
+    name: "Assess blast radius"
+    query_template: |
+      Identify all hosts with the same package/component installed.
+      Check if the same indicators appear on other systems.
+    assess: |
+      - How many systems have the compromised component?
+      - Are other systems showing similar suspicious behavior?
+      - Is the build/CI pipeline affected (developer machine compromise)?
+
+verdict_criteria:
+  true_positive:
+    - Package hash does not match official repository
+    - Compromised component executing malicious code
+    - Vendor advisory confirms supply chain compromise
+  false_positive:
+    - Legitimate package update with new hash
+    - Developer build artifact triggering FIM alerts
+    - Approved custom-compiled package
+  needs_investigation:
+    - New package version not yet in baseline but from official repo
+    - Component behavior change coinciding with legitimate update
+
+recommended_actions:
+  if_true_positive:
+    - Isolate all affected hosts immediately
+    - Roll back to last known-good version of the component
+    - Block all IOCs associated with the compromise
+    - Audit CI/CD pipeline for compromise
+    - Notify vendor and affected downstream users
+  if_false_positive:
+    - Update baseline hashes for legitimate package updates
+    - Document approved custom packages

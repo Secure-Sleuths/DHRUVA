@@ -1,0 +1,105 @@
+# =============================================================================
+# Investigation Playbook: Privilege Escalation & Account Manipulation
+# Rule Groups: account_management, sudo, audit, win_security
+# MITRE: T1098, T1078, T1548, T1134
+# =============================================================================
+
+name: "Privilege Escalation Investigation"
+trigger_rule_groups:
+  - "account_management"
+  - "sudo"
+  - "audit"
+  - "win_security"
+  - "pam"
+
+trigger_rule_ids:
+  - 5401   # sudo: user NOT in sudoers
+  - 5402   # sudo: failed attempt
+  - 5403   # sudo: successful execution
+  - 5551   # Integrity checksum for /etc/passwd changed
+  - 18120  # Windows security group changed
+  - 18145  # Windows privilege escalation
+
+investigation_steps:
+  - step: 1
+    name: "Identify the actor and target"
+    query_template: |
+      SELECT srcuser, dstuser, agent_name, rule_description,
+             data_command, data_extra, rule_level,
+             COUNT(*) as event_count,
+             MIN(timestamp) as first_seen, MAX(timestamp) as last_seen
+      FROM {enriched_alerts_index}
+      WHERE agent_id = '{alert_agent_id}'
+        AND rule_group IN ('account_management', 'sudo', 'audit')
+        AND timestamp >= NOW() - INTERVAL 24 HOURS
+      GROUP BY srcuser, dstuser, agent_name, rule_description, data_command, data_extra, rule_level
+      ORDER BY last_seen DESC
+    assess: |
+      - Who initiated the privilege change?
+      - What account or group was modified?
+      - Was this a sudo attempt, group change, or account creation?
+      - Is the initiator authorized for this action?
+
+  - step: 2
+    name: "Verify authorization context"
+    actions:
+      - "Check if user has change management ticket for this action"
+      - "Verify user's role permits this type of change"
+      - "Check if this aligns with maintenance window"
+    assess: |
+      - Is there a corresponding change request or deployment?
+      - Does the user's role authorize this type of modification?
+      - Is this happening during an approved maintenance window?
+
+  - step: 3
+    name: "Check preceding activity"
+    query_template: |
+      SELECT timestamp, rule_description, rule_group, srcip,
+             srcuser, data_command, agent_name
+      FROM {enriched_alerts_index}
+      WHERE (srcuser = '{alert_user}' OR agent_id = '{alert_agent_id}')
+        AND timestamp BETWEEN '{alert_timestamp}' - INTERVAL 2 HOURS
+            AND '{alert_timestamp}'
+      ORDER BY timestamp ASC
+    assess: |
+      - How did the user gain initial access?
+      - Were there authentication anomalies before this event?
+      - Any suspicious file modifications or process executions?
+      - Signs of compromised credentials being used?
+
+  - step: 4
+    name: "Check subsequent activity with elevated privileges"
+    query_template: |
+      SELECT timestamp, rule_description, rule_group, data_command,
+             data_file, dstip, agent_name
+      FROM {enriched_alerts_index}
+      WHERE (srcuser = '{alert_user}' OR srcuser = '{elevated_user}')
+        AND agent_id = '{alert_agent_id}'
+        AND timestamp BETWEEN '{alert_timestamp}'
+            AND '{alert_timestamp}' + INTERVAL 4 HOURS
+      ORDER BY timestamp ASC
+    assess: |
+      - What did the user do after gaining elevated privileges?
+      - Any data access, configuration changes, or network connections?
+      - Any additional privilege escalation attempts?
+      - Signs of credential harvesting (mimikatz, shadow copy, etc.)?
+
+verdict_criteria:
+  true_positive:
+    - "Unauthorized user adding themselves to admin group"
+    - "Privilege escalation following compromised credential use"
+    - "New service account created outside change management"
+    - "sudo to root followed by credential harvesting tools"
+    
+  false_positive:
+    - "IT admin performing authorized account management"
+    - "Automated provisioning system creating accounts"
+    - "Scheduled sudo operations for backup/maintenance"
+    
+recommended_actions:
+  if_true_positive:
+    - "Immediately revoke the unauthorized privileges"
+    - "Lock the compromised account"
+    - "Audit all actions taken with elevated privileges"
+    - "Check for persistence mechanisms installed"
+    - "Escalate to client with full timeline"

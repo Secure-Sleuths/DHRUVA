@@ -1,0 +1,105 @@
+# Containment Authority Matrix  —  AUTHORIZATION GUIDANCE ONLY
+#
+# ⚠️ ENFORCEMENT LIVES IN CODE, NOT HERE.
+# This file is NOT loaded by the guidance loader (src/guidance/loader.py loads
+# risk_criteria.yaml, escalation_logic.yaml and playbooks/ only). It documents the
+# INTENDED manual-authorization tier per action; it does not enable anything.
+#
+# Actual runtime enforcement:
+#   • Manual active response — RBAC-gated in src/api/routes/response.py
+#     (propose → approve lifecycle; block_ip fail-closed on internal/allowlisted IPs).
+#   • AUTO active response — src/soar/auto_block_gate.py is the sole auto path and
+#     hard-codes `block_ip` as the ONLY auto-executable action. It is OFF by default
+#     (auto_enabled must be explicitly true), requires a dual gate (true-positive
+#     verdict + exact-IP TI hit above floors), is rate-capped (→ queue for human),
+#     TTL-bounded, and fully audited. NO other action can auto-fire, on any tier.
+#
+# Therefore every `auto_allowed` below is `false`. block_ip carries an `auto_eligible`
+# note meaning "may auto-fire ONLY via the auto_block_gate dual gate when an operator
+# has explicitly enabled auto-containment" — never automatically by default.
+# Per standing policy (CLAUDE.md): active response is human-approved by default.
+
+authority_matrix:
+  block_ip:
+    tier_1_critical:
+      requires: "senior_analyst"
+      auto_allowed: false        # never auto — critical assets are human-only
+    tier_2_important:
+      requires: "analyst"
+      auto_allowed: false
+    tier_3_standard:
+      requires: "analyst"
+      auto_allowed: false        # auto_eligible via auto_block_gate ONLY (dual-gate + enabled)
+    tier_4_low:
+      requires: "analyst"
+      auto_allowed: false        # auto_eligible via auto_block_gate ONLY (dual-gate + enabled)
+
+  isolate_host:                  # human-only — NOT auto-executable in code
+    tier_1_critical:
+      requires: "admin"
+      auto_allowed: false
+    tier_2_important:
+      requires: "senior_analyst"
+      auto_allowed: false
+    tier_3_standard:
+      requires: "analyst"
+      auto_allowed: false
+    tier_4_low:
+      requires: "analyst"
+      auto_allowed: false
+
+  disable_user:                  # human-only — NOT auto-executable in code
+    tier_1_critical:
+      requires: "admin"
+      auto_allowed: false
+    tier_2_important:
+      requires: "senior_analyst"
+      auto_allowed: false
+    tier_3_standard:
+      requires: "senior_analyst"
+      auto_allowed: false
+    tier_4_low:
+      requires: "analyst"
+      auto_allowed: false
+
+  kill_process:                  # human-only — NOT auto-executable in code
+    tier_1_critical:
+      requires: "admin"
+      auto_allowed: false
+    tier_2_important:
+      requires: "senior_analyst"
+      auto_allowed: false
+    tier_3_standard:
+      requires: "analyst"
+      auto_allowed: false
+    tier_4_low:
+      requires: "analyst"
+      auto_allowed: false
+
+  quarantine_file:               # human-only — NOT auto-executable in code
+    tier_1_critical:
+      requires: "senior_analyst"
+      auto_allowed: false
+    tier_2_important:
+      requires: "analyst"
+      auto_allowed: false
+    tier_3_standard:
+      requires: "analyst"
+      auto_allowed: false
+    tier_4_low:
+      requires: "analyst"
+      auto_allowed: false
+
+  restart_agent:                 # human-only — NOT auto-executable in code
+    tier_1_critical:
+      requires: "admin"
+      auto_allowed: false
+    tier_2_important:
+      requires: "senior_analyst"
+      auto_allowed: false
+    tier_3_standard:
+      requires: "analyst"
+      auto_allowed: false
+    tier_4_low:
+      requires: "analyst"
+      auto_allowed: false

@@ -1,0 +1,41 @@
+[Unit]
+Description=SecureSleuths DHRUVA
+Documentation=https://github.com/securesleuths/ai-soc-platform
+After=network.target opensearch.service wazuh-manager.service
+Wants=opensearch.service wazuh-manager.service
+
+[Service]
+Type=simple
+User=aisoc
+Group=aisoc
+WorkingDirectory=/opt/ai-soc-platform
+Environment=PYTHONPATH=/opt/ai-soc-platform
+EnvironmentFile=/opt/ai-soc-platform/.env
+
+ExecStart=/opt/ai-soc-platform/venv/bin/python main.py config/config.yaml
+ExecStop=/bin/kill -SIGTERM $MAINPID
+
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/ai-soc /opt/ai-soc-platform/logs
+PrivateTmp=yes
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ai-soc
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target

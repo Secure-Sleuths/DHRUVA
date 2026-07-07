@@ -1,0 +1,311 @@
+"""
+LLM Backend - Unified interface for calling language models.
+
+Supports multiple providers:
+  - Anthropic (Claude) — API and CLI modes
+  - OpenAI (GPT-4o, etc.) — standard and Azure endpoints
+  - Ollama — local models via REST API
+  - Groq — fast cloud inference
+
+The rest of the platform doesn't care which provider is active.
+It just calls: backend.call(system_prompt, user_message) → dict
+
+Backward compatible: ``ClaudeBackend`` is an alias for ``LLMBackend``.
+"""
+
+import json
+import time
+import structlog
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+from src.agents.llm_providers.base import BaseLLMProvider
+
+logger = structlog.get_logger(__name__)
+
+# Provider registry — maps config name to class
+PROVIDER_REGISTRY = {}
+
+
+def _load_providers():
+    """Lazily load provider classes to avoid import errors for missing SDKs."""
+    global PROVIDER_REGISTRY
+    if PROVIDER_REGISTRY:
+        return
+    from src.agents.llm_providers.anthropic_provider import AnthropicProvider
+    from src.agents.llm_providers.openai_provider import OpenAIProvider
+    from src.agents.llm_providers.ollama_provider import OllamaProvider
+    from src.agents.llm_providers.groq_provider import GroqProvider
+    PROVIDER_REGISTRY.update({
+        "anthropic": AnthropicProvider,
+        "openai": OpenAIProvider,
+        "ollama": OllamaProvider,
+        "groq": GroqProvider,
+    })
+
+
+class LLMBackend:
+    """
+    Unified LLM interface with provider abstraction.
+
+    Config structure (new):
+      llm:
+        provider: "anthropic"    # "anthropic", "openai", "ollama", "groq"
+        model: "..."
+        max_tokens: 4096
+        temperature: 0.1
+        rate_limit:
+          cooldown_seconds: 5
+        anthropic:
+          mode: "auto"
+          api_key: "..."
+        openai:
+          api_key: "..."
+          model: "gpt-4o"
+        ollama:
+          base_url: "http://localhost:11434"
+          model: "llama3.1:70b"
+        groq:
+          api_key: "..."
+          model: "llama-3.1-70b-versatile"
+
+    Backward-compatible with old ``claude:`` config section.
+    """
+
+    def __init__(self, config: dict, db=None):
+        _load_providers()
+        self._usage_db = db
+
+        # Support both new 'llm:' and old 'claude:' config
+        llm_cfg = config.get("llm") or config.get("claude", {})
+        provider_name = llm_cfg.get("provider", "")
+
+        # Backward compat: if using old 'claude:' section, default to anthropic
+        if not provider_name:
+            if "claude" in config and "llm" not in config:
+                provider_name = "anthropic"
+            else:
+                provider_name = "anthropic"
+
+        # Global settings (can be overridden per-provider)
+        self.model = llm_cfg.get("model", "")
+        self.max_tokens = llm_cfg.get("max_tokens", 4096)
+        self.temperature = llm_cfg.get("temperature", 0.1)
+
+        # Rate limiting
+        rate_cfg = llm_cfg.get("rate_limit", {})
+        self.cooldown_seconds = rate_cfg.get("cooldown_seconds", 5)
+        self._last_call_time = 0
+
+        # Build provider config: merge global settings + provider-specific
+        provider_cfg = llm_cfg.get(provider_name, {})
+        merged_cfg = {
+            "model": provider_cfg.get("model") or self.model,
+            "max_tokens": provider_cfg.get("max_tokens") or self.max_tokens,
+            "temperature": provider_cfg.get("temperature", self.temperature),
+            **provider_cfg,
+        }
+
+        # Backward compat: old claude config has api_key at top level
+        if provider_name == "anthropic" and "api_key" not in merged_cfg:
+            merged_cfg["api_key"] = llm_cfg.get("api_key", "")
+        if provider_name == "anthropic" and "mode" not in merged_cfg:
+            merged_cfg["mode"] = llm_cfg.get("mode", "auto")
+        if provider_name == "anthropic" and "cli_path" not in merged_cfg:
+            merged_cfg["cli_path"] = llm_cfg.get("cli_path", "claude")
+
+        # Instantiate provider
+        cls = PROVIDER_REGISTRY.get(provider_name)
+        if not cls:
+            raise ValueError(
+                f"Unknown LLM provider: '{provider_name}'. "
+                f"Available: {list(PROVIDER_REGISTRY.keys())}")
+
+        self.provider: BaseLLMProvider = cls(merged_cfg)
+        self.mode = provider_name  # For backward compat with code checking .mode
+
+        logger.info("llm_backend_ready",
+                    provider=provider_name,
+                    model=self.provider.model)
+
+    def _rate_limit(self):
+        """Enforce cooldown between calls."""
+        elapsed = time.time() - self._last_call_time
+        if elapsed < self.cooldown_seconds:
+            time.sleep(self.cooldown_seconds - elapsed)
+        self._last_call_time = time.time()
+
+    def _track(self, request_type, input_len, output_len, latency,
+               success, error_type=None):
+        """Record usage metrics if DB is available."""
+        if not self._usage_db:
+            return
+        try:
+            from src.agents.llm_providers.multi_provider import ProviderUsageTracker
+            from src.database.store import _tenant_ctx
+            tid = _tenant_ctx.get() or "default"
+            tracker = ProviderUsageTracker(tid, self._usage_db)
+            tracker.track_usage(
+                provider=self.mode, model=self.provider.model,
+                request_type=request_type,
+                input_length=input_len, output_length=output_len,
+                latency=latency, success=success, error_type=error_type)
+        except Exception as e:
+            logger.debug("usage_track_failed", error=str(e))
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=30),
+           before_sleep=lambda rs: logger.warning(
+               "llm_call_retry",
+               attempt=rs.attempt_number,
+               error=str(rs.outcome.exception()) if rs.outcome else "unknown"))
+    def call(self, system_prompt: str, user_message: str,
+             request_type: str = "triage") -> dict:
+        """
+        Call the LLM and return parsed JSON response.
+        Works identically regardless of which provider is active.
+        request_type accepted for compatibility with MultiProviderLLMBackend.
+        """
+        self._rate_limit()
+        input_len = len(system_prompt) + len(user_message)
+        t0 = time.time()
+        try:
+            raw_text = self.provider.call_text(system_prompt, user_message)
+            self._track(request_type, input_len, len(raw_text),
+                        time.time() - t0, True)
+            return self._parse_json_response(raw_text)
+        except Exception as e:
+            self._track(request_type, input_len, 0,
+                        time.time() - t0, False, type(e).__name__)
+            raise
+
+    def call_raw(self, system_prompt: str, user_message: str,
+                 request_type: str = "raw") -> str:
+        """Call the LLM and return raw text (no JSON parsing)."""
+        self._rate_limit()
+        input_len = len(system_prompt) + len(user_message)
+        t0 = time.time()
+        try:
+            raw_text = self.provider.call_text(system_prompt, user_message)
+            self._track(request_type, input_len, len(raw_text),
+                        time.time() - t0, True)
+            return raw_text
+        except Exception as e:
+            self._track(request_type, input_len, 0,
+                        time.time() - t0, False, type(e).__name__)
+            raise
+
+    def get_info(self) -> dict:
+        """Return backend info for admin/health display."""
+        return self.provider.get_info()
+
+    # ─── Response Parsing (shared across all providers) ──────────────
+
+    def _parse_json_response(self, raw_text: str) -> dict:
+        """Parse JSON from LLM response, handling markdown fences."""
+        json_text = raw_text.strip()
+
+        # Strip markdown code fences
+        if json_text.startswith("```"):
+            json_text = json_text.split("\n", 1)[1] if "\n" in json_text else json_text[3:]
+        if json_text.endswith("```"):
+            json_text = json_text[:-3]
+        json_text = json_text.strip()
+
+        try:
+            return json.loads(json_text)
+        except json.JSONDecodeError as e:
+            logger.warning("json_parse_first_attempt_failed", error=str(e))
+
+            extracted = self._extract_json_object(raw_text)
+            if extracted is not None:
+                return extracted
+
+            extracted = self._extract_json_array(raw_text)
+            if extracted is not None:
+                return extracted
+
+            stripped = raw_text.rstrip()
+            looks_truncated = (
+                len(stripped) > 0
+                and stripped[-1] not in ('}', ']', '"')
+            )
+            logger.error("json_parse_all_attempts_failed",
+                         raw_length=len(raw_text),
+                         raw_preview=raw_text[:500],
+                         raw_tail=raw_text[-200:] if raw_text else "",
+                         looks_truncated=looks_truncated,
+                         hint=("response likely hit max_tokens — increase "
+                               "llm.max_tokens in config")
+                              if looks_truncated else "")
+            raise ValueError(
+                f"Could not parse JSON from LLM response (len={len(raw_text)}, "
+                f"truncated={looks_truncated}): {raw_text[:200]}")
+
+    @staticmethod
+    def _extract_json_object(text: str):
+        """Extract the first complete JSON object using balanced brace counting."""
+        start = text.find('{')
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if escape:
+                escape = False
+                continue
+            if c == '\\' and in_string:
+                escape = True
+                continue
+            if c == '"' and not escape:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        return None
+        return None
+
+    @staticmethod
+    def _extract_json_array(text: str):
+        """Extract the first complete JSON array using balanced bracket counting."""
+        start = text.find('[')
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if escape:
+                escape = False
+                continue
+            if c == '\\' and in_string:
+                escape = True
+                continue
+            if c == '"' and not escape:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == '[':
+                depth += 1
+            elif c == ']':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        return None
+        return None
+
+
+# Backward-compatible alias
+ClaudeBackend = LLMBackend

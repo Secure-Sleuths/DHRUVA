@@ -1,0 +1,68 @@
+name: "Cloud Infrastructure Compromise Investigation"
+trigger_rule_groups: ["aws", "azure", "gcp", "cloud"]
+trigger_rule_ids: []
+
+investigation_steps:
+  - step: 1
+    name: "Identify compromised identity and entry point"
+    query_template: |
+      Review CloudTrail/Activity Log for the compromised IAM user or role.
+      Check sign-in logs for unusual source IPs, user agents, or geolocations.
+    assess: |
+      - Which IAM identity was compromised (user, role, service account)?
+      - What was the initial access vector (stolen key, phishing, misconfigured role)?
+      - Is the attacker IP known to threat intelligence?
+
+  - step: 2
+    name: "Audit resource creation and modification"
+    query_template: |
+      Search for resource creation events (EC2, Lambda, S3 buckets, IAM roles)
+      by the compromised identity in the last 48 hours.
+    assess: |
+      - Were new compute resources created (crypto mining indicators)?
+      - Were IAM policies modified to grant persistent access?
+      - Were new API keys or access keys generated?
+
+  - step: 3
+    name: "Check for data access and exfiltration"
+    query_template: |
+      Review S3/Blob data access events, database query logs,
+      and data transfer events for the compromised identity.
+    assess: |
+      - Was sensitive data accessed (S3 GetObject, database queries)?
+      - Were data transfer services used (S3 sync, AzCopy)?
+      - Is there evidence of data staging or exfiltration?
+
+  - step: 4
+    name: "Assess lateral movement and persistence"
+    query_template: |
+      Check for AssumeRole events, cross-account access, new trust
+      policies, modified security groups, or new VPC peering connections.
+    assess: |
+      - Did the attacker move to other AWS accounts or subscriptions?
+      - Were persistence mechanisms established (new IAM user, backdoor role)?
+      - Were security controls weakened (CloudTrail disabled, GuardDuty suppressed)?
+
+verdict_criteria:
+  true_positive:
+    - Unauthorized IAM activity from unknown IP/geolocation
+    - Resource creation inconsistent with normal operations
+    - Evidence of data access or exfiltration from compromised identity
+  false_positive:
+    - Known DevOps automation or CI/CD pipeline activity
+    - Authorized penetration testing or red team exercise
+    - New employee/contractor legitimate setup activity
+  needs_investigation:
+    - Unusual but potentially legitimate cross-region activity
+    - API calls from new IP but within corporate CIDR range
+
+recommended_actions:
+  if_true_positive:
+    - Rotate all access keys and session tokens for compromised identity
+    - Review and revoke any IAM changes made during compromise window
+    - Terminate unauthorized compute resources
+    - Enable CloudTrail if disabled, review GuardDuty findings
+    - Assess data exposure scope for breach notification
+  if_false_positive:
+    - Whitelist legitimate automation source IPs
+    - Document expected cross-region/cross-account patterns

@@ -1,0 +1,134 @@
+# =============================================================================
+# Escalation Logic - SecureSleuths DHRUVA
+# Defines when agents escalate vs auto-resolve
+# =============================================================================
+
+auto_close_conditions:
+  # ALL conditions in a group must be true for auto-close
+  - name: "Known scanner noise"
+    conditions:
+      - field: "src_ip"
+        match: "known_scanner_list"
+      - field: "rule_level"
+        operator: "<="
+        value: 6
+      - field: "mitre_tactic"
+        not_in: ["credential-access", "lateral-movement", "exfiltration"]
+    confidence_floor: 0.85
+    
+  - name: "Maintenance window activity"
+    conditions:
+      - field: "time_context"
+        match: "maintenance_window"
+      - field: "agent_name"
+        match: "known_ci_cd_agents"
+      - field: "rule_group"
+        in: ["syscheck", "vulnerability-detector"]
+    confidence_floor: 0.90
+    
+  - name: "Repeated benign pattern"
+    conditions:
+      - field: "historical_fp_rate"
+        operator: ">="
+        value: 0.85
+      - field: "rule_level"
+        operator: "<="
+        value: 8
+      - field: "same_rule_closed_benign_last_7d"
+        operator: ">="
+        value: 5
+    confidence_floor: 0.88
+
+  - name: "Development environment noise"
+    conditions:
+      - field: "asset_tier"
+        in: ["tier_4_low"]
+      - field: "rule_level"
+        operator: "<="
+        value: 9
+      - field: "mitre_tactic"
+        not_in: ["exfiltration", "impact"]
+    confidence_floor: 0.85
+
+always_escalate:
+  # ANY of these conditions triggers immediate human escalation
+  - name: "Critical asset credential access"
+    conditions:
+      - field: "asset_tier"
+        in: ["tier_1_critical"]
+      - field: "mitre_tactic"
+        in: ["credential-access"]
+        
+  - name: "Data exfiltration indicators"
+    conditions:
+      - field: "mitre_tactic"
+        in: ["exfiltration"]
+      - field: "data_volume_anomaly"
+        value: true
+        
+  - name: "Ransomware indicators"
+    conditions:
+      - field: "mitre_technique"
+        in: ["T1486", "T1490"]  # Data Encrypted for Impact, Inhibit System Recovery
+        
+  - name: "Multiple failed auth then success"
+    conditions:
+      - field: "rule_group"
+        in: ["authentication_failures"]
+      - field: "followed_by_success"
+        value: true
+      - field: "unique_source_count"
+        operator: ">="
+        value: 3
+        
+  - name: "New admin account creation"
+    conditions:
+      - field: "rule_group"
+        in: ["account_management"]
+      - field: "action"
+        in: ["create_admin", "privilege_escalation"]
+      - field: "time_context"
+        match: "outside_business_hours"
+
+  - name: "High severity on any tier-1 asset"
+    conditions:
+      - field: "asset_tier"
+        in: ["tier_1_critical"]
+      - field: "rule_level"
+        operator: ">="
+        value: 10
+
+notification_channels:
+  critical:
+    - type: "telegram"
+      bot: "soc_alerts_bot"
+      chat_id: "${TELEGRAM_CRITICAL_CHAT}"
+    - type: "email"
+      recipients: ["soc-critical@securesleuths.local"]
+      
+  high:
+    - type: "telegram"
+      bot: "soc_alerts_bot"
+      chat_id: "${TELEGRAM_HIGH_CHAT}"
+      
+  medium:
+    - type: "email"
+      recipients: ["soc-team@securesleuths.local"]
+      frequency: "hourly_digest"
+      
+  low:
+    - type: "dashboard_only"
+
+sla_targets:
+  critical:
+    initial_response_minutes: 15
+    resolution_hours: 4
+  high:
+    initial_response_minutes: 60
+    resolution_hours: 24
+  medium:
+    initial_response_minutes: 240
+    resolution_hours: 72
+  low:
+    initial_response_minutes: 1440
+    resolution_hours: 168

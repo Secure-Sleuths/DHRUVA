@@ -1,0 +1,112 @@
+# =============================================================================
+# SecureSleuths DHRUVA — Docker Compose
+#
+# Usage:
+#   1. cp .env.template .env && nano .env    # Fill in credentials
+#   2. nano config/config.yaml               # Point to your Wazuh instance
+#   3. docker compose up -d                  # Start platform + Postgres
+#   4. Open https://localhost:8443           # Dashboard
+# Community-only build:
+#   docker compose -f docker-compose.yml -f docker-compose.community.yml up -d --build
+#
+# Upgrades:
+#   docker compose pull && docker compose up -d
+#
+# v4.9.0+ requires Postgres. Two deployment topologies:
+#
+# (1) Single-host (default — runs the bundled Postgres):
+#       docker compose --profile bundled-db up -d
+#     POSTGRES_PASSWORD must be set in .env. Compose will start postgres
+#     first, wait for it to be healthy, then start ai-soc.
+#
+# (2) Split-host / external managed Postgres (recommended for production):
+#       docker compose up -d
+#     Set DATABASE_URL in .env to your remote DSN; the bundled postgres
+#     service stays parked (profiles: [bundled-db] excludes it from the
+#     default profile). See docs/DEPLOYMENT-SPLIT-HOST.md.
+# =============================================================================
+
+services:
+  postgres:
+    # Tagged with the `bundled-db` profile so external-DB installs don't
+    # accidentally double-start a local Postgres. Start it explicitly:
+    #   docker compose --profile bundled-db up -d
+    profiles: ["bundled-db"]
+    image: postgres:16-alpine
+    container_name: dhruva-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-dhruva}
+      # External-DB installs don't need this — the postgres service is
+      # parked behind the bundled-db profile. When activating that profile,
+      # POSTGRES_PASSWORD must be set in .env (postgres entrypoint will
+      # refuse to start without it).
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: ${POSTGRES_DB:-dhruva}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dhruva} -d ${POSTGRES_DB:-dhruva}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  ai-soc:
+    # Version comes from the VERSION single source of truth. Export
+    # DHRUVA_VERSION (e.g. `DHRUVA_VERSION=$(cat VERSION)` or in .env) to pin a
+    # tag; falls back to `latest` for the local build-from-source path.
+    image: securesleuths/dhruva:${DHRUVA_VERSION:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Stamp the version into the image. Empty when DHRUVA_VERSION isn't
+        # exported — the Dockerfile then falls back to the COPY'd VERSION file,
+        # so `docker compose up -d --build` never bakes a wrong version.
+        DHRUVA_VERSION: ${DHRUVA_VERSION:-}
+    container_name: ai-soc-platform
+    restart: unless-stopped
+    # No `depends_on` here on purpose. Compose v2 rejects depends_on
+    # referencing a service that isn't in the active profile set, so
+    # depending on the profile-gated `postgres` service would break the
+    # split-host path. Boot ordering is instead enforced by the entry-
+    # point's DB-reachability retry (docker-entrypoint.sh: DB_RETRY_MAX
+    # × DB_RETRY_SLEEP, default ~60s) — it works identically whether
+    # Postgres is the bundled sidecar or a remote managed DB.
+    ports:
+      - "${SOC_PORT:-8443}:8443"
+    env_file:
+      - .env
+    environment:
+      - TZ=${TZ:-UTC}
+      # Default DATABASE_URL points at the bundled service; .env can
+      # override to use an external Postgres.
+      - DATABASE_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-dhruva}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-dhruva}}
+    volumes:
+      # User-editable configuration (survives upgrades)
+      - ./config/config.yaml:/opt/ai-soc/config/config.yaml:ro
+      - ./config/guidance:/opt/ai-soc/config/guidance:ro
+      # Persistent data (baselines, local IOCs, certs)
+      - soc-data:/var/lib/ai-soc
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sfk https://localhost:8443/api/health 2>/dev/null || curl -sf http://localhost:8443/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    # Ensure the platform can reach Wazuh/OpenSearch on the host network
+    # Uncomment the line below if Wazuh runs on the Docker host:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+volumes:
+  soc-data:
+    driver: local
+  pg-data:
+    driver: local

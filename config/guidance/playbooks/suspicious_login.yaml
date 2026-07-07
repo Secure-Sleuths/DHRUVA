@@ -1,0 +1,142 @@
+# =============================================================================
+# Investigation Playbook: Suspicious Login Activity
+# Rule Groups: authentication_failures, authentication_success, pam, sshd, web-log
+# MITRE: T1078 (Valid Accounts), T1110 (Brute Force)
+# =============================================================================
+
+name: "Suspicious Login Investigation"
+trigger_rule_groups:
+  - "authentication_failures"
+  - "authentication_success"
+  - "pam"
+  - "sshd"
+  - "win_authentication"
+  
+trigger_rule_ids:
+  - 5710   # sshd: attempt to login using a non-existent user
+  - 5712   # sshd: brute force attack
+  - 5720   # Multiple authentication failures
+  - 5763   # SSH brute force (multiple hosts)
+  - 18100  # Windows logon failure
+  - 18152  # Multiple Windows logon failures
+
+investigation_steps:
+  - step: 1
+    name: "Identify the user and source"
+    query_template: |
+      SELECT srcip, srcuser, dstuser, agent_name, rule_id, rule_level,
+             COUNT(*) as event_count,
+             MIN(timestamp) as first_seen,
+             MAX(timestamp) as last_seen
+      FROM {enriched_alerts_index}
+      WHERE rule_id = {alert_rule_id}
+        AND (srcuser = '{alert_user}' OR dstuser = '{alert_user}')
+        AND timestamp >= NOW() - INTERVAL 24 HOURS
+      GROUP BY srcip, srcuser, dstuser, agent_name, rule_id, rule_level
+      ORDER BY event_count DESC
+    assess: |
+      - How many unique source IPs are involved?
+      - Is the user a known service account or human?
+      - What is the event velocity (events per minute)?
+      
+  - step: 2
+    name: "Check user login history baseline"
+    query_template: |
+      SELECT srcip, agent_name, rule_description,
+             COUNT(*) as login_count,
+             DATE_TRUNC('day', timestamp) as day
+      FROM {enriched_alerts_index}
+      WHERE (srcuser = '{alert_user}' OR dstuser = '{alert_user}')
+        AND rule_group IN ('authentication_success', 'pam')
+        AND timestamp >= NOW() - INTERVAL 30 DAYS
+      GROUP BY srcip, agent_name, rule_description, day
+      ORDER BY day DESC
+    assess: |
+      - Is this source IP in the user's normal login pattern?
+      - Has the user logged in from this agent/host before?
+      - Is the login time consistent with their normal hours?
+      
+  - step: 3
+    name: "Check source IP reputation and history"
+    query_template: |
+      SELECT srcip, 
+             COUNT(DISTINCT srcuser) as targeted_users,
+             COUNT(DISTINCT agent_name) as targeted_hosts,
+             COUNT(*) as total_events,
+             ARRAY_AGG(DISTINCT rule_description) as triggered_rules
+      FROM {enriched_alerts_index}
+      WHERE srcip = '{alert_src_ip}'
+        AND timestamp >= NOW() - INTERVAL 7 DAYS
+      GROUP BY srcip
+    assess: |
+      - Has this IP targeted multiple users or hosts?
+      - What other rule types has this IP triggered?
+      - Is this IP in any threat intelligence feeds?
+      - Is this a known VPN/proxy endpoint?
+      
+  - step: 4
+    name: "Check for successful auth following failures"
+    query_template: |
+      SELECT timestamp, rule_id, rule_description, rule_group,
+             srcip, srcuser, dstuser, agent_name
+      FROM {enriched_alerts_index}
+      WHERE (srcuser = '{alert_user}' OR dstuser = '{alert_user}')
+        AND srcip = '{alert_src_ip}'
+        AND timestamp BETWEEN '{alert_timestamp}' - INTERVAL 1 HOUR 
+            AND '{alert_timestamp}' + INTERVAL 2 HOURS
+      ORDER BY timestamp ASC
+    assess: |
+      - Did authentication failures precede a successful login?
+      - If yes, this is a CRITICAL indicator — likely compromised credentials.
+      - What happened AFTER the successful login? (commands, file access, lateral movement)
+      
+  - step: 5
+    name: "Check for lateral movement post-auth"
+    query_template: |
+      SELECT timestamp, rule_id, rule_description, rule_group,
+             srcip, dstip, agent_name, data_command
+      FROM {enriched_alerts_index}
+      WHERE (srcip = '{alert_src_ip}' OR srcuser = '{alert_user}')
+        AND timestamp >= '{alert_timestamp}'
+        AND timestamp <= '{alert_timestamp}' + INTERVAL 4 HOURS
+        AND rule_group IN ('syscheck', 'rootcheck', 'command_monitoring', 
+                           'process_monitoring', 'network_connection')
+      ORDER BY timestamp ASC
+      LIMIT 100
+    assess: |
+      - Any file integrity changes on the target host?
+      - Any unusual commands or processes spawned?
+      - Any connections to other internal hosts (lateral movement)?
+      - Any data exfiltration indicators (large outbound transfers)?
+
+verdict_criteria:
+  true_positive:
+    - "Successful auth following brute force from external IP"
+    - "Login from never-before-seen geo + immediate privilege use"
+    - "Service account login from non-infrastructure IP"
+    - "Post-auth lateral movement or credential dumping detected"
+    
+  false_positive:
+    - "Known CI/CD or monitoring system auth patterns"
+    - "User VPN IP change during maintenance window"
+    - "Password rotation triggering temporary failures"
+    - "Load balancer health checks"
+    
+  needs_investigation:
+    - "Failures from user's historical IP range but unusual time"
+    - "New user account (< 7 days) with login anomalies"
+    - "Moderate failure count without clear success or known pattern"
+
+recommended_actions:
+  if_true_positive:
+    - "Force password reset for affected user"
+    - "Disable account if service account compromise suspected"
+    - "Block source IP at firewall/WAF"
+    - "Collect forensic artifacts from target host"
+    - "Check for persistence mechanisms"
+    - "Notify client security team via escalation channel"
+    
+  if_false_positive:
+    - "Tag alert with FP reason for feedback loop"
+    - "If recurring, propose detection tuning to reduce noise"
+    - "Update baseline if legitimate pattern change"

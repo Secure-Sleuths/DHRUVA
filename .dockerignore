@@ -1,0 +1,28 @@
+# Don't send these to Docker build context
+.git/
+.github/
+.claude/
+venv/
+__pycache__/
+*.db
+*.sqlite
+.env
+.env.*
+!.env.template
+*.md
+!README.md
+static-dashboard.html
+deploy.sh
+systemd/
+.DS_Store
+.gitignore
+CLAUDE.md
+ROADMAP.md
+
+# Keep web/ source in the build context (the `web` Docker stage runs
+# `npm ci && npm run build`), but exclude local dependency/build dirs and
+# QA screenshots — the image regenerates node_modules + out from scratch.
+web/node_modules/
+web/.next/
+web/out/
+web/*-screenshot.png

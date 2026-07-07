@@ -1,0 +1,209 @@
+platform:
+  name: SecureSleuths DHRUVA
+  version: 5.0.0
+  log_level: INFO
+  data_dir: /var/lib/ai-soc
+licensing:
+  license_file: ${LICENSE_FILE}
+  check_interval_hours: 24
+wazuh:
+  api:
+    host: ${WAZUH_API_URL}
+    port: 55000
+    username: ${WAZUH_API_USER}
+    password: ${WAZUH_API_PASSWORD}
+    verify_ssl: true
+    ca_cert: ''
+    tls_insecure_hostname: false
+  ssh_user: ${WAZUH_SSH_USER}
+  ssh_password: ${WAZUH_SSH_PASSWORD}
+  ssh_key_path: ''
+  ssh_key_passphrase: ''
+  ssh_sudo_nopasswd: false
+  alerts:
+    poll_interval_seconds: 10
+    batch_size: 50
+    min_severity: 3
+opensearch:
+  hosts:
+  - ${OPENSEARCH_URL}
+  username: ${OPENSEARCH_USER}
+  password: ${OPENSEARCH_PASSWORD}
+  verify_ssl: true
+  ca_cert: ''
+  ilm:
+    hot_days: 7
+    warm_days: 30
+    cold_days: 90
+    delete_days: 365
+  indices:
+    raw_alerts: wazuh-alerts-*
+    enriched_alerts: ai-soc-enriched-alerts
+    agent_decisions: ai-soc-agent-decisions
+    feedback_loop: ai-soc-feedback
+    detection_proposals: ai-soc-detection-proposals
+    baselines: ai-soc-baselines
+llm:
+  provider: anthropic
+  model: claude-sonnet-4-20250514
+  max_tokens: 8192
+  temperature: 0.1
+  rate_limit:
+    cooldown_seconds: 5
+  anthropic:
+    mode: auto
+    api_key: ${ANTHROPIC_API_KEY}
+    cli_path: claude
+  openai:
+    api_key: ${OPENAI_API_KEY}
+    model: gpt-4o
+    base_url: ${OPENAI_BASE_URL}
+  ollama:
+    base_url: http://localhost:11434
+    model: llama3.1:70b
+  groq:
+    api_key: ${GROQ_API_KEY}
+    model: llama-3.1-70b-versatile
+agents:
+  triage:
+    enabled: true
+    auto_close_confidence_threshold: 0.92
+    escalation_confidence_threshold: 0.5
+    max_context_alerts: 20
+    cooldown_seconds: 5
+enrichment:
+  asset_inventory:
+    source: file
+    file_path: /var/lib/ai-soc/assets.yaml
+    refresh_interval_minutes: 30
+  identity:
+    source: file
+    file_path: /var/lib/ai-soc/identities.yaml
+  threat_intel:
+    enabled: true
+    feeds:
+    - name: abuse_ipdb
+      api_key: ${ABUSEIPDB_API_KEY}
+      cache_ttl_hours: 24
+    - name: alienvault_otx
+      api_key: ${OTX_API_KEY}
+      cache_ttl_hours: 12
+    local_iocs_file: /var/lib/ai-soc/local_iocs.yaml
+  historical:
+    baseline_window_days: 30
+    anomaly_std_deviations: 2.5
+    baseline_refresh_hours: 6
+  vulnerability_context:
+    enabled: true
+    critical_multiplier: 1.5
+    high_multiplier: 1.2
+    sca_failed_multiplier: 1.3
+    sca_failed_threshold: 1
+    max_multiplier: 1.8
+    cache_ttl: 300
+  host_integrity_context:
+    enabled: true
+    rootcheck_finding_multiplier: 1.3
+    fim_recent_changes_multiplier: 1.15
+    fim_recent_threshold: 10
+    fim_recency_hours: 24
+    max_multiplier: 1.5
+    cache_ttl: 300
+guidance:
+  base_path: ./config/guidance
+  risk_criteria: risk_criteria.yaml
+  escalation_logic: escalation_logic.yaml
+  playbooks_dir: playbooks
+threat_intel:
+  enabled: true
+  collect_interval_minutes: 30
+  ioc_expiry_days: 90
+  feeds:
+    threatfox:
+      enabled: true
+      interval_minutes: 360
+      api_key: ${THREATFOX_API_KEY}
+    urlhaus:
+      enabled: true
+      interval_minutes: 360
+    feodo:
+      enabled: true
+      interval_minutes: 720
+    malwarebazaar:
+      enabled: true
+      interval_minutes: 360
+    cisa_kev:
+      enabled: true
+      interval_minutes: 1440
+    epss:
+      enabled: true
+      mode: on_demand
+    openphish:
+      enabled: true
+      interval_minutes: 720
+    abuseipdb:
+      enabled: true
+      api_key: ${ABUSEIPDB_API_KEY}
+      mode: on_demand
+    virustotal:
+      enabled: true
+      api_key: ${VIRUSTOTAL_API_KEY}
+      mode: on_demand
+    alienvault_otx:
+      enabled: true
+      api_key: ${OTX_API_KEY}
+      mode: on_demand
+incidents:
+  enabled: true
+  auto_assign: false
+  max_per_analyst: 15
+  grouping_window_minutes: 30
+  attack_chain:
+    enabled: true
+    window_minutes: 120
+    min_distinct_tactics: 2
+notifications:
+  enabled: true
+  slack:
+    webhook_url: ${SLACK_WEBHOOK_URL}
+    channel: ''
+  email:
+    smtp_host: ${SMTP_HOST}
+    smtp_port: 587
+    smtp_user: ${SMTP_USER}
+    smtp_password: ${SMTP_PASSWORD}
+    from_address: ${SMTP_FROM}
+    use_tls: true
+    recipients: []
+api:
+  host: 0.0.0.0
+  port: 8443
+  cors_origins:
+  - https://soc.securesleuths.local
+  auth:
+    enabled: true
+    jwt_secret: ${JWT_SECRET}
+    token_expiry_hours: 8
+anonymization:
+  enabled: true
+  hash_salt: ${ANONYMIZATION_SALT}
+  internal_ip_ranges: []
+  free_text_pii: true
+  national_id_locales:
+  - US
+  - IN
+  fields:
+    hostnames: true
+    internal_ips: true
+    usernames: true
+    asset_owner: true
+    scrub_data_field: true
+knowledge_base:
+  enabled: true
+  auto_index_feedback: true
+  auto_index_hunts: true
+  auto_index_incidents: true
+  auto_index_guidance: true
+  max_agent_results: 3
+database:
+  dsn: ${DATABASE_URL}

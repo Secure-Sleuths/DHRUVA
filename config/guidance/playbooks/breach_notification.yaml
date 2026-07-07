@@ -1,0 +1,78 @@
+name: "Breach Notification Workflow"
+trigger_rule_groups: ["exfiltration", "data_leak"]
+trigger_rule_ids: []
+
+investigation_steps:
+  - step: 1
+    name: "Determine if notification is required"
+    query_template: |
+      Assess whether the incident constitutes a data breach requiring notification:
+      1. Was personal data (PII/PHI) involved?
+      2. Was the data actually accessed/exfiltrated (not just exposed)?
+      3. Was the data encrypted at rest (reduces notification obligation)?
+    assess: |
+      - Does the data meet the definition of "personal data" under applicable law?
+      - Is there evidence of actual unauthorized access (not just theoretical exposure)?
+      - Were compensating controls (encryption) in place that may exempt notification?
+
+  - step: 2
+    name: "Identify applicable regulations"
+    query_template: |
+      Determine which notification requirements apply based on:
+      - Data subject location (GDPR: 72 hours, US state laws: varies)
+      - Data type (HIPAA: PHI, PCI-DSS: cardholder data)
+      - Organization jurisdiction and contracts
+    assess: |
+      - Which regulations apply (GDPR, HIPAA, state breach laws, PCI-DSS)?
+      - What are the notification deadlines (GDPR: 72h from discovery)?
+      - Are there contractual notification obligations with clients?
+
+  - step: 3
+    name: "Scope the breach"
+    query_template: |
+      Quantify the breach for notification purposes:
+      1. Number of records/data subjects affected
+      2. Types of data compromised
+      3. Time period of unauthorized access
+      4. Geographic distribution of affected individuals
+    assess: |
+      - How many individuals are affected?
+      - What specific data elements were compromised?
+      - How long did the unauthorized access last?
+
+  - step: 4
+    name: "Engage legal and execute notifications"
+    query_template: |
+      Notification execution checklist:
+      1. Brief legal counsel with breach scope assessment
+      2. Prepare regulatory notification (supervisory authority)
+      3. Prepare individual notification (affected data subjects)
+      4. Prepare media statement if >500 individuals affected
+      5. Document all notifications with timestamps
+    assess: |
+      - Has legal counsel reviewed and approved all notifications?
+      - Have all required regulatory bodies been notified within deadline?
+      - Have affected individuals been notified with required information?
+      - Is documentation complete for audit trail?
+
+verdict_criteria:
+  true_positive:
+    - Confirmed unauthorized access to personal/protected data
+    - Data exfiltration with PII/PHI confirmed
+  false_positive:
+    - Authorized data access or processing
+    - Encrypted data exposure (may not require notification)
+  needs_investigation:
+    - Potential exposure but no confirmed access
+    - Data type classification unclear
+
+recommended_actions:
+  if_true_positive:
+    - Engage legal counsel immediately
+    - Start notification clock (GDPR 72h from confirmed breach)
+    - Prepare regulatory and individual notifications
+    - Document all actions and decisions for audit trail
+    - Engage external breach counsel if cross-jurisdictional
+  if_false_positive:
+    - Document analysis and decision not to notify
+    - Retain evidence of the assessment for audit purposes

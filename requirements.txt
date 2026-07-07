@@ -1,0 +1,64 @@
+# DHRUVA - SecureSleuths
+# Pinned versions for reproducible builds. Run pip-audit periodically.
+# Core
+pyyaml==6.0.2
+python-dotenv==1.2.2
+pydantic==2.10.6
+pydantic-settings==2.7.1
+
+# Wazuh & OpenSearch
+opensearch-py==2.8.0
+requests==2.33.1
+urllib3==2.6.3
+paramiko==3.5.1
+
+# Claude API
+anthropic==0.49.0
+
+# OpenAI SDK — used by both OpenAIProvider and GroqProvider (Groq is
+# OpenAI-compatible, so no separate `groq` pin needed).
+openai==1.55.3
+
+# Async & Scheduling
+apscheduler==3.10.4
+aiohttp==3.13.4
+
+# API Server
+fastapi==0.136.1
+starlette==0.49.1
+uvicorn[standard]==0.34.0
+PyJWT==2.12.0
+python-multipart==0.0.27
+slowapi==0.1.9
+
+# Database (Postgres — v4.9.0+ requires Postgres; SQLite was removed)
+psycopg[binary]==3.2.4
+psycopg-pool==3.2.4
+alembic==1.14.0
+SQLAlchemy==2.0.36
+
+# Licensing
+cryptography==46.0.7
+
+# Utilities
+jinja2==3.1.6
+structlog==25.1.0
+tenacity==9.0.0
+cachetools==5.5.2
+gitpython==3.1.44
+xmltodict==0.14.1
+defusedxml==0.7.1
+
+# Notifications
+python-telegram-bot==21.10
+
+# Threat Intel
+OTXv2==1.5.12
+
+# Testing (dev-only — not loaded in Community/Team/Enterprise builds).
+# testcontainers spins up an ephemeral postgres:16 container per pytest
+# session so the suite never touches a real database. Docker must be on
+# PATH; CI runners need the docker socket available.
+testcontainers[postgres]==4.13.1
+pytest==9.0.2
+pytest-cov==7.1.0

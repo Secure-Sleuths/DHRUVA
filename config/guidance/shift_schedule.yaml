@@ -1,0 +1,31 @@
+# SOC Shift Schedule — defines analyst shifts for handoff and routing.
+# Times are in UTC. Adjust for your timezone.
+
+shifts:
+  - name: "Morning Shift"
+    start_utc: 6
+    end_utc: 14
+    days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
+    analysts: []
+    on_call_primary: ""
+
+  - name: "Afternoon Shift"
+    start_utc: 14
+    end_utc: 22
+    days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
+    analysts: []
+    on_call_primary: ""
+
+  - name: "Night Shift"
+    start_utc: 22
+    end_utc: 6
+    days: ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    analysts: []
+    on_call_primary: ""
+
+  - name: "Weekend Day"
+    start_utc: 8
+    end_utc: 20
+    days: ["saturday", "sunday"]
+    analysts: []
+    on_call_primary: ""

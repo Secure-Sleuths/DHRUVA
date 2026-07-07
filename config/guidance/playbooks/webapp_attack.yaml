@@ -1,0 +1,68 @@
+name: "Web Application Attack Investigation"
+trigger_rule_groups: ["web", "apache", "nginx", "attack", "sqli", "xss"]
+trigger_rule_ids: []
+
+investigation_steps:
+  - step: 1
+    name: "Classify attack type and vector"
+    query_template: |
+      Examine the triggering alert's full_log and data fields.
+      Identify the attack class: SQLi, XSS, RCE, LFI/RFI, SSRF, path traversal.
+    assess: |
+      - What type of web attack is this (injection, traversal, RCE)?
+      - What is the target URL/endpoint?
+      - Is the payload sophisticated or automated scanner noise?
+
+  - step: 2
+    name: "Check for successful exploitation"
+    query_template: |
+      Review HTTP response codes for the attack requests. Check application
+      logs for errors, unusual database queries, or file system access.
+    assess: |
+      - Did any attack request receive a 200 response with unexpected content?
+      - Are there database errors or unusual query patterns in app logs?
+      - Is there evidence of command execution or file access?
+
+  - step: 3
+    name: "Profile the attacker"
+    query_template: |
+      Aggregate all requests from the attacker IP in the last 24 hours.
+      Check for reconnaissance patterns, scanning behavior, and target spread.
+    assess: |
+      - Is this a single attacker or distributed attack?
+      - What is the volume and sophistication of the attack?
+      - Is the source IP known to threat intelligence?
+
+  - step: 4
+    name: "Assess post-exploitation indicators"
+    query_template: |
+      If exploitation succeeded, check for webshell uploads, reverse shell
+      connections, privilege escalation, or lateral movement from the web server.
+    assess: |
+      - Are there new files in web-accessible directories?
+      - Are there outbound connections from the web server to unusual IPs?
+      - Has the web server process spawned unexpected child processes?
+
+verdict_criteria:
+  true_positive:
+    - Exploitation attempt with evidence of successful payload execution
+    - Webshell or backdoor uploaded to web server
+    - Post-exploitation activity detected from web server
+  false_positive:
+    - Automated vulnerability scanner from known security testing IP
+    - WAF false positive on legitimate application request
+    - Penetration test activity within authorized scope
+  needs_investigation:
+    - Sophisticated attack payloads but no clear success indicators
+    - Attack from internal IP (possible compromised host or insider)
+
+recommended_actions:
+  if_true_positive:
+    - Block attacker IP at WAF and firewall
+    - Isolate web server if post-exploitation confirmed
+    - Patch the exploited vulnerability immediately
+    - Review all files modified during attack window
+    - Check for persistence (cron jobs, startup scripts, webshells)
+  if_false_positive:
+    - Add scanner IP to WAF whitelist if authorized testing
+    - Tune WAF rules for false positive patterns

@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * DHRUVA AI-SOC — global base layer (WO-U1 design-system).
+ * Tokens live in tailwind.config.ts; this file only holds the few
+ * document-level rules that can't be expressed as utilities.
+ */
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  background: #0a0e14; /* token: bg */
+  color: #e6edf5; /* token: ink */
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    sans-serif;
+}
+
+/*
+ * Accessibility invariant: a visible focus ring on ANY keyboard-focused
+ * element. Components also opt in via the `focusRing` utility (src/lib/ui.ts),
+ * but this baseline guarantees the ring even if one is missed. Uses the `acc`
+ * token (#6ea8fe) — AA-contrast against every surface in the palette.
+ */
+:focus-visible {
+  outline: 2px solid #6ea8fe;
+  outline-offset: 2px;
+}
+
+/* tabular numerals for aligned metrics / confidence values */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Respect reduced-motion: disable rail slide, fades and spinners. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

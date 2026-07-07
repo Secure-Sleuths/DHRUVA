@@ -1,0 +1,87 @@
+name: "Forensic Evidence Collection"
+trigger_rule_groups: []
+trigger_rule_ids: []
+
+investigation_steps:
+  - step: 1
+    name: "Preserve volatile data first"
+    query_template: |
+      Before any other action, capture volatile data in order:
+      1. Running processes and open network connections
+      2. Memory dump (if authorized and tooling available)
+      3. Logged-in users and active sessions
+      4. Network routing table and ARP cache
+    assess: |
+      - Is the system still running (do NOT reboot)?
+      - Has memory acquisition been completed before disk operations?
+      - Are timestamps being preserved (avoid modifying access times)?
+
+  - step: 2
+    name: "Capture system state"
+    query_template: |
+      Collect non-volatile system artifacts:
+      1. Disk image (full or targeted — based on incident scope)
+      2. System logs (auth, syslog, application, security events)
+      3. File system timeline (MAC times for key directories)
+      4. Registry hive copies (Windows) or configuration files (Linux)
+    assess: |
+      - Is the disk image being taken with a write-blocker or forensic tool?
+      - Are hash values (SHA-256) being computed for all evidence?
+      - Is the evidence being stored on a separate, clean medium?
+
+  - step: 3
+    name: "Document chain of custody"
+    query_template: |
+      For every piece of evidence collected, record:
+      - What: Description of the evidence item
+      - Where: Source system hostname, IP, location
+      - When: Collection timestamp (UTC)
+      - Who: Analyst performing collection
+      - How: Tool and method used
+      - Hash: SHA-256 hash of the evidence file
+    assess: |
+      - Is the chain of custody form complete for all evidence?
+      - Are evidence items stored in a tamper-evident manner?
+      - Has evidence been transferred to a secure evidence locker?
+
+  - step: 4
+    name: "Collect network evidence"
+    query_template: |
+      Capture relevant network data:
+      1. Firewall and proxy logs for the incident timeframe
+      2. DNS query logs for affected hosts
+      3. PCAP if available (from network tap or IDS)
+      4. NetFlow data for the relevant time window
+    assess: |
+      - Do network logs cover the full incident timeframe?
+      - Has PCAP been filtered to relevant traffic?
+      - Are all network evidence items hashed and documented?
+
+  - step: 5
+    name: "Secure and validate evidence"
+    query_template: |
+      Final evidence validation:
+      1. Verify all SHA-256 hashes match computed values
+      2. Create evidence inventory with item numbers
+      3. Store in locked evidence repository with access controls
+      4. Notify incident lead that evidence collection is complete
+    assess: |
+      - Do all hash values verify correctly?
+      - Is the evidence inventory complete and cross-referenced?
+      - Has access to evidence been restricted to authorized personnel?
+
+verdict_criteria:
+  true_positive:
+    - N/A (this is a collection playbook, not a detection playbook)
+  false_positive:
+    - N/A
+  needs_investigation:
+    - N/A
+
+recommended_actions:
+  if_true_positive:
+    - Complete evidence collection following all steps above
+    - Engage external forensics firm if scope exceeds internal capability
+    - Preserve evidence for potential legal proceedings
+  if_false_positive:
+    - N/A

@@ -1,0 +1,78 @@
+name: "Insider Threat Investigation"
+trigger_rule_groups: ["data_leak", "policy_violation", "audit"]
+trigger_rule_ids: []
+
+investigation_steps:
+  - step: 1
+    name: "Identify actor and data accessed"
+    query_template: |
+      Search enriched alerts for src_user activity in the last 24 hours.
+      Focus on file access, data transfers, and unusual application usage.
+    assess: |
+      - Who is the user and what is their role/department?
+      - What data or systems were accessed?
+      - Is access consistent with their job function?
+
+  - step: 2
+    name: "Check for policy violations"
+    query_template: |
+      Review DLP alerts, USB device usage, cloud storage uploads,
+      email attachments to external addresses for the same user.
+    assess: |
+      - Has the user violated data handling policies?
+      - Are there large data transfers to personal accounts?
+      - Any use of unauthorized tools (personal cloud, USB, etc.)?
+
+  - step: 3
+    name: "Behavioral baseline comparison"
+    query_template: |
+      Compare user activity volume and patterns against their
+      30-day behavioral baseline. Check for anomalous hours, systems, volumes.
+    assess: |
+      - Is the activity volume abnormal for this user?
+      - Is the timing unusual (after hours, weekend)?
+      - Are they accessing systems they don't normally use?
+
+  - step: 4
+    name: "Check for resignation or HR indicators"
+    query_template: |
+      Cross-reference with HR data if available. Check if user
+      has given notice, is on a PIP, or has been flagged by management.
+    assess: |
+      - Is the user a flight risk (notice period, contractor end date)?
+      - Has there been a pattern of escalating data access?
+      - Does the timeline correlate with any known HR events?
+
+  - step: 5
+    name: "Assess data sensitivity and scope"
+    query_template: |
+      Identify what data was potentially exfiltrated. Check data
+      classification labels, database audit logs, file access logs.
+    assess: |
+      - What is the classification of the data accessed?
+      - Has any data left the organization boundary?
+      - What is the potential business impact?
+
+verdict_criteria:
+  true_positive:
+    - Unauthorized data transfer to personal/external account confirmed
+    - Access to sensitive data inconsistent with job function
+    - Deliberate circumvention of security controls (DLP bypass, encryption of exfil)
+  false_positive:
+    - Normal business activity (approved data sharing, legitimate transfer)
+    - Automated process or scheduled job triggering policy alerts
+    - Recently changed job role with updated access not yet baselined
+  needs_investigation:
+    - Unusual pattern but no clear data exfiltration evidence
+    - Access consistent with role but at abnormal times/volumes
+    - First-time behavioral anomaly without supporting indicators
+
+recommended_actions:
+  if_true_positive:
+    - Disable user account immediately
+    - Preserve all evidence (email, file access logs, endpoint forensics)
+    - Engage HR and Legal before any employee contact
+    - Assess scope of data exposure for breach notification
+  if_false_positive:
+    - Document benign activity pattern for baseline update
+    - Adjust detection thresholds if generating excessive noise

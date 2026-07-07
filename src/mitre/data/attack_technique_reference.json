@@ -1,0 +1,497 @@
+{
+  "_meta": {
+    "attack_version": "14.1",
+    "source": "MITRE ATT&CK Enterprise (https://attack.mitre.org). Hand-curated, concise summaries authored offline; not a verbatim copy of the STIX bundle.",
+    "note": "Curated subset covering exactly the technique IDs recognized in src/mitre/matrix.py (the SOC-relevant set). Fields are deliberately short (token budget) and intentionally general where a verbatim ATT&CK phrasing was uncertain — accuracy over completeness. No network access is used to build or refresh this asset.",
+    "license": "ATT&CK content (c) The MITRE Corporation, reused under the ATT&CK Terms of Use.",
+    "field_schema": ["name", "description", "detection", "mitigation"]
+  },
+  "techniques": {
+    "T1003": {
+      "name": "OS Credential Dumping",
+      "description": "Adversaries dump credential material (password hashes, plaintext passwords, Kerberos tickets) from the operating system, such as from LSASS memory, the SAM database, or /etc/shadow, to enable lateral movement and privileged access.",
+      "detection": "Monitor for processes reading LSASS memory, access to the SAM/SECURITY registry hives or /etc/shadow, and known tools (Mimikatz, procdump, comsvcs.dll MiniDump). Correlate unexpected credential-store access with the accessing process lineage.",
+      "mitigation": "Enable Credential Guard/LSA protection, restrict local admin rights, disable WDigest plaintext caching, and apply least privilege so credential stores are not broadly readable."
+    },
+    "T1005": {
+      "name": "Data from Local System",
+      "description": "Adversaries search local file systems and directories on a compromised host to find and collect files of interest prior to exfiltration.",
+      "detection": "Look for unusual command-line file discovery/collection activity, mass file reads by a single process, and staging of archives. Baseline normal file-access patterns per user and host.",
+      "mitigation": "Data loss prevention, restricting access to sensitive files with least privilege, and monitoring/auditing access to high-value file shares reduce exposure."
+    },
+    "T1016": {
+      "name": "System Network Configuration Discovery",
+      "description": "Adversaries enumerate the host's network configuration and settings (IP addresses, routes, DNS, ARP tables, proxy settings) to orient themselves and plan further movement.",
+      "detection": "Monitor for execution of utilities such as ipconfig/ifconfig, route, arp, nbtstat, and netsh, especially in rapid succession or from unusual parent processes.",
+      "mitigation": "This is discovery of built-in system information and is difficult to prevent directly; focus on detection and on limiting the value of the information via network segmentation."
+    },
+    "T1021": {
+      "name": "Remote Services",
+      "description": "Adversaries use valid accounts to log into remote services such as SSH, RDP, SMB/admin shares, VNC, or WinRM to move laterally between systems.",
+      "detection": "Monitor authentication logs for remote logons using valid accounts from unexpected sources, unusual internal service connections, and new or atypical remote-session activity.",
+      "mitigation": "Enforce MFA, restrict which accounts can use remote services, disable unnecessary services, and segment the network to limit reachable systems."
+    },
+    "T1027": {
+      "name": "Obfuscated Files or Information",
+      "description": "Adversaries make files or command content hard to discover or analyze by encoding, encrypting, packing, or otherwise obfuscating payloads and scripts to evade defenses.",
+      "detection": "Flag encoded command-line arguments (e.g. base64 PowerShell -enc), high-entropy files, packed binaries, and script deobfuscation-then-execute patterns. Use script block logging.",
+      "mitigation": "Prevention is difficult; use antivirus/AMSI, behavioral detection, and script logging. Application control can block unknown or packed executables."
+    },
+    "T1029": {
+      "name": "Scheduled Transfer",
+      "description": "Adversaries schedule data exfiltration to occur only at certain times of day or intervals (e.g. to blend with normal business traffic), rather than continuously.",
+      "detection": "Look for periodic, regular outbound data transfers to the same destination, especially outside business hours, and correlate with prior collection/staging activity.",
+      "mitigation": "Network intrusion prevention and egress filtering that inspect and constrain outbound connections can limit scheduled exfiltration channels."
+    },
+    "T1036": {
+      "name": "Masquerading",
+      "description": "Adversaries manipulate the name, location, or metadata of files/processes to make malicious artifacts appear legitimate (e.g. naming malware after a trusted system binary).",
+      "detection": "Compare process names against their true image paths and signatures, flag legitimate names running from unusual directories, and detect mismatched file extensions or spoofed signatures.",
+      "mitigation": "Application control and code signing enforcement help ensure only legitimate, correctly-located binaries execute."
+    },
+    "T1039": {
+      "name": "Data from Network Shared Drive",
+      "description": "Adversaries search network shares and remote file systems accessible from a compromised host to locate and collect files of interest before exfiltration.",
+      "detection": "Monitor for enumeration and bulk reads of network shares by a single account or host, and unusual access to file servers outside a user's normal pattern.",
+      "mitigation": "Apply least-privilege share permissions, audit access to sensitive shares, and use data loss prevention on high-value repositories."
+    },
+    "T1041": {
+      "name": "Exfiltration Over C2 Channel",
+      "description": "Adversaries steal data by sending it back over the same command-and-control channel used to control the compromised host, blending exfiltration with existing C2 traffic.",
+      "detection": "Look for larger-than-expected outbound data on established C2 sessions, unusual upload/download ratios, and beaconing connections carrying bulk data.",
+      "mitigation": "Network intrusion prevention, egress filtering, and detection of C2 channels themselves are the primary controls; segment sensitive data away from internet-facing hosts."
+    },
+    "T1046": {
+      "name": "Network Service Discovery",
+      "description": "Adversaries scan hosts and networks to enumerate listening services and open ports, identifying targets and vulnerabilities for exploitation or lateral movement.",
+      "detection": "Detect port-scanning behavior — many connection attempts to sequential ports or many hosts from one source in a short window — via network sensors and firewall logs.",
+      "mitigation": "Network segmentation, disabling unnecessary services, and intrusion prevention limit the reachable attack surface and detect scanning."
+    },
+    "T1047": {
+      "name": "Windows Management Instrumentation",
+      "description": "Adversaries abuse Windows Management Instrumentation (WMI) to execute commands and payloads locally or on remote hosts, and to query system information.",
+      "detection": "Monitor for wmic.exe usage, WmiPrvSE.exe spawning shells/processes, and WMI-based remote execution. Enable WMI activity logging and correlate with lateral-movement patterns.",
+      "mitigation": "Restrict WMI remote access to authorized administrators, apply least privilege, and use application control to limit what WMI can launch."
+    },
+    "T1048": {
+      "name": "Exfiltration Over Alternative Protocol",
+      "description": "Adversaries exfiltrate data over a protocol different from the main C2 channel, such as DNS, ICMP, FTP, or SMTP, to evade monitoring focused on the primary channel.",
+      "detection": "Look for anomalous data volumes over DNS/ICMP/SMTP, unusual protocol usage from a host, and long or high-entropy DNS queries indicative of tunneling.",
+      "mitigation": "Egress filtering, restricting protocols allowed outbound, and network intrusion prevention that inspects DNS/ICMP reduce alternative exfiltration paths."
+    },
+    "T1053": {
+      "name": "Scheduled Task/Job",
+      "description": "Adversaries abuse task scheduling utilities (Windows Task Scheduler/schtasks, cron, at) to execute malicious code, often for persistence or for running with elevated privileges.",
+      "detection": "Monitor for creation or modification of scheduled tasks and cron jobs, especially those launching scripts/binaries from unusual paths, and correlate with the creating account.",
+      "mitigation": "Restrict who can create scheduled tasks, apply least privilege, and audit task/cron changes. Configure task creation to require elevated permissions."
+    },
+    "T1056": {
+      "name": "Input Capture",
+      "description": "Adversaries capture user input — via keylogging, credential-prompt spoofing, or API hooking — to steal credentials and other sensitive information.",
+      "detection": "Look for processes registering keyboard hooks or GUI credential prompts, unexpected drivers, and unusual access to input APIs. Monitor for keylogger artifacts.",
+      "mitigation": "Endpoint protection, application control, and MFA (to reduce the value of captured passwords) mitigate input capture."
+    },
+    "T1057": {
+      "name": "Process Discovery",
+      "description": "Adversaries enumerate running processes on a host to understand the environment, find security tooling, and identify targets for injection or termination.",
+      "detection": "Monitor for execution of tasklist, ps, Get-Process, and similar, particularly from scripts or unusual parents and in bursts alongside other discovery commands.",
+      "mitigation": "Built-in discovery of process information is hard to prevent; focus on detecting anomalous or scripted enumeration."
+    },
+    "T1059": {
+      "name": "Command and Scripting Interpreter",
+      "description": "Adversaries abuse command and script interpreters (PowerShell, cmd, Bash, Python, Windows Script Host) to execute commands, scripts, and payloads.",
+      "detection": "Enable command-line and script-block logging; flag suspicious interpreter invocations, encoded commands, and interpreters spawned by document/office or web-server processes.",
+      "mitigation": "Constrain or disable unneeded interpreters, use PowerShell Constrained Language Mode and AMSI, and apply application control to restrict script execution."
+    },
+    "T1068": {
+      "name": "Exploitation for Privilege Escalation",
+      "description": "Adversaries exploit software vulnerabilities in the OS kernel, drivers, or privileged services to elevate their privileges on a compromised host.",
+      "detection": "Look for process crashes and anomalous child processes of privileged services, unexpected SYSTEM/root shells, and known exploit indicators. Correlate with unpatched vulnerabilities.",
+      "mitigation": "Prompt patching, exploit protection (DEP/ASLR/CFG), least privilege, and application isolation/sandboxing reduce exploitable surface."
+    },
+    "T1070": {
+      "name": "Indicator Removal",
+      "description": "Adversaries delete or alter evidence of their activity — clearing event logs, deleting files, removing command history, or manipulating timestamps — to hinder detection and forensics.",
+      "detection": "Alert on event-log clearing (e.g. Windows Event ID 1102), history file truncation, mass file deletion, and use of tools like wevtutil or 'log clear' commands.",
+      "mitigation": "Forward logs off-host to a central SIEM, restrict permissions to delete logs, and enable tamper protection so local removal does not erase the record."
+    },
+    "T1071": {
+      "name": "Application Layer Protocol",
+      "description": "Adversaries use standard application-layer protocols (HTTP/S, DNS, mail) for command and control, blending malicious traffic with legitimate protocol usage.",
+      "detection": "Look for beaconing patterns, unusual user-agents/JA3 fingerprints, connections to newly-seen or low-reputation domains, and protocol content anomalies.",
+      "mitigation": "Network intrusion prevention, TLS inspection where permitted, and egress filtering to known-good destinations reduce covert C2 channels."
+    },
+    "T1074": {
+      "name": "Data Staged",
+      "description": "Adversaries collect and store data in a central location or archive on the host or network prior to exfiltration, often compressing or encrypting it first.",
+      "detection": "Look for creation of large archives in temp/staging directories, unusual write volumes to a single location, and archive utilities (zip, rar, tar) run by non-standard users.",
+      "mitigation": "Monitoring for large file writes and archive creation in unusual locations, plus data loss prevention, helps catch staging before exfiltration."
+    },
+    "T1078": {
+      "name": "Valid Accounts",
+      "description": "Adversaries obtain and abuse the credentials of existing accounts (default, local, domain, or cloud) to gain initial access, persist, escalate privileges, and evade detection by appearing as legitimate users.",
+      "detection": "Monitor for logons from unusual sources, times, or geolocations; impossible-travel; use of dormant/service accounts; and privileged access outside normal patterns. Correlate authentication with behavioral baselines.",
+      "mitigation": "Enforce MFA, disable or rename default accounts, apply least privilege, rotate credentials, and monitor for anomalous account usage."
+    },
+    "T1080": {
+      "name": "Taint Shared Content",
+      "description": "Adversaries add malicious content or modify legitimate files on shared storage (network shares, code repositories) so that other users execute the payload when accessing it.",
+      "detection": "Monitor writes to shared executables, scripts, and document repositories, and flag modifications to files on shares by unexpected accounts.",
+      "mitigation": "Least-privilege share permissions, integrity monitoring of shared content, and application control limit tainting and its execution."
+    },
+    "T1082": {
+      "name": "System Information Discovery",
+      "description": "Adversaries gather detailed information about a host — OS version, hardware, hostname, patches, architecture — to tailor further actions.",
+      "detection": "Monitor for execution of systeminfo, hostname, uname, wmic, and reg query commands, particularly scripted or in bursts with other discovery activity.",
+      "mitigation": "Built-in system information gathering is difficult to prevent; focus on detecting anomalous or automated enumeration."
+    },
+    "T1083": {
+      "name": "File and Directory Discovery",
+      "description": "Adversaries enumerate files and directories on a host or network share to find data of interest and understand the file-system layout.",
+      "detection": "Look for scripted or rapid directory traversal (dir, ls, tree, find, Get-ChildItem) especially targeting user, document, or credential-bearing paths.",
+      "mitigation": "This discovery of built-in file listings is hard to prevent; concentrate on detection and least-privilege access to sensitive directories."
+    },
+    "T1087": {
+      "name": "Account Discovery",
+      "description": "Adversaries enumerate local, domain, cloud, or email accounts to understand available identities and target them for access or privilege escalation.",
+      "detection": "Monitor for account-enumeration commands (net user/net group, dsquery, ldapsearch, Get-ADUser) and unusual LDAP/directory queries from non-admin hosts.",
+      "mitigation": "Restrict and audit directory enumeration where possible, apply least privilege, and detect anomalous LDAP/AD queries."
+    },
+    "T1090": {
+      "name": "Proxy",
+      "description": "Adversaries route traffic through intermediary proxy systems — internal hops, external proxies, or multi-hop chains — to obscure the true source of C2 and evade attribution.",
+      "detection": "Look for internal hosts acting as relays, connections to known proxy/anonymizer infrastructure (e.g. Tor), and unexpected internal-to-internal forwarding.",
+      "mitigation": "Network intrusion prevention, egress filtering, and blocking known anonymization services reduce proxied C2."
+    },
+    "T1091": {
+      "name": "Replication Through Removable Media",
+      "description": "Adversaries move onto systems (including air-gapped ones) by copying malware to removable media and relying on autorun or user execution when the media is used elsewhere.",
+      "detection": "Monitor for executable/script writes to removable drives, process execution originating from removable media, and autorun artifacts.",
+      "mitigation": "Disable autorun/autoplay, restrict or block removable media use via device control, and scan media on connection."
+    },
+    "T1095": {
+      "name": "Non-Application Layer Protocol",
+      "description": "Adversaries use non-application-layer protocols (ICMP, raw TCP/UDP, or other OSI layer 3/4 protocols) for command and control to avoid inspection focused on application traffic.",
+      "detection": "Flag anomalous ICMP volumes/payloads, unexpected raw socket traffic, and use of uncommon protocols between hosts.",
+      "mitigation": "Restrict allowed protocols with firewalls, apply network intrusion prevention, and filter unnecessary protocols at egress."
+    },
+    "T1098": {
+      "name": "Account Manipulation",
+      "description": "Adversaries modify accounts — changing credentials, adding permissions or group memberships, or attaching credentials — to maintain or elevate access.",
+      "detection": "Monitor directory and IAM change events: group membership additions (especially privileged groups), permission grants, credential/SSH-key additions, and MFA changes.",
+      "mitigation": "Enforce least privilege and MFA, alert on privileged group changes, and require multi-party approval for sensitive account modifications."
+    },
+    "T1105": {
+      "name": "Ingress Tool Transfer",
+      "description": "Adversaries transfer tools, malware, or other files from an external system into a compromised environment to support their operations.",
+      "detection": "Look for downloads by living-off-the-land utilities (certutil, bitsadmin, curl, wget, PowerShell DownloadFile), and file writes shortly followed by execution.",
+      "mitigation": "Egress filtering, application control on downloaded binaries, and network intrusion prevention limit tool transfer."
+    },
+    "T1106": {
+      "name": "Native API",
+      "description": "Adversaries invoke operating-system native APIs directly to execute code and interact with the system, bypassing higher-level utilities that are more heavily monitored.",
+      "detection": "Behavioral detection of suspicious API call sequences (e.g. process creation, memory allocation, injection primitives) and unusual direct syscalls; leverage EDR telemetry.",
+      "mitigation": "Application control, exploit protection, and behavioral EDR are the primary controls; the API surface itself cannot be disabled."
+    },
+    "T1110": {
+      "name": "Brute Force",
+      "description": "Adversaries guess credentials through repeated attempts — password guessing, password spraying, credential stuffing, or offline hash cracking — to obtain valid accounts.",
+      "detection": "Alert on many failed authentications for one account (guessing), one attempt across many accounts (spraying), and failures followed by success. Correlate by source IP and account.",
+      "mitigation": "Enforce account lockout/throttling, strong password policy, MFA, and monitoring for spray/stuffing patterns."
+    },
+    "T1112": {
+      "name": "Modify Registry",
+      "description": "Adversaries create, modify, or delete Windows Registry keys and values to configure persistence, alter system behavior, store data, or evade defenses.",
+      "detection": "Monitor registry writes to autostart, service, and security-relevant keys (Run keys, services, Winlogon), and use of reg.exe/regedit from unusual processes.",
+      "mitigation": "Restrict write access to sensitive registry keys with least privilege and use application control and integrity monitoring."
+    },
+    "T1114": {
+      "name": "Email Collection",
+      "description": "Adversaries collect email — from local mail stores, remote mailboxes, or via forwarding rules — to obtain sensitive information and communications.",
+      "detection": "Monitor for creation of mail-forwarding rules, bulk mailbox access/export, access to PST/OST files, and unusual mailbox API activity.",
+      "mitigation": "Audit and restrict auto-forwarding rules, apply MFA and least privilege to mailboxes, and alert on bulk export."
+    },
+    "T1133": {
+      "name": "External Remote Services",
+      "description": "Adversaries use externally-facing remote services (VPN, RDP gateways, Citrix, SSH) with valid accounts to gain initial access or persist in an environment.",
+      "detection": "Monitor VPN/remote-gateway authentication for unusual sources, times, or accounts; flag first-time external logons and impossible travel.",
+      "mitigation": "Require MFA on all external remote access, restrict access with allowlists, disable unused services, and place gateways behind segmentation."
+    },
+    "T1134": {
+      "name": "Access Token Manipulation",
+      "description": "Adversaries manipulate Windows access tokens — duplicating, impersonating, or creating tokens — to run actions under a different user's security context and escalate or evade.",
+      "detection": "Monitor for token-manipulation API usage (e.g. DuplicateTokenEx, ImpersonateLoggedOnUser), unexpected privilege changes, and processes running as unexpected users.",
+      "mitigation": "Apply least privilege, restrict assignment of sensitive privileges (SeDebugPrivilege, SeImpersonatePrivilege), and use EDR behavioral detection."
+    },
+    "T1135": {
+      "name": "Network Share Discovery",
+      "description": "Adversaries enumerate shared drives and folders on remote systems to locate data and identify targets for lateral movement or collection.",
+      "detection": "Monitor for share-enumeration commands (net view, net share, Get-SmbShare) and SMB session enumeration, especially from non-admin hosts in bursts.",
+      "mitigation": "Least-privilege share permissions, disabling unnecessary shares, and detecting enumeration reduce exposure."
+    },
+    "T1136": {
+      "name": "Create Account",
+      "description": "Adversaries create local, domain, or cloud accounts to establish persistent access under credentials they control.",
+      "detection": "Alert on account-creation events, especially new privileged or service accounts created outside normal provisioning workflows or by unexpected actors.",
+      "mitigation": "Restrict account-creation rights, require approval workflows, and monitor and alert on all new-account events."
+    },
+    "T1189": {
+      "name": "Drive-by Compromise",
+      "description": "Adversaries gain access when a user visits a malicious or compromised website that exploits the browser or its plugins to execute code without further user action.",
+      "detection": "Look for browser processes spawning shells or writing/executing files, exploit-kit indicators, and connections to malicious/low-reputation web infrastructure.",
+      "mitigation": "Keep browsers and plugins patched, use exploit protection and sandboxing, block malicious sites, and restrict script/plugin execution."
+    },
+    "T1190": {
+      "name": "Exploit Public-Facing Application",
+      "description": "Adversaries exploit vulnerabilities in internet-facing applications or services (web apps, APIs, databases, network appliances) to gain initial access.",
+      "detection": "Monitor web/app server logs for exploitation patterns (injection, deserialization, path traversal), web servers spawning shells, and post-exploitation file writes to web roots.",
+      "mitigation": "Patch promptly, use a web application firewall, apply least privilege and segmentation for exposed services, and remove unnecessary internet exposure."
+    },
+    "T1195": {
+      "name": "Supply Chain Compromise",
+      "description": "Adversaries compromise a product, dependency, update mechanism, or vendor before delivery so that trusted software or hardware carries malicious code to victims.",
+      "detection": "Detect via anomalous behavior of trusted software post-update, integrity/hash mismatches of dependencies and updates, and unexpected outbound connections from vendor software.",
+      "mitigation": "Verify integrity and signatures of software/updates, vet third-party dependencies, and use least privilege plus behavioral monitoring for trusted software."
+    },
+    "T1199": {
+      "name": "Trusted Relationship",
+      "description": "Adversaries abuse an existing trusted relationship — such as a managed service provider, contractor, or partner connection — to access a victim through that trusted third party.",
+      "detection": "Monitor access originating from partner/MSP connections for anomalies, and treat third-party access with the same scrutiny (and logging) as internal privileged access.",
+      "mitigation": "Apply least privilege and network segmentation to third-party connections, require MFA, and audit external partner access."
+    },
+    "T1203": {
+      "name": "Exploitation for Client Execution",
+      "description": "Adversaries exploit vulnerabilities in client applications (browsers, office suites, PDF readers) so that opening a crafted document or file executes code.",
+      "detection": "Look for client applications (Office, Acrobat, browsers) spawning script interpreters or writing/executing payloads, and known exploit indicators.",
+      "mitigation": "Patch client software, disable macros and risky features, use exploit protection and application sandboxing, and block risky file types."
+    },
+    "T1204": {
+      "name": "User Execution",
+      "description": "Adversaries rely on a user to open a malicious file or link (e.g. from phishing) to trigger execution of the payload.",
+      "detection": "Correlate email/download delivery with subsequent execution: document or archive processes spawning interpreters, and users running unexpected downloaded binaries.",
+      "mitigation": "User security awareness training, blocking risky attachments, disabling macros, and application control reduce successful user execution."
+    },
+    "T1218": {
+      "name": "System Binary Proxy Execution",
+      "description": "Adversaries proxy execution of malicious code through trusted, signed system binaries (LOLBins such as rundll32, regsvr32, mshta, msiexec) to bypass application control and evade detection.",
+      "detection": "Monitor for signed system utilities executing remote or unusual payloads, atypical command-line arguments, and LOLBins making network connections.",
+      "mitigation": "Application control rules that constrain how LOLBins can be used, plus behavioral EDR detection, mitigate proxy execution."
+    },
+    "T1222": {
+      "name": "File and Directory Permissions Modification",
+      "description": "Adversaries modify file or directory permissions/ownership (ACLs, chmod/chown, icacls) to enable access, evade defenses, or make malicious files usable or hidden.",
+      "detection": "Monitor for permission-changing commands (icacls, cacls, chmod, chown, takeown) on system or security-relevant paths, particularly from non-admin processes.",
+      "mitigation": "Apply least privilege, restrict who can change permissions on sensitive paths, and use integrity monitoring/auditing of ACL changes."
+    },
+    "T1485": {
+      "name": "Data Destruction",
+      "description": "Adversaries destroy data and files on systems — overwriting, deleting, or corrupting them — to disrupt operations and impair availability, sometimes irrecoverably.",
+      "detection": "Look for mass file deletion/overwrite, use of secure-delete or disk-wiping tools, and rapid destructive I/O across many files.",
+      "mitigation": "Maintain tested, offline/immutable backups, restrict destructive permissions with least privilege, and alert on mass deletion."
+    },
+    "T1486": {
+      "name": "Data Encrypted for Impact",
+      "description": "Adversaries encrypt data on target systems (ransomware) to deny availability and extort the victim, often across many files and hosts simultaneously.",
+      "detection": "Detect rapid mass file modification with rising entropy, ransom-note creation, shadow-copy deletion, and known ransomware tool/behavior signatures.",
+      "mitigation": "Maintain tested offline/immutable backups, use behavioral anti-ransomware controls, segment networks to limit spread, and apply least privilege."
+    },
+    "T1489": {
+      "name": "Service Stop",
+      "description": "Adversaries stop or disable services — often security, database, or backup services — to disrupt availability or to remove obstacles before further impact.",
+      "detection": "Monitor for service stop/disable commands (sc stop, net stop, systemctl stop) and Service Control Manager events, especially targeting security or backup services.",
+      "mitigation": "Restrict permissions to stop critical services, protect security-service processes with tamper protection, and alert on stop/disable events."
+    },
+    "T1490": {
+      "name": "Inhibit System Recovery",
+      "description": "Adversaries delete or disable recovery features — Volume Shadow Copies, backup catalogs, boot recovery — to prevent restoration after a destructive or ransomware attack.",
+      "detection": "Alert on vssadmin/wbadmin delete, bcdedit recovery changes, shadow-copy deletion, and disabling of backup services — classic pre-encryption ransomware behavior.",
+      "mitigation": "Keep offline/immutable backups outside the host's control, restrict permissions to recovery tooling, and alert on recovery-deletion commands."
+    },
+    "T1491": {
+      "name": "Defacement",
+      "description": "Adversaries modify visual content — websites, internal pages, or host displays — to deliver a message, intimidate, or claim credit, damaging integrity and reputation.",
+      "detection": "Monitor for unexpected changes to web root/content files, integrity-check failures on served pages, and unusual writes by web-server processes.",
+      "mitigation": "Integrity monitoring of web content, least-privilege write access to web roots, patching of web apps, and tested backups for rapid restoration."
+    },
+    "T1499": {
+      "name": "Endpoint Denial of Service",
+      "description": "Adversaries exhaust the resources of a specific endpoint or service (CPU, memory, connections, application logic) to make it unavailable to legitimate users.",
+      "detection": "Look for resource-exhaustion patterns — sustained high CPU/memory, connection floods, or application error spikes — on targeted hosts and services.",
+      "mitigation": "Rate limiting, resource quotas, load balancing, upstream DoS protection, and patching of resource-exhaustion vulnerabilities."
+    },
+    "T1505": {
+      "name": "Server Software Component",
+      "description": "Adversaries abuse extensibility of server software — web shells, malicious IIS/Apache modules, SQL stored procedures, transport agents — to persist and execute code on servers.",
+      "detection": "Monitor for new/modified files in web roots (web shells), unexpected server modules/extensions, web servers spawning shells, and anomalous server-component loads.",
+      "mitigation": "Restrict write access to server content and module directories, apply least privilege, use file integrity monitoring, and patch server software."
+    },
+    "T1537": {
+      "name": "Transfer Data to Cloud Account",
+      "description": "Adversaries exfiltrate by transferring data to a cloud account or storage they control (e.g. copying to an attacker-owned bucket or sharing snapshots), keeping traffic within cloud-provider networks.",
+      "detection": "Monitor cloud audit logs for data copied/shared to external accounts, snapshot sharing, and unusual bulk object transfers to unfamiliar destinations.",
+      "mitigation": "Restrict cross-account sharing with policy, monitor cloud data-transfer events, and apply least privilege to cloud storage."
+    },
+    "T1539": {
+      "name": "Steal Web Session Cookie",
+      "description": "Adversaries steal web session cookies or tokens to hijack authenticated sessions and bypass credential authentication, including MFA.",
+      "detection": "Look for access to browser cookie stores, session reuse from new devices/IPs (impossible travel), and token use inconsistent with the originating device.",
+      "mitigation": "Bind sessions to device/context, shorten session lifetimes, protect cookie stores, and use phishing-resistant MFA and token-binding where available."
+    },
+    "T1543": {
+      "name": "Create or Modify System Process",
+      "description": "Adversaries create or modify system-level processes — Windows services, Linux systemd services, launch daemons/agents — to execute malicious code, usually for persistence and elevated privilege.",
+      "detection": "Monitor for new/modified services and daemons (Service Control Manager events, systemd unit changes, sc/systemctl usage) pointing to unusual binaries or paths.",
+      "mitigation": "Restrict permissions to create/modify services, apply least privilege, and audit service/daemon changes with integrity monitoring."
+    },
+    "T1547": {
+      "name": "Boot or Logon Autostart Execution",
+      "description": "Adversaries configure the system to automatically execute their code at boot or logon — via Run keys, startup folders, kernel modules, or similar autostart mechanisms — for persistence.",
+      "detection": "Monitor autostart locations (Run keys, startup folders, services, LSA/Winlogon, kernel modules) for new or modified entries pointing to suspicious binaries.",
+      "mitigation": "Restrict write access to autostart locations, use application control, and audit autostart-configuration changes."
+    },
+    "T1548": {
+      "name": "Abuse Elevation Control Mechanism",
+      "description": "Adversaries bypass or abuse privilege-elevation controls — UAC bypass, sudo/setuid abuse, elevated-prompt manipulation — to obtain higher privileges.",
+      "detection": "Monitor for known UAC-bypass techniques, unexpected auto-elevating processes, setuid/sudo misuse, and privilege elevation without corresponding prompts.",
+      "mitigation": "Configure UAC to the highest practical level, restrict sudo/setuid, apply least privilege, and remove local admin where unnecessary."
+    },
+    "T1550": {
+      "name": "Use Alternate Authentication Material",
+      "description": "Adversaries authenticate using stolen material other than a plaintext password — password hashes (pass-the-hash), Kerberos tickets (pass-the-ticket), or application access tokens — to move laterally without knowing the password.",
+      "detection": "Detect pass-the-hash/ticket via logon-type and NTLM/Kerberos anomalies, tickets used from unexpected hosts, and token reuse inconsistent with normal patterns.",
+      "mitigation": "Enable Credential Guard, restrict privileged-account reuse across hosts, rotate krbtgt, enforce MFA, and segment administrative tiers."
+    },
+    "T1552": {
+      "name": "Unsecured Credentials",
+      "description": "Adversaries search for credentials stored insecurely — in files, scripts, configuration, environment variables, registry, cloud metadata, or command history — and reuse them.",
+      "detection": "Monitor for access to credential-bearing files (config, .env, private keys), cloud instance-metadata requests, and searches through history/registry for password patterns.",
+      "mitigation": "Use secret managers/vaults, remove hardcoded credentials, restrict access to credential stores, and rotate exposed secrets."
+    },
+    "T1555": {
+      "name": "Credentials from Password Stores",
+      "description": "Adversaries extract credentials from password stores such as browser password managers, keychains, the Windows Credential Manager, and third-party vaults.",
+      "detection": "Monitor for access to browser/OS credential stores and keychain files, and use of tools that dump saved credentials.",
+      "mitigation": "Protect and encrypt password stores, apply least privilege, use MFA to reduce reuse value, and restrict access to keychain/credential files."
+    },
+    "T1558": {
+      "name": "Steal or Forge Kerberos Tickets",
+      "description": "Adversaries abuse Kerberos — Kerberoasting, AS-REP roasting, golden/silver ticket forgery — to obtain or forge tickets granting access to services and domains.",
+      "detection": "Detect anomalous TGS requests (Kerberoasting), RC4-encrypted ticket requests, tickets with abnormal lifetimes, and service-ticket requests for many SPNs.",
+      "mitigation": "Use strong service-account passwords/gMSA, restrict SPNs, enforce AES encryption, rotate krbtgt regularly, and monitor Kerberos activity."
+    },
+    "T1560": {
+      "name": "Archive Collected Data",
+      "description": "Adversaries compress and/or encrypt collected data into archives before exfiltration to reduce size and evade content inspection.",
+      "detection": "Look for archive-utility execution (zip, rar, 7z, tar) and archive creation shortly before outbound transfers, and password-protected archives in staging areas.",
+      "mitigation": "Data loss prevention, monitoring for archive creation in unusual contexts, and inspecting/blocking large outbound transfers."
+    },
+    "T1562": {
+      "name": "Impair Defenses",
+      "description": "Adversaries disable, modify, or interfere with security controls — antivirus/EDR, firewalls, logging, and event monitoring — to avoid detection and enable further activity.",
+      "detection": "Alert on stopping/disabling of security services, log-source silence, tampering with AV/EDR configuration, and firewall-rule changes weakening protection.",
+      "mitigation": "Enable tamper protection on security tools, restrict permissions to modify them, forward logs off-host, and alert when a log source goes silent."
+    },
+    "T1566": {
+      "name": "Phishing",
+      "description": "Adversaries send phishing messages — malicious attachments, links, or social engineering — to trick users into executing payloads or divulging credentials, a common initial-access vector.",
+      "detection": "Inspect email for malicious attachments/links and spoofing, correlate delivery with subsequent user execution or credential entry, and detect credential-harvesting pages.",
+      "mitigation": "Email filtering and attachment sandboxing, link rewriting, user awareness training, and MFA to blunt credential theft."
+    },
+    "T1567": {
+      "name": "Exfiltration Over Web Service",
+      "description": "Adversaries exfiltrate data to legitimate external web services (cloud storage, code-sharing, paste sites) whose traffic is commonly allowed, blending with normal usage.",
+      "detection": "Monitor for uploads to cloud-storage/paste/code services from unusual hosts or in unusual volumes, and connections to such services by server or service accounts.",
+      "mitigation": "Restrict or allowlist outbound access to web services, use data loss prevention and CASB controls, and inspect large outbound transfers."
+    },
+    "T1569": {
+      "name": "System Services",
+      "description": "Adversaries execute code by abusing the OS service manager — creating or manipulating services (e.g. via sc.exe, service execution) to run commands, sometimes with elevated privileges.",
+      "detection": "Monitor for service creation and execution events, sc.exe/PsExec service usage, and services launching cmd/PowerShell or binaries from unusual paths.",
+      "mitigation": "Restrict who can create/start services, apply least privilege, and audit service-creation and execution events."
+    },
+    "T1570": {
+      "name": "Lateral Tool Transfer",
+      "description": "Adversaries copy tools and files between internal systems (via SMB shares, admin shares, or remote copy) to stage capabilities as they move laterally.",
+      "detection": "Look for file writes to remote admin shares (ADMIN$, C$), internal SMB transfers of executables/scripts, and copies shortly followed by remote execution.",
+      "mitigation": "Restrict admin-share access, segment the network, apply least privilege, and monitor internal file-transfer patterns."
+    },
+    "T1571": {
+      "name": "Non-Standard Port",
+      "description": "Adversaries run command-and-control or exfiltration protocols over non-standard ports (e.g. HTTPS on an unusual port) to evade port-based filtering and detection.",
+      "detection": "Detect protocol/port mismatches — a known protocol on an unexpected port — and outbound connections to uncommon ports from server or user hosts.",
+      "mitigation": "Egress filtering that constrains destination ports, protocol-aware inspection, and network intrusion prevention reduce non-standard-port C2."
+    },
+    "T1572": {
+      "name": "Protocol Tunneling",
+      "description": "Adversaries tunnel their traffic inside another protocol (e.g. C2 over DNS, HTTP, or SSH tunnels) to conceal it and bypass network controls.",
+      "detection": "Look for tunneling indicators — long/high-entropy DNS queries, unexpected SSH tunnels, and payloads inconsistent with the carrier protocol.",
+      "mitigation": "Network intrusion prevention, DNS monitoring, egress filtering, and blocking unauthorized tunneling utilities limit covert tunnels."
+    },
+    "T1573": {
+      "name": "Encrypted Channel",
+      "description": "Adversaries encrypt C2 traffic using standard TLS or custom/symmetric cryptography to hide command-and-control content from inspection.",
+      "detection": "Where payload inspection is blocked by encryption, rely on metadata: beaconing cadence, JA3/TLS fingerprints, self-signed or anomalous certificates, and destination reputation.",
+      "mitigation": "TLS inspection where permitted, network intrusion prevention, and blocking connections to low-reputation destinations."
+    },
+    "T1583": {
+      "name": "Acquire Infrastructure",
+      "description": "Adversaries buy, lease, or register infrastructure — domains, servers, VPS, cloud accounts — ahead of an operation to support C2, delivery, and staging. (Pre-compromise; rarely visible in victim telemetry.)",
+      "detection": "Largely detected via external threat intelligence on newly-registered domains and known-bad infrastructure rather than on-host signals; correlate alerts with such indicators.",
+      "mitigation": "This pre-attack activity occurs outside victim environments and cannot be directly mitigated; rely on threat-intel blocking of known adversary infrastructure."
+    },
+    "T1584": {
+      "name": "Compromise Infrastructure",
+      "description": "Adversaries compromise third-party infrastructure (servers, domains, network devices, cloud accounts) belonging to others and repurpose it for their operations. (Pre-compromise from the victim's view.)",
+      "detection": "Detected chiefly through threat intelligence on compromised/abused infrastructure; correlate C2 or delivery indicators against such reputation data.",
+      "mitigation": "Occurs outside the victim environment; mitigation relies on threat-intel-driven blocking of known-abused infrastructure."
+    },
+    "T1586": {
+      "name": "Compromise Accounts",
+      "description": "Adversaries compromise existing third-party accounts (email, social media, cloud, developer) to use in later operations such as phishing or infrastructure access. (Pre-compromise resource development.)",
+      "detection": "Not typically visible in victim on-host telemetry; surfaced via threat intelligence about compromised sender/service accounts used against the organization.",
+      "mitigation": "External to the victim environment; rely on threat intelligence and on verifying the identity of external senders and services."
+    },
+    "T1587": {
+      "name": "Develop Capabilities",
+      "description": "Adversaries build their own capabilities — malware, exploits, certificates, or tooling — to support operations rather than obtaining them from others. (Pre-compromise resource development.)",
+      "detection": "Not observable in victim telemetry; relevant mainly as context via threat intelligence about a group's tooling and TTPs.",
+      "mitigation": "This development occurs outside victim environments and cannot be directly mitigated; focus on detection of the resulting capabilities in use."
+    },
+    "T1588": {
+      "name": "Obtain Capabilities",
+      "description": "Adversaries obtain capabilities — malware, exploits, code-signing certificates, tools, or vulnerability information — from third parties for use in operations. (Pre-compromise resource development.)",
+      "detection": "Not directly observable in victim telemetry; informs detection via threat intelligence on tooling, certificates, and exploits an adversary is known to use.",
+      "mitigation": "Occurs outside the victim environment; mitigation relies on detecting the obtained capabilities when they are deployed."
+    },
+    "T1589": {
+      "name": "Gather Victim Identity Information",
+      "description": "Adversaries collect identity information about the target — email addresses, employee names, credentials — through open sources or active means to support later targeting. (Reconnaissance.)",
+      "detection": "Mostly conducted outside victim visibility; some active collection may appear as phishing for information or unusual queries against public-facing identity services.",
+      "mitigation": "Limit exposure of employee/identity details publicly and train staff; much of this reconnaissance cannot be directly prevented."
+    },
+    "T1590": {
+      "name": "Gather Victim Network Information",
+      "description": "Adversaries collect information about the target's networks — IP ranges, domains, topology, DNS — via open sources or active scanning to plan operations. (Reconnaissance.)",
+      "detection": "Active elements may surface as external scanning or unusual DNS/WHOIS queries against the organization; much passive collection is not visible.",
+      "mitigation": "Minimize exposed network information and monitor external-facing services; passive OSINT collection largely cannot be prevented."
+    },
+    "T1591": {
+      "name": "Gather Victim Org Information",
+      "description": "Adversaries collect organizational details — business structure, roles, physical locations, relationships — to inform targeting and social engineering. (Reconnaissance.)",
+      "detection": "Largely conducted through open sources outside victim telemetry; occasionally visible as social-engineering probes or pretexting.",
+      "mitigation": "Limit sensitive organizational detail exposed publicly and train staff against pretexting; passive collection cannot be directly prevented."
+    },
+    "T1592": {
+      "name": "Gather Victim Host Information",
+      "description": "Adversaries collect information about target hosts — hardware, software, OS, configuration — via open sources or active probing to tailor later actions. (Reconnaissance.)",
+      "detection": "Active probing (banner grabbing, fingerprinting) may appear in external service logs; much passive collection is not visible to the victim.",
+      "mitigation": "Minimize information leaked by public-facing services (banners, error pages); passive host-information gathering cannot be fully prevented."
+    },
+    "T1595": {
+      "name": "Active Scanning",
+      "description": "Adversaries actively probe the target's infrastructure — scanning IP blocks, ports, and vulnerabilities — to identify reachable services and weaknesses. (Reconnaissance.)",
+      "detection": "Detect port/vulnerability scanning against external-facing assets via firewall, IDS, and web-server logs: many connections across ports/hosts from one source in a short window.",
+      "mitigation": "Reduce external attack surface, use intrusion prevention on internet-facing assets, and monitor for scanning; the activity itself originates externally."
+    }
+  }
+}

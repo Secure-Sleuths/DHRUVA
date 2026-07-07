@@ -1,0 +1,124 @@
+# Communication Templates — pre-drafted notifications for stakeholders.
+# Variables in {braces} are populated from incident data.
+
+templates:
+  - name: "executive_briefing"
+    audience: "C-suite, VP-level leadership"
+    trigger_severity: ["critical", "high"]
+    template_text: |
+      SECURITY INCIDENT BRIEFING
+
+      Date: {date}
+      Severity: {severity}
+      Status: {status}
+
+      SUMMARY:
+      A {severity}-severity security incident has been detected involving {affected_hosts_count} system(s).
+      The incident was classified as: {title}.
+
+      IMPACT:
+      - Systems affected: {affected_hosts}
+      - Users impacted: {affected_users_count}
+      - Business impact: {business_impact}
+
+      CURRENT STATUS:
+      - Detection time: {first_seen}
+      - Response initiated: {first_response_at}
+      - Current status: {status}
+
+      ACTIONS TAKEN:
+      {actions_summary}
+
+      NEXT STEPS:
+      {next_steps}
+
+      This briefing will be updated every {update_interval}.
+
+  - name: "technical_update"
+    audience: "SOC team, IT operations, engineering leads"
+    trigger_severity: ["critical", "high", "medium"]
+    template_text: |
+      INCIDENT TECHNICAL UPDATE
+
+      Incident ID: {incident_id}
+      Severity: {severity} | Status: {status}
+      MITRE Techniques: {mitre_techniques}
+
+      TIMELINE:
+      - First seen: {first_seen}
+      - Last activity: {last_seen}
+      - Alerts: {alert_count}
+
+      AFFECTED SYSTEMS:
+      - Hosts: {affected_hosts}
+      - IPs: {affected_ips}
+      - Users: {affected_users}
+
+      INVESTIGATION FINDINGS:
+      {investigation_summary}
+
+      CONTAINMENT ACTIONS:
+      {containment_actions}
+
+      IOCs:
+      {iocs}
+
+  - name: "customer_notification"
+    audience: "Affected client organization"
+    trigger_severity: ["critical"]
+    required_approvers: ["admin"]
+    template_text: |
+      Dear {customer_name},
+
+      We are writing to inform you of a security incident that was detected
+      in your environment on {date}.
+
+      WHAT HAPPENED:
+      Our SOC team detected {incident_type} activity affecting your infrastructure.
+      The incident was identified at {first_seen} and our team responded within
+      {response_time}.
+
+      WHAT WE DID:
+      {response_summary}
+
+      CURRENT STATUS:
+      The incident has been {status}. We are continuing to monitor your
+      environment for any related activity.
+
+      WHAT YOU SHOULD DO:
+      {customer_actions}
+
+      We will provide an updated report within 24 hours.
+
+      SecureSleuths SOC Team
+
+  - name: "regulatory_notification"
+    audience: "Legal, compliance, regulatory bodies"
+    trigger_severity: ["critical"]
+    required_approvers: ["admin"]
+    template_text: |
+      SECURITY INCIDENT NOTIFICATION
+
+      Organization: {organization}
+      Date of discovery: {first_seen}
+      Date of notification: {notification_date}
+
+      NATURE OF INCIDENT:
+      {incident_description}
+
+      DATA INVOLVED:
+      - Type of data: {data_classification}
+      - Records affected: {records_affected}
+      - Data subjects affected: {subjects_affected}
+
+      CONTAINMENT MEASURES:
+      {containment_measures}
+
+      RISK ASSESSMENT:
+      {risk_assessment}
+
+      REMEDIATION PLAN:
+      {remediation_plan}
+
+      CONTACT:
+      {contact_information}

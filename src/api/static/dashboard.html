@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>SecureSleuths DHRUVA</title>
+<link rel="stylesheet" href="/static/css/app.css">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/ag-grid-community@32.3.3/dist/ag-grid-community.min.noStyle.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@32.3.3/styles/ag-grid.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@32.3.3/styles/ag-theme-alpine.css">
+</head><body>
+<div class="h" style="position:fixed;top:0;left:0;right:0;z-index:100">
+  <div style="display:flex;align-items:center">
+    <div class="logo">
+      <img src="/static/logo.png" alt="SecureSleuths" style="height:40px;width:auto">
+      <span>DHRUVA</span>
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:14px">
+    <div id="status"><div id="dot" class="spin"></div><span style="color:#B8C8D8;font-size:11px">Connecting...</span></div>
+    <span id="clock" style="color:#7A8FA6;font-size:11px;font-family:'JetBrains Mono',monospace"></span>
+    <select id="tenant-selector" data-action="switchTenant" style="background:#1A2D4A;color:#E8EDF2;border:1px solid #2D4A6A;border-radius:4px;padding:3px 8px;font-size:11px;font-family:'JetBrains Mono',monospace;display:none;cursor:pointer"></select>
+    <span id="tenant-name" style="color:#818CF8;font-size:11px;font-family:'JetBrains Mono',monospace;display:none"></span>
+    <span id="userinfo" style="color:#B8C8D8;font-size:11px;font-family:'JetBrains Mono',monospace"></span>
+    <button id="logoutbtn" data-action="logout" style="background:transparent;border:1px solid #3D5A75;color:#B8C8D8;border-radius:4px;padding:3px 8px;font-size:10px;cursor:pointer;font-family:inherit;display:none">Logout</button>
+  </div>
+</div>
+<nav id="sidebar">
+  <div class="nav-group">
+    <div class="nav-label">Operations</div>
+    <div class="nav-item" data-tab="dailyreview" data-action="navClick"><i data-lucide="sun"></i><span class="nav-text">Daily Review</span><span class="nav-badge" id="drc" style="display:none"></span></div>
+    <div class="nav-item on" data-tab="overview" data-action="navClick"><i data-lucide="layout-dashboard"></i><span class="nav-text">Overview</span></div>
+    <div class="nav-item" data-tab="triage" data-action="navClick"><i data-lucide="scan-eye"></i><span class="nav-text">Triage</span><span class="nav-badge" id="tc" style="display:none"></span></div>
+    <div class="nav-item" data-tab="incidents" data-action="navClick"><i data-lucide="alert-triangle"></i><span class="nav-text">Incidents</span><span class="nav-badge" id="ic" style="display:none"></span></div>
+  </div>
+  <div class="nav-group">
+    <div class="nav-label">Intelligence</div>
+    <div class="nav-item" data-tab="detection" data-action="navClick"><i data-lucide="radar"></i><span class="nav-text">Detection</span><span class="nav-badge" id="dc" style="display:none"></span></div>
+    <div class="nav-item" data-tab="hunt" data-action="navClick"><i data-lucide="crosshair"></i><span class="nav-text">Hunt</span><span class="nav-badge" id="hc" style="display:none"></span></div>
+    <div class="nav-item" data-tab="feedback" data-action="navClick"><i data-lucide="refresh-ccw"></i><span class="nav-text">Closed Loop</span></div>
+    <div class="nav-item" data-tab="investigate" data-action="navClick"><i data-lucide="search"></i><span class="nav-text">Investigate</span></div>
+    <div class="nav-item" data-tab="mitre" data-action="navClick"><i data-lucide="grid-3x3"></i><span class="nav-text">MITRE</span></div>
+    <div class="nav-item" data-tab="threatintel" data-action="navClick"><i data-lucide="shield-alert"></i><span class="nav-text">Threat Intel</span></div>
+    <div class="nav-item" data-tab="knowledge" data-action="navClick"><i data-lucide="book-open"></i><span class="nav-text">Knowledge</span></div>
+  </div>
+  <div class="nav-group">
+    <div class="nav-label">Response</div>
+    <div class="nav-item" data-tab="soar" data-action="navClick"><i data-lucide="workflow"></i><span class="nav-text">SOAR</span><span class="nav-badge" id="soarc" style="display:none"></span></div>
+    <div class="nav-item" data-tab="tickets" data-action="navClick"><i data-lucide="ticket"></i><span class="nav-text">Tickets</span><span class="nav-badge" id="tktc" style="display:none"></span></div>
+    <div class="nav-item" data-tab="respond" data-action="navClick"><i data-lucide="terminal"></i><span class="nav-text">Respond</span></div>
+    <div class="nav-item" data-tab="fim" data-action="navClick"><i data-lucide="file-search"></i><span class="nav-text">Host Integrity</span></div>
+    <div class="nav-item" data-tab="groups" data-action="navClick" style="display:none"><i data-lucide="layers"></i><span class="nav-text">Agent Groups</span></div>
+  </div>
+  <div class="nav-group">
+    <div class="nav-label">System</div>
+    <div class="nav-item" data-tab="metrics" data-action="navClick"><i data-lucide="bar-chart-3"></i><span class="nav-text">Metrics</span></div>
+    <div class="nav-item" data-tab="reports" data-action="navClick"><i data-lucide="file-text"></i><span class="nav-text">Reports</span></div>
+    <div class="nav-item" data-tab="admin" data-action="navClick" style="display:none"><i data-lucide="settings"></i><span class="nav-text">Admin</span></div>
+  </div>
+  <div class="sidebar-toggle" data-action="toggleSidebar">
+    <i data-lucide="panel-left-close" id="sidebar-toggle-icon"></i>
+    <span class="toggle-text">Collapse</span>
+  </div>
+</nav>
+<div class="m" id="content">Loading...</div>
+<div class="slide-over" id="slide-over"></div>
+<script src="/static/js/app.js"></script>
+</body></html>

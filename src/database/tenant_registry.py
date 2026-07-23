@@ -159,7 +159,11 @@ class TenantServiceRegistry:
                 return None
             try:
                 from src.agents.claude_backend import LLMBackend
-                backend = LLMBackend(self._global_config)
+                # WO-H50: pass the DB so usage is actually recorded. Without it,
+                # LLMBackend._track short-circuits on `if not self._usage_db`
+                # and every call goes unmetered — the cause of "0 usage rows
+                # since restart" on a live install.
+                backend = LLMBackend(self._global_config, db=self.db)
                 self._llm_backends[tenant_id] = backend
                 logger.info("tenant_llm_using_global_fallback",
                            tenant_id=tenant_id, provider=backend.mode)
@@ -183,7 +187,7 @@ class TenantServiceRegistry:
             # Fallback to legacy single-provider backend
             try:
                 from src.agents.claude_backend import LLMBackend
-                backend = LLMBackend({"llm": llm_config})
+                backend = LLMBackend({"llm": llm_config}, db=self.db)  # WO-H50: meter usage
                 self._llm_backends[tenant_id] = backend
                 logger.info("tenant_llm_backend_fallback_created",
                            tenant_id=tenant_id, provider=backend.mode)

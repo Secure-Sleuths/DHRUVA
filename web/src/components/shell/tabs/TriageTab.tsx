@@ -43,17 +43,19 @@ import { PageHeading } from "../PageHeading";
 import {
   getDecisionAuditTrail,
   getPendingReview,
+  getTriageDecision,
   getTriageDecisionsFiltered,
   ApiError,
 } from "@/lib/api";
 import { SEVERITY, riskSeverity, severityLabel } from "@/lib/severity";
-import { verdictPresentation } from "@/lib/triage";
+import { decisionPresentation } from "@/lib/triage";
 import { cn, focusRing } from "@/lib/ui";
 import {
   GlassBoxAlertCard,
   errMessage,
   formatWhen,
 } from "../GlassBoxCase";
+import { DecisionClaim, claimedLabel } from "../DecisionClaim";
 import type { TabProps } from "../tabRegistry";
 import type {
   GlassBox,
@@ -132,6 +134,10 @@ interface QueueState {
   total: number;
   error: string | null;
   loading: boolean;
+  /** WO-H33: another page exists past the loaded window (server-computed). */
+  hasMore: boolean;
+  /** WO-H33: the SQL offset of the NEXT page (server echo, anomaly-safe). */
+  nextOffset: number;
 }
 
 export function TriageTab({ navParam }: TabProps) {
@@ -140,9 +146,19 @@ export function TriageTab({ navParam }: TabProps) {
     total: 0,
     error: null,
     loading: true,
+    hasMore: false,
+    nextOffset: 0,
   });
   const [secondsAgo, setSecondsAgo] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
+  // WO-H33: an in-flight "Load more" append (kept apart from `refreshing` so
+  // the poll indicator and the pager never fight over one spinner).
+  const [loadingMore, setLoadingMore] = useState(false);
+  // WO-H33: once the analyst has paged deeper, background polls stop replacing
+  // the list (a 30s poll resetting a 5-page working set would yank rows out
+  // from under the analyst mid-backlog). A manual refresh or filter change
+  // resets to the first page and re-arms polling.
+  const pagedRef = useRef(false);
   // Filter chips (parity gap ② + the legacy "Open"/Pending chip). Default = no filter.
   const [verdictFilter, setVerdictFilter] = useState<VerdictFilter>("all");
   const [timeFilter, setTimeFilter] = useState<TimeFilter>("all");
@@ -158,6 +174,8 @@ export function TriageTab({ navParam }: TabProps) {
     try {
       let decisions: TriageDecision[];
       let total: number;
+      let hasMore = false;
+      let nextOffset = 0;
       if (verdictFilter === "open") {
         // "Open" = the human-review backlog (escalated + no human verdict yet).
         // Its own endpoint takes no verdict/time params. Rows are normalized
@@ -189,12 +207,18 @@ export function TriageTab({ navParam }: TabProps) {
         if (ac.signal.aborted) return;
         decisions = res.decisions;
         total = res.total;
+        // WO-H33 pagination echo — absent on older servers → no pager.
+        hasMore = res.has_more ?? false;
+        nextOffset = (res.offset ?? 0) + (res.limit ?? decisions.length);
       }
+      pagedRef.current = false; // fresh first page → polling is safe again
       setState({
         decisions,
         total,
         error: null,
         loading: false,
+        hasMore,
+        nextOffset,
       });
       setSecondsAgo(0);
     } catch (e) {
@@ -210,18 +234,67 @@ export function TriageTab({ navParam }: TabProps) {
       setState((prev) =>
         prev.decisions
           ? { ...prev, loading: false }
-          : { decisions: null, total: 0, error: msg, loading: false },
+          : {
+              decisions: null,
+              total: 0,
+              error: msg,
+              loading: false,
+              hasMore: false,
+              nextOffset: 0,
+            },
       );
     } finally {
       if (!ac.signal.aborted) setRefreshing(false);
     }
   }, [verdictFilter, timeFilter]);
 
+  // WO-H33: append the next page of the worst-first window (dedup by id — the
+  // live queue shifts under offset pages, so a row that slid down into the
+  // next page must not render twice). Uses the server-echoed next offset, so
+  // the anomaly post-filter can shorten a PAGE without desyncing the WINDOW.
+  const loadMore = useCallback(async () => {
+    if (loadingMore || verdictFilter === "open") return;
+    setLoadingMore(true);
+    try {
+      const isAnomaly = verdictFilter === "anomaly";
+      const res = await getTriageDecisionsFiltered({
+        sort: "risk",
+        verdict:
+          verdictFilter === "all" || isAnomaly ? undefined : verdictFilter,
+        anomaly: isAnomaly || undefined,
+        limit: isAnomaly ? 1000 : undefined,
+        since: sinceForTimeFilter(timeFilter),
+        offset: state.nextOffset,
+      });
+      pagedRef.current = true; // deep in the backlog → stop poll resets
+      setState((prev) => {
+        const seen = new Set((prev.decisions ?? []).map((d) => d.id));
+        const appended = res.decisions.filter((d) => !seen.has(d.id));
+        const decisions = [...(prev.decisions ?? []), ...appended];
+        return {
+          ...prev,
+          decisions,
+          total: decisions.length,
+          hasMore: res.has_more ?? false,
+          nextOffset: (res.offset ?? 0) + (res.limit ?? res.decisions.length),
+        };
+      });
+    } catch {
+      // Leave the loaded window intact; the pager stays visible for a retry.
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [loadingMore, verdictFilter, timeFilter, state.nextOffset]);
+
   // Initial fetch + auto-poll. Re-runs when a filter changes (load identity
-  // changes) → the queue refetches server-side with the new filter.
+  // changes) → the queue refetches server-side with the new filter. Polls are
+  // suspended while the analyst is paged past the first window (WO-H33) —
+  // manual refresh always resets to page one and re-arms them.
   useEffect(() => {
     load(false);
-    const poll = setInterval(() => load(false), POLL_MS);
+    const poll = setInterval(() => {
+      if (!pagedRef.current) load(false);
+    }, POLL_MS);
     return () => {
       clearInterval(poll);
       abortRef.current?.abort();
@@ -239,7 +312,7 @@ export function TriageTab({ navParam }: TabProps) {
     if (navParam) setSelectedId(navParam);
   }, [navParam]);
 
-  const { decisions, error, loading } = state;
+  const { decisions, error, loading, hasMore } = state;
   const filtersActive = verdictFilter !== "all" || timeFilter !== "all";
   const clearFilters = () => {
     setVerdictFilter("all");
@@ -339,6 +412,7 @@ export function TriageTab({ navParam }: TabProps) {
                 <TH>AI verdict</TH>
                 <TH>Confidence</TH>
                 <TH>Risk</TH>
+                <TH>Claimed</TH>
                 <TH className="w-16" aria-label="Open" />
               </TR>
             </THead>
@@ -348,6 +422,19 @@ export function TriageTab({ navParam }: TabProps) {
               ))}
             </TBody>
           </Table>
+          {/* WO-H33 pager: the worst-first window used to end silently at the
+              first page, hiding every high-risk row past the cap. */}
+          {hasMore && verdictFilter !== "open" && (
+            <div className="flex items-center justify-center gap-3 border-t border-line px-3 py-2">
+              <span className="text-kbd text-dim2">
+                Showing the {decisions!.length} highest-priority rows — more
+                match below this window.
+              </span>
+              <Chip onClick={loadMore}>
+                {loadingMore ? "Loading…" : "Load more"}
+              </Chip>
+            </div>
+          )}
         </Panel>
       )}
 
@@ -468,7 +555,10 @@ function TriageRow({
   onOpen: () => void;
 }) {
   const sev = riskSeverity(d.risk_score);
-  const verdict = verdictPresentation(String(d.verdict));
+  const verdict = decisionPresentation({
+    verdict: String(d.verdict),
+    llm_failed: d.llm_failed,
+  });
   const title = d.rule_description ?? `Alert ${d.id}`;
 
   // "open ›" → THAT decision's glass-box case (in-tab master→detail), NOT the
@@ -503,6 +593,17 @@ function TriageRow({
       <TD mono className={cn("font-bold", SEVERITY[sev].textClass)}>
         {d.risk_score}
       </TD>
+      {/* WO-H25 ownership — who is working this alert. Defensive: absent
+          `claimed_by` (older backend / unclaimed) renders a quiet dash. */}
+      <TD className="text-kbd">
+        {d.claimed_by ? (
+          <span title={claimedLabel(d.claimed_by)}>{d.claimed_by}</span>
+        ) : (
+          <span className="text-dim2" title="Unclaimed">
+            —
+          </span>
+        )}
+      </TD>
       <TD className="text-kbd text-dim2">open ›</TD>
     </TR>
   );
@@ -533,7 +634,32 @@ function DecisionCaseView({
   const [glassBox, setGlassBox] = useState<GlassBox | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // WO-H33: a deep-linked decision may sit beyond the loaded queue window —
+  // resolve it by id instead of dead-ending on "not in the current slice".
+  const [fetchedDecision, setFetchedDecision] = useState<TriageDecision | null>(
+    null,
+  );
+  const [fetchingDecision, setFetchingDecision] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    if (decision) return; // already in the loaded window
+    const ac = new AbortController();
+    setFetchingDecision(true);
+    getTriageDecision(decisionId, ac.signal)
+      .then((row) => {
+        if (!ac.signal.aborted) setFetchedDecision(row);
+      })
+      .catch(() => {
+        // 404 (foreign tenant / deleted) or transient failure → the honest
+        // "not found" empty state below; never fabricate a case.
+        if (!ac.signal.aborted) setFetchedDecision(null);
+      })
+      .finally(() => {
+        if (!ac.signal.aborted) setFetchingDecision(false);
+      });
+    return () => ac.abort();
+  }, [decision, decisionId]);
 
   const loadTrail = useCallback(async () => {
     abortRef.current?.abort();
@@ -578,53 +704,56 @@ function DecisionCaseView({
     </button>
   );
 
-  // The decision may not be in the current (polled) queue slice — surface that
-  // honestly rather than fabricating a case.
-  if (!decision) {
+  // WO-H33: prefer the row from the loaded window; otherwise the by-id fetch.
+  const row = decision ?? fetchedDecision;
+
+  // Not in the loaded slice AND not resolvable by id (404: deleted or another
+  // tenant's) — surface that honestly rather than fabricating a case.
+  if (!row) {
     return (
       <>
         {backButton}
-        {loading ? (
+        {loading || fetchingDecision ? (
           <StatusState variant="loading" title="Loading the decision…" />
         ) : (
           <StatusState
             variant="empty"
-            title="Decision not in the current queue"
-            description={`Decision ${decisionId} isn't in the current triage slice (it may have aged out or been re-sorted). Go back to the queue and reopen it.`}
+            title="Decision not found"
+            description={`Decision ${decisionId} could not be loaded — it may have been removed, or the link may be stale. Go back to the queue and reopen it.`}
           />
         )}
       </>
     );
   }
 
-  const sev = riskSeverity(decision.risk_score);
+  const sev = riskSeverity(row.risk_score);
   const alert: IncidentAlert = {
-    id: decision.id,
-    rule_id: decision.rule_id,
-    rule_description: decision.rule_description,
+    id: row.id,
+    rule_id: row.rule_id,
+    rule_description: row.rule_description,
     agent_type: "triage",
-    verdict: decision.verdict,
-    confidence: decision.confidence,
-    risk_score: decision.risk_score,
-    reasoning: decision.reasoning ?? null,
+    verdict: row.verdict,
+    confidence: row.confidence,
+    risk_score: row.risk_score,
+    reasoning: row.reasoning ?? null,
     enrichment_summary:
-      decision.enrichment_summary ??
+      row.enrichment_summary ??
       JSON.stringify({
-        agent_name: decision.host,
-        src_ip: decision.src_ip,
-        rule_mitre_techniques: decision.technique_ids,
-        rule_mitre_tactics: decision.tactic_ids,
+        agent_name: row.host,
+        src_ip: row.src_ip,
+        rule_mitre_techniques: row.technique_ids,
+        rule_mitre_tactics: row.tactic_ids,
       }),
-    human_verdict: decision.human_verdict ?? null,
-    created_at: decision.created_at,
+    human_verdict: row.human_verdict ?? null,
+    created_at: row.created_at,
     glass_box: glassBox ?? undefined,
-    anonymized_fields: decision.anonymized_fields,
+    anonymized_fields: row.anonymized_fields,
     // AI recommended next-steps (legacy "Recommended Actions") — rendered by the
     // glass-box card's RecommendedActionsExpander.
-    actions_taken: decision.actions_taken ?? null,
+    actions_taken: row.actions_taken ?? null,
     // AIS2 grounding self-check — carried through so the glass-box card can show
     // the low/medium flag near confidence. Flag-only / decorative.
-    grounding: decision.grounding,
+    grounding: row.grounding,
   };
 
   return (
@@ -633,28 +762,40 @@ function DecisionCaseView({
       <Panel className="p-4">
         {/* case header */}
         <div className="mb-1.5 flex flex-wrap items-center gap-2.5">
-          <Chip mono aria-label={`decision id ${decision.id}`}>
-            {decision.id}
+          <Chip mono aria-label={`decision id ${row.id}`}>
+            {row.id}
           </Chip>
           <SeverityBadge severity={sev} />
-          {decision.host && (
-            <span className="font-mono text-kbd text-dim">{decision.host}</span>
+          {row.host && (
+            <span className="font-mono text-kbd text-dim">{row.host}</span>
           )}
           <span className="text-kbd text-dim2">
-            {formatWhen(decision.created_at)}
+            {formatWhen(row.created_at)}
           </span>
-          {decision.technique_ids.map((t) => (
+          {row.technique_ids.map((t) => (
             <Chip key={t} mono>
               {t}
             </Chip>
           ))}
         </div>
         <div className="text-title font-semibold">
-          {decision.rule_description ?? `Alert ${decision.id}`}
+          {row.rule_description ?? `Alert ${row.id}`}
         </div>
-        <div className="mb-3 text-kbd text-dim2">
+        <div className="mb-1.5 text-kbd text-dim2">
           One AI decision · glass-box — the risk math, the AI&apos;s reasoning,
           its provenance, and what it saw vs what you see.
+        </div>
+
+        {/* WO-H25 — alert-level ownership: claim this decision to yourself so
+            a colleague working the queue sees it's taken. Self-claim,
+            unowned-only; the gate mirrors the server (see DecisionClaim). A
+            successful claim/release refetches the queue via onReload. */}
+        <div className="mb-3">
+          <DecisionClaim
+            decisionId={row.id}
+            claimedBy={row.claimed_by}
+            onChanged={onReload}
+          />
         </div>
 
         {loading && !glassBox ? (

@@ -150,7 +150,10 @@ class AISocPlatform:
         # entries are deliberately ignored; operators on legacy configs
         # see a clear v4.9.0 cutover error instead of a silent fallback.
         db_cfg = self.config.get("database") or {}
-        self.db = SOCDatabase(db_cfg.get("dsn"))
+        # Pool size: config database.pool_size → DB_POOL_SIZE env → default 20
+        # (resolution + sizing arithmetic live in SOCDatabase).
+        self.db = SOCDatabase(db_cfg.get("dsn"),
+                              pool_size=db_cfg.get("pool_size"))
         logger.info("database_ready")
 
         # Seed admin user from env if DB has no users (backward compat)
@@ -247,13 +250,33 @@ class AISocPlatform:
 
         # Detect multi-tenant mode: if more than one active tenant exists,
         # enable fail-closed tenant isolation across OpenSearch/Wazuh queries.
-        from src.database.store import set_multi_tenant_mode
+        from src.database.store import set_multi_tenant_mode, is_multi_tenant
         try:
             active_tenants = self.tenant_registry.get_active_tenant_ids()
             _is_mt = len(active_tenants) > 1
             set_multi_tenant_mode(_is_mt)
         except Exception:
             set_multi_tenant_mode(False)
+
+        # WO-H12-followup: RLS-active boot gate. In multi-tenant mode the Postgres
+        # RLS backstop (WO-H12) is the structural tenant-isolation guarantee — but
+        # it is SILENTLY bypassed when DHRUVA connects as a superuser / BYPASSRLS
+        # role (e.g. the docker-compose bundled-db default). Refuse to start rather
+        # than run with a backstop that isn't actually in effect. Single-tenant mode
+        # skips this (RLS is not the isolation boundary there).
+        if is_multi_tenant():
+            _rls_ok, _rls_reason = self.db.verify_rls_active()
+            if not _rls_ok:
+                raise SystemExit(
+                    "FATAL: multi-tenant mode is active but Postgres Row-Level "
+                    "Security is NOT in effect — the tenant backstop is silently "
+                    f"bypassed. {_rls_reason} Fix: run DHRUVA as a NON-superuser, "
+                    "NON-BYPASSRLS DB role (see docs/MULTI-TENANT.md §Row-Level "
+                    "Security) and ensure migration 0006 has run. Refusing to start."
+                )
+            logger.info("rls_backstop_active", detail=_rls_reason)
+        else:
+            logger.info("rls_backstop_skipped", reason="single-tenant mode")
 
         # Triage Agent (with multi-tenant LLM support)
         self.triage_agent = TriageAgent(
@@ -344,6 +367,38 @@ class AISocPlatform:
             soar_engine=self.soar_engine,
             ticketing_service=self.ticketing_service)
         logger.info("incident_engine_ready")
+
+        # WO-H9: parallel-triage dispatcher. The fetch loop enqueues enriched
+        # alerts; a bounded pool of workers drains them in risk-priority order,
+        # each triaging one alert under its own tenant context and then running
+        # the per-decision downstream (incident grouping + SOAR eval). This
+        # replaces the old inline/serial ``for`` in run_alert_loop.
+        from src.agents.triage_dispatcher import TriageDispatcher
+        triage_cfg = self.config.get("agents", {}).get("triage", {})
+        max_workers = int(triage_cfg.get("max_workers", 4))
+        # WO-H32 QA: in CLI mode every LLM call is a whole `claude` subprocess
+        # (~40s, real memory) — don't spawn them concurrently; clamp to one
+        # worker. Detected the same way the backend itself decides: the
+        # anthropic provider's resolved ``sub_mode``. API mode (and
+        # non-anthropic providers, which have no sub_mode) keep the configured
+        # value. Multi-tenant resolves backends per tenant (legacy ``claude``
+        # is None) so THIS clamp can't see them — there, WO-H37 clamps at the
+        # backend instead: MultiProviderLLMBackend._sem_for serializes calls
+        # through any CLI-resolved provider (1 permit), while the shared
+        # worker pool keeps the configured size for API-mode tenants.
+        _provider = getattr(
+            getattr(self.triage_agent, "claude", None), "provider", None)
+        if getattr(_provider, "sub_mode", "") == "cli" and max_workers > 1:
+            logger.info("triage_concurrency_clamped_cli",
+                        requested=max_workers, effective=1)
+            max_workers = 1
+        self.triage_dispatcher = TriageDispatcher(
+            self.triage_agent, self.db,
+            max_workers=max_workers,
+            on_decision=self._process_decision_downstream,
+            max_queue=int(triage_cfg.get("max_queue", 1000)),
+        )
+        logger.info("triage_dispatcher_ready", max_workers=max_workers)
 
         # Pipeline Health Monitor (optional)
         self.pipeline_monitor = None
@@ -774,6 +829,50 @@ class AISocPlatform:
         finally:
             _tenant_ctx.reset(_ctx_token)
 
+    def _check_llm_health_periodic(self):
+        """WO-H46-c: alert when triage is failing closed instead of working.
+
+        A dead LLM backend is invisible in ordinary metrics: triage fails
+        CLOSED, so every un-analyzed alert is still written as an escalated
+        ``needs_investigation`` decision. The queue looks BUSY, not BROKEN. On
+        one install that masquerade ran long enough to bank 1398 un-analyzed
+        rows — 20% of its decision history — before anyone noticed.
+
+        This turns that silence into a periodic CRITICAL log line. It is
+        deliberately observation-only: it never stops the platform, because
+        ingestion, enrichment, correlation and the deterministic
+        always-escalate rules all keep working without an LLM.
+        """
+        try:
+            stats = self.db.get_llm_failure_rate(hours=1)
+        except Exception as e:  # noqa: BLE001 — a health probe must not crash the scheduler
+            logger.warning("llm_health_check_failed", error=str(e))
+            return
+
+        if stats["total"] == 0:
+            return  # nothing triaged this hour; nothing to say
+
+        if stats["failed"] == stats["total"]:
+            logger.critical(
+                "llm_backend_down",
+                failed=stats["failed"], total=stats["total"],
+                message="EVERY triage call in the last hour failed. Alerts are "
+                        "being escalated WITHOUT analysis — the queue will look "
+                        "busy while nothing is actually being triaged.",
+                remediation="Check the LLM backend: expired `claude login` "
+                            "session, empty/invalid ANTHROPIC_API_KEY, or a "
+                            "provider outage.")
+        elif stats["failure_rate"] >= 0.25:
+            logger.error(
+                "llm_backend_degraded",
+                failed=stats["failed"], total=stats["total"],
+                failure_rate=round(stats["failure_rate"], 3),
+                message="A significant share of triage calls are failing; those "
+                        "alerts were escalated without analysis.")
+        else:
+            logger.info("llm_health_ok",
+                        failed=stats["failed"], total=stats["total"])
+
     def _check_license_periodic(self):
         """Periodic license expiry check. Shuts down platform if expired."""
         from src.licensing import LicenseValidator, LicenseExpiredError, LicenseError
@@ -872,6 +971,33 @@ class AISocPlatform:
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
 
+    def _leader_job(self, job_id: str, fn):
+        """WO-H9 leader election wrapper for a scheduled job.
+
+        Guards ``fn`` with a per-job ``pg_try_advisory_lock`` so that with N
+        replicas/processes sharing one Postgres, EXACTLY ONE runs the job at a
+        time. A non-leader SKIPS the cycle (it does NOT block then double-run) —
+        the whole point is that a second replica must not, e.g., fire an
+        active-response block or a TI-collection write twice.
+
+        Applied only to jobs whose side effects are SHARED (DB / OpenSearch /
+        Wazuh / external). Per-process, in-memory jobs (guidance reload, license
+        state refresh) are intentionally NOT wrapped — every replica needs to
+        run those locally.
+        """
+        def _wrapped():
+            try:
+                with self.db.job_lock(f"dhruva:job:{job_id}") as is_leader:
+                    if not is_leader:
+                        logger.info("scheduled_job_skipped_not_leader",
+                                    job=job_id)
+                        return
+                    fn()
+            except Exception as e:
+                logger.error("scheduled_job_failed", job=job_id,
+                             error=str(e))
+        return _wrapped
+
     def _schedule_periodic_tasks(self):
         """Schedule background tasks."""
         agents_cfg = self.config.get("agents", {})
@@ -881,7 +1007,7 @@ class AISocPlatform:
         if det_cfg.get("enabled", True) and self.detection_agent:
             interval = det_cfg.get("run_interval_minutes", 60)
             self.scheduler.add_job(
-                self._run_detection_cycle,
+                self._leader_job('detection_cycle', self._run_detection_cycle),
                 'interval',
                 minutes=interval,
                 id='detection_cycle',
@@ -895,7 +1021,7 @@ class AISocPlatform:
         if fb_cfg.get("enabled", True) and self.feedback_engine:
             interval = fb_cfg.get("pattern_analysis_interval_hours", 4)
             self.scheduler.add_job(
-                self._run_feedback_cycle,
+                self._leader_job('feedback_cycle', self._run_feedback_cycle),
                 'interval',
                 hours=interval,
                 id='feedback_cycle',
@@ -905,6 +1031,8 @@ class AISocPlatform:
             logger.info("feedback_cycle_scheduled", interval_hrs=interval)
 
         # Guidance reload (pick up file changes)
+        # WO-H9: intentionally NOT leader-gated — this mutates per-process
+        # in-memory guidance, so EVERY replica must reload its own copy.
         self.scheduler.add_job(
             self.guidance.reload,
             'interval',
@@ -918,7 +1046,7 @@ class AISocPlatform:
         if hunt_cfg.get("enabled", True) and self.hunt_agent:
             hunt_interval = hunt_cfg.get("run_interval_hours", 6)
             self.scheduler.add_job(
-                self._run_hunt_cycle,
+                self._leader_job('hunt_cycle', self._run_hunt_cycle),
                 'interval',
                 hours=hunt_interval,
                 id='hunt_cycle',
@@ -933,7 +1061,7 @@ class AISocPlatform:
                 "historical", {}
             ).get("baseline_refresh_hours", 6)
             self.scheduler.add_job(
-                self._compute_baselines,
+                self._leader_job('baseline_computation', self._compute_baselines),
                 'interval',
                 hours=baseline_interval,
                 id='baseline_computation',
@@ -951,17 +1079,49 @@ class AISocPlatform:
                 logger.warning("processed_cleanup_failed", error=str(e))
 
         self.scheduler.add_job(
-            _safe_cleanup,
+            self._leader_job('processed_cleanup', _safe_cleanup),
             'interval',
             hours=24,
             id='processed_cleanup',
             name='Processed Alerts Cleanup'
         )
 
+        # WO-H28: daily retention prune for ever-growing tables
+        # (operational_metrics, agent_decisions, decision_audit_trail,
+        # soar_executions, llm_usage_metrics, webhook_requests, budget
+        # reservations). Windows are config-driven (retention.days.*,
+        # 0 = keep forever); deletes run in batches; leader-gated so only
+        # one replica prunes.
+        ret_cfg = self.config.get("retention", {}) or {}
+        if ret_cfg.get("enabled", True):
+            def _retention_prune():
+                try:
+                    with self.db.cross_tenant():
+                        results = self.db.prune_expired_rows(
+                            ret_cfg.get("days", {}) or {},
+                            batch_size=int(ret_cfg.get("batch_size", 10000)))
+                    logger.info("retention_prune_cycle_completed",
+                                deleted={t: n for t, n in results.items() if n})
+                except Exception as e:
+                    logger.error("retention_prune_cycle_failed", error=str(e))
+            self.scheduler.add_job(
+                self._leader_job('retention_prune', _retention_prune),
+                'cron',
+                hour=int(ret_cfg.get("run_hour", 3)),
+                minute=15,
+                id='retention_prune',
+                name='Retention Prune',
+                max_instances=1, coalesce=True,
+            )
+            logger.info("retention_prune_scheduled",
+                        run_hour=int(ret_cfg.get("run_hour", 3)))
+
         # License expiry check
         license_check_hrs = self.config.get("licensing", {}).get(
             "check_interval_hours", 24
         )
+        # WO-H9: NOT leader-gated — each replica must re-check its own license
+        # state (per-process ``_license_info``), so all replicas run this.
         self.scheduler.add_job(
             self._check_license_periodic,
             'interval',
@@ -970,13 +1130,28 @@ class AISocPlatform:
             name='License Expiry Check'
         )
 
+        # WO-H46-c: LLM-backend health. Observation-only — never stops the
+        # platform, because a dead LLM does not stop ingestion/enrichment.
+        # Frequent (default 15 min) because the failure mode is silent: triage
+        # fails closed, so a broken backend reads as a busy escalation queue.
+        llm_health_mins = self.config.get("health", {}).get(
+            "llm_check_interval_minutes", 15
+        )
+        self.scheduler.add_job(
+            self._check_llm_health_periodic,
+            'interval',
+            minutes=llm_health_mins,
+            id='llm_health_check',
+            name='LLM Backend Health Check'
+        )
+
         # Threat intelligence feed collection
         if self.ti_collector:
             ti_interval = self.config.get("threat_intel", {}).get(
                 "collect_interval_minutes", 30
             )
             self.scheduler.add_job(
-                self._run_ti_collection,
+                self._leader_job('ti_collection', self._run_ti_collection),
                 'interval',
                 minutes=ti_interval,
                 id='ti_collection',
@@ -987,7 +1162,7 @@ class AISocPlatform:
                 with self.db.cross_tenant():
                     self.ti_collector.cleanup_expired()
             self.scheduler.add_job(
-                _ti_cleanup,
+                self._leader_job('ti_ioc_cleanup', _ti_cleanup),
                 'interval',
                 hours=24,
                 id='ti_ioc_cleanup',
@@ -1005,7 +1180,7 @@ class AISocPlatform:
                     except Exception as e:
                         logger.error("sla_breach_check_failed", tenant=tid, error=str(e))
             self.scheduler.add_job(
-                _sla_check,
+                self._leader_job('sla_breach_check', _sla_check),
                 'interval',
                 minutes=5,
                 id='sla_breach_check',
@@ -1022,7 +1197,7 @@ class AISocPlatform:
                 except Exception as e:
                     logger.error("mtt_rollup_failed", tenant=tid, error=str(e))
         self.scheduler.add_job(
-            _mtt_rollup,
+            self._leader_job('daily_mtt_rollup', _mtt_rollup),
             'cron',
             hour=1,
             minute=0,
@@ -1040,7 +1215,7 @@ class AISocPlatform:
                 except Exception as e:
                     logger.error("mitre_coverage_failed", tenant=tid, error=str(e))
         self.scheduler.add_job(
-            _mitre_coverage,
+            self._leader_job('daily_mitre_coverage', _mitre_coverage),
             'cron',
             hour=2,
             minute=0,
@@ -1055,7 +1230,7 @@ class AISocPlatform:
                 with self.db.cross_tenant():
                     self.knowledge_base.index_guidance_docs(self.guidance)
             self.scheduler.add_job(
-                _kb_reindex,
+                self._leader_job('kb_guidance_reindex', _kb_reindex),
                 'interval',
                 minutes=15,
                 id='kb_guidance_reindex',
@@ -1080,14 +1255,14 @@ class AISocPlatform:
                     except Exception as e:
                         logger.error("ticketing_retry_failed", tenant=tid, error=str(e))
             self.scheduler.add_job(
-                _ticketing_sync,
+                self._leader_job('ticketing_sync_poll', _ticketing_sync),
                 'interval',
                 minutes=sync_min,
                 id='ticketing_sync_poll',
                 name='Ticketing Sync Poll'
             )
             self.scheduler.add_job(
-                _ticketing_retry,
+                self._leader_job('ticketing_retry_failed', _ticketing_retry),
                 'interval',
                 minutes=15,
                 id='ticketing_retry_failed',
@@ -1101,7 +1276,7 @@ class AISocPlatform:
         if pipeline_cfg.get("enabled", True) and self._license_info.has_feature("pipeline_health") and self.pipeline_monitor:
             check_interval = pipeline_cfg.get("check_interval_minutes", 5)
             self.scheduler.add_job(
-                self._run_pipeline_health_checks,
+                self._leader_job('pipeline_health', self._run_pipeline_health_checks),
                 'interval',
                 minutes=check_interval,
                 id='pipeline_health',
@@ -1113,7 +1288,7 @@ class AISocPlatform:
         # Alert buffer flush (every 60 seconds) — only if module is present
         if self.alert_buffer:
             self.scheduler.add_job(
-                self._flush_alert_buffer,
+                self._leader_job('alert_buffer_flush', self._flush_alert_buffer),
                 'interval',
                 seconds=60,
                 id='alert_buffer_flush',
@@ -1121,9 +1296,22 @@ class AISocPlatform:
                 max_instances=1, coalesce=True,
             )
 
+        # WO-H32: triage queue depth/lag sampler (every 60 seconds). The
+        # enqueue-time sample in the alert loop only fires when a batch is
+        # queued, so it never shows the backlog DRAINING (or stalling) between
+        # fetch cycles — this samples continuously.
+        self.scheduler.add_job(
+            self._leader_job('triage_queue_sampler', self._sample_triage_queue),
+            'interval',
+            seconds=60,
+            id='triage_queue_sampler',
+            name='Triage Queue Depth/Lag Sampler',
+            max_instances=1, coalesce=True,
+        )
+
         # Analyst workload monitoring (every 30 minutes)
         self.scheduler.add_job(
-            self._check_analyst_workload,
+            self._leader_job('analyst_workload_check', self._check_analyst_workload),
             'interval',
             minutes=30,
             id='analyst_workload_check',
@@ -1166,6 +1354,33 @@ class AISocPlatform:
                         logger.info("alert_buffer_flushed", count=flushed)
         except Exception as e:
             logger.error("alert_buffer_flush_failed", error=str(e))
+
+    def _sample_triage_queue(self):
+        """WO-H32: record triage queue depth + lag for every active tenant.
+
+        The dispatcher queue is process-global (all tenants share the worker
+        pool), so each tenant's dashboard sees the shared pipeline's health —
+        the same semantics as the enqueue-time ``triage_queue_depth`` sample.
+        ``triage_queue_lag_seconds`` is the peak time an alert WAITED in the
+        queue during the sample window: rising lag with steady depth = the
+        workers can't keep up with the arrival rate."""
+        try:
+            m = self.triage_dispatcher.queue_metrics()
+        except Exception as e:
+            logger.error("triage_queue_sample_failed", error=str(e))
+            return
+        for tid in self._get_active_tenant_ids():
+            try:
+                self.db.set_tenant(tid)
+                self.db.record_metric("triage_queue_depth", m["depth"],
+                                      {"tenant": tid, "sampled": True})
+                self.db.record_metric(
+                    "triage_queue_lag_seconds", m["max_wait_seconds"],
+                    {"tenant": tid,
+                     "last_wait_seconds": m["last_wait_seconds"]})
+            except Exception as e:
+                logger.warning("triage_queue_sample_write_failed",
+                               tenant=tid, error=str(e))
 
     def _check_analyst_workload(self):
         """Check analyst workload per tenant."""
@@ -1285,16 +1500,72 @@ class AISocPlatform:
         default_tenant = self.config.get("client_id")
         return [default_tenant] if default_tenant else ["default"]
 
+    def _process_decision_downstream(self, decision, alert: dict, tenant_id: str):
+        """WO-H9 per-decision downstream — runs on a triage WORKER thread under
+        the item's tenant context (the dispatcher set it before calling us).
+
+        Mirrors the post-triage work the old inline loop did per batch, but for
+        one decision: incident grouping, SOAR evaluation, and the ``triage_call``
+        metric. Active-response inside SOAR remains human-approved and is now
+        double-fire-safe (see src/soar/engine.py serialized_section guard).
+        """
+        # Belt-and-suspenders: re-pin tenant context on this worker thread.
+        self.db.set_tenant(tenant_id)
+        try:
+            self.db.record_metric("triage_call", 1,
+                                  {"alert_id": decision.alert_id})
+        except Exception:
+            pass
+
+        # Incident grouping (single-decision batch — grouping is incremental,
+        # so per-alert is correct, just not batched).
+        try:
+            self.incident_engine.process_decisions([decision], [alert])
+        except Exception as e:
+            logger.warning("incident_grouping_failed",
+                           alert_id=decision.alert_id, error=str(e)[:200])
+
+        # SOAR playbook evaluation for actionable verdicts.
+        if self.soar_engine and decision.verdict in (
+                "true_positive", "needs_investigation"):
+            try:
+                inc_id = None
+                try:
+                    row = self.db._get_conn().execute(
+                        "SELECT incident_id FROM incident_alerts "
+                        "WHERE decision_id = %s LIMIT 1",
+                        (decision.id,)).fetchone()
+                    if row:
+                        inc_id = row["incident_id"]
+                except Exception:
+                    pass
+                self.soar_engine.evaluate(decision, alert, incident_id=inc_id)
+            except Exception as e:
+                logger.warning("soar_evaluate_failed",
+                               alert_id=decision.alert_id, error=str(e)[:200])
+
     def run_alert_loop(self):
         """
-        Main alert processing loop.
-        Continuously polls Wazuh for new alerts, enriches them,
-        and sends them through the triage agent.
+        Main alert FETCH loop (producer).
+
+        Continuously polls Wazuh/OpenSearch for new alerts, enriches them, and
+        ENQUEUES the risk-worthy ones onto the triage dispatcher. Triage itself
+        (and its downstream incident/SOAR work) runs on the dispatcher's bounded
+        worker pool — decoupled from this loop so a slow ~40s triage can't stall
+        fetching and a critical alert is triaged ahead of low-value noise.
+
+        WO-H9 leader election: the per-cycle body is guarded by a
+        ``pg_try_advisory_lock`` so that with multiple replicas sharing one
+        Postgres, EXACTLY ONE actually fetches + enqueues (and therefore drives
+        active response). A standby replica keeps looping and simply skips the
+        body until it wins the lock (e.g. when the leader dies) — no
+        block-then-double-run.
 
         In multi-tenant mode, iterates all active tenants each cycle.
         """
         poll_interval = self.config.get("wazuh", {}).get("alerts", {}).get(
             "poll_interval_seconds", 10)
+        min_risk = 10
         logger.info("alert_loop_started", poll_interval=poll_interval)
 
         # Agent auto-sync: discover and assign new agents from dedicated
@@ -1304,142 +1575,139 @@ class AISocPlatform:
 
         while self.running and not self._shutdown_event.is_set():
             try:
-                # Periodic agent auto-sync for tenants with dedicated Wazuh
-                import time as _time
-                _now = _time.monotonic()
-                if _now - _last_agent_sync >= _agent_sync_interval:
-                    try:
-                        results = self.tenant_registry.sync_all_tenant_agents()
-                        if results:
-                            logger.info("agent_auto_sync_completed",
-                                        tenants_synced=len(results),
-                                        details=results)
-                    except Exception as e:
-                        logger.warning("agent_auto_sync_failed",
-                                       error=str(e)[:200])
-                    _last_agent_sync = _now
-
-                # Iterate all active tenants (single-tenant: just the default)
-                # Collect enriched alerts tagged with their tenant's client_id
-                enriched_alerts = []
-                for tenant_id in self._get_alert_loop_tenants():
-                    self.db.set_tenant(tenant_id)
-                    try:
-                        batch = self.enrichment.process_batch()
-                    except TenantConfigUnavailable:
-                        # Fail closed, per-tenant: this tenant's secrets can't
-                        # be decrypted (wrong/rotated/corrupt key). Skip it so
-                        # it never runs under global creds — and keep all other
-                        # tenants' cycles going.
-                        logger.error("tenant_skipped_config_unavailable",
-                                     tenant_id=tenant_id, phase="alert_loop")
-                        continue
-                    if batch:
-                        enriched_alerts.extend(batch)
-
-                if enriched_alerts:
-                    # Group alerts by tenant for downstream processing
-                    from collections import defaultdict
-                    by_tenant = defaultdict(list)
-                    for alert in enriched_alerts:
-                        tid = (alert.get("client_id")
-                               or self.config.get("client_id")
-                               or "default")
-                        by_tenant[tid].append(alert)
-
-                    min_risk = 10
-                    total_triaged = 0
-
-                    for tid, tenant_alerts in by_tenant.items():
-                        # Set correct tenant context for all downstream writes
-                        self.db.set_tenant(tid)
-
-                        agent_worthy = [
-                            a for a in tenant_alerts
-                            if a.get("enrichment", {}).get("risk_score", 0) >= min_risk
-                        ]
-
-                        if not agent_worthy:
-                            continue
-
-                        # Check triage daily limit before calling AI
-                        today = __import__("datetime").datetime.now(
-                            __import__("datetime").timezone.utc
-                        ).strftime("%Y-%m-%d")
-                        today_count = self.db.get_metric_count(
-                            "triage_call", since_date=today)
-                        if (self._license_info.max_triage_daily > 0
-                                and today_count >= self._license_info.max_triage_daily):
-                            logger.warning("triage_daily_limit_reached",
-                                           tier=self._license_info.tier,
-                                           limit=self._license_info.max_triage_daily,
-                                           count=today_count, tenant=tid)
-                            continue
-
-                        # Triage under correct tenant context
-                        decisions = self.triage_agent.process_batch(
-                            agent_worthy, tenant_id=tid)
-                        total_triaged += len(decisions)
-                        self.db.record_metric(
-                            "triage_call", len(decisions),
-                            {"batch_size": len(agent_worthy)})
-
-                        # Group decisions into incidents (tenant-scoped)
-                        if decisions:
-                            self.incident_engine.process_decisions(
-                                decisions, agent_worthy)
-
-                            # Evaluate SOAR playbooks for true_positive decisions
-                            if self.soar_engine:
-                                alert_map = {a.get("alert_id"): a
-                                             for a in agent_worthy}
-                                for dec in decisions:
-                                    if dec.verdict in ("true_positive", "needs_investigation"):
-                                        try:
-                                            alert = alert_map.get(dec.alert_id, {})
-                                            # Look up the incident for this decision
-                                            inc_id = None
-                                            try:
-                                                row = self.db._get_conn().execute(
-                                                    "SELECT incident_id FROM incident_alerts WHERE decision_id = %s LIMIT 1",
-                                                    (dec.id,)).fetchone()
-                                                if row:
-                                                    inc_id = row["incident_id"]
-                                            except Exception:
-                                                pass
-                                            self.soar_engine.evaluate(
-                                                dec, alert, incident_id=inc_id)
-                                        except Exception as e:
-                                            logger.warning(
-                                                "soar_evaluate_failed",
-                                                alert_id=dec.alert_id,
-                                                error=str(e)[:200])
-
-                        # Update MITRE coverage for this tenant
-                        try:
-                            self.mitre_analyzer.compute_coverage()
-                        except Exception:
-                            pass
-
-                        # Per-tenant batch summary
-                        self.db.record_metric(
-                            "alert_loop_batch",
-                            len(tenant_alerts),
-                            {
-                                "tenant": tid,
-                                "enriched": len(tenant_alerts),
-                                "triaged": len(decisions),
-                                "skipped_low_risk": len(tenant_alerts) - len(agent_worthy)
-                            }
-                        )
-
+                # Leader election: only ONE replica runs the fetch/enqueue body.
+                with self.db.job_lock("dhruva:job:alert_loop") as is_leader:
+                    if not is_leader:
+                        logger.debug("alert_loop_cycle_skipped_not_leader")
+                    else:
+                        self._run_alert_loop_cycle(
+                            min_risk, _last_agent_sync, _agent_sync_interval)
+                        # _run_alert_loop_cycle returns the updated agent-sync
+                        # clock via instance attr to keep the signature simple.
+                        _last_agent_sync = self._last_agent_sync_clock
             except Exception as e:
                 logger.error("alert_loop_error", error=str(e))
+
+            # WO-H10 liveness heartbeat: record once per iteration REGARDLESS of
+            # leadership — this proves the loop THREAD is alive (a standby that
+            # is healthily skipping is still alive). Read by /api/health.
+            try:
+                from src.api.liveness import record_cycle
+                record_cycle()
+            except Exception:
+                pass
 
             # Wait before next poll
             self._shutdown_event.wait(timeout=poll_interval)
 
         logger.info("alert_loop_stopped")
+
+    def _run_alert_loop_cycle(self, min_risk: int, last_agent_sync: float,
+                              agent_sync_interval: int):
+        """One leader-only fetch+enqueue cycle. Extracted from run_alert_loop so
+        the leader-election wrapper stays readable."""
+        import time as _time
+        _now = _time.monotonic()
+        # Periodic agent auto-sync for tenants with dedicated Wazuh
+        if _now - last_agent_sync >= agent_sync_interval:
+            try:
+                results = self.tenant_registry.sync_all_tenant_agents()
+                if results:
+                    logger.info("agent_auto_sync_completed",
+                                tenants_synced=len(results),
+                                details=results)
+            except Exception as e:
+                logger.warning("agent_auto_sync_failed", error=str(e)[:200])
+            last_agent_sync = _now
+        self._last_agent_sync_clock = last_agent_sync
+
+        # Iterate all active tenants (single-tenant: just the default)
+        enriched_alerts = []
+        for tenant_id in self._get_alert_loop_tenants():
+            self.db.set_tenant(tenant_id)
+            try:
+                batch = self.enrichment.process_batch()
+            except TenantConfigUnavailable:
+                # Fail closed, per-tenant: this tenant's secrets can't be
+                # decrypted (wrong/rotated/corrupt key). Skip it so it never
+                # runs under global creds — and keep all other tenants going.
+                logger.error("tenant_skipped_config_unavailable",
+                             tenant_id=tenant_id, phase="alert_loop")
+                continue
+            if batch:
+                enriched_alerts.extend(batch)
+
+        if not enriched_alerts:
+            return
+
+        # Group alerts by tenant for the daily-limit gate + enqueue.
+        from collections import defaultdict
+        by_tenant = defaultdict(list)
+        for alert in enriched_alerts:
+            tid = (alert.get("client_id")
+                   or self.config.get("client_id")
+                   or "default")
+            by_tenant[tid].append(alert)
+
+        for tid, tenant_alerts in by_tenant.items():
+            self.db.set_tenant(tid)
+
+            agent_worthy = [
+                a for a in tenant_alerts
+                if a.get("enrichment", {}).get("risk_score", 0) >= min_risk
+            ]
+
+            # WO-H9 crash-safe checkpoint: below-threshold alerts (risk <
+            # min_risk) are never enqueued/triaged — they ARE handled (skipped
+            # as noise), so checkpoint them durably HERE so they aren't
+            # re-fetched forever. Triageable alerts are checkpointed atomically
+            # with their triage decision (store.save_decision), NOT here.
+            for a in tenant_alerts:
+                if a.get("enrichment", {}).get("risk_score", 0) < min_risk:
+                    try:
+                        self.db.mark_alert_processed(
+                            alert_id=a.get("alert_id") or a.get("id"),
+                            rule_id=a.get("rule_id"),
+                            rule_description=a.get("rule_description"),
+                            verdict="below_threshold")
+                    except Exception as e:
+                        logger.warning("below_threshold_checkpoint_failed",
+                                       alert_id=a.get("alert_id"),
+                                       error=str(e)[:200])
+
+            if not agent_worthy:
+                continue
+
+            # Check triage daily limit before enqueuing for AI triage.
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            today_count = self.db.get_metric_count(
+                "triage_call", since_date=today)
+            if (self._license_info.max_triage_daily > 0
+                    and today_count >= self._license_info.max_triage_daily):
+                logger.warning("triage_daily_limit_reached",
+                               tier=self._license_info.tier,
+                               limit=self._license_info.max_triage_daily,
+                               count=today_count, tenant=tid)
+                continue
+
+            # Enqueue for the parallel worker pool (risk-priority ordering is
+            # applied inside the dispatcher). The fetcher returns immediately.
+            queued = self.triage_dispatcher.submit_batch(agent_worthy, tid)
+
+            self.db.record_metric(
+                "alert_loop_batch", len(tenant_alerts),
+                {
+                    "tenant": tid,
+                    "enriched": len(tenant_alerts),
+                    "enqueued": queued,
+                    "skipped_low_risk": len(tenant_alerts) - len(agent_worthy),
+                    "backlog_depth": self.triage_dispatcher.backlog_depth(),
+                })
+            # Emit backlog/queue-depth as its own metric for dashboards/alerting.
+            self.db.record_metric(
+                "triage_queue_depth",
+                self.triage_dispatcher.backlog_depth(),
+                {"tenant": tid})
 
     def start(self):
         """Start the full platform."""
@@ -1468,7 +1736,11 @@ class AISocPlatform:
             ti_thread.start()
             logger.info("initial_ti_collection_started")
 
-        # Start alert processing loop in a thread
+        # WO-H9: start the parallel-triage worker pool BEFORE the fetch loop so
+        # workers are ready to drain the moment alerts are enqueued.
+        self.triage_dispatcher.start()
+
+        # Start alert processing loop (producer) in a thread
         alert_thread = threading.Thread(
             target=self.run_alert_loop,
             name="alert-loop",
@@ -1514,6 +1786,15 @@ class AISocPlatform:
         self._shutdown_event.set()
         if hasattr(self, "scheduler") and self.scheduler.running:
             self.scheduler.shutdown(wait=True)
+        # WO-H9: stop the triage worker pool with a BOUNDED drain so in-flight
+        # alerts get their decision saved + checkpointed before exit (anything
+        # past the deadline is left un-checkpointed and safely re-triaged on
+        # restart — never silently dropped).
+        if hasattr(self, "triage_dispatcher"):
+            try:
+                self.triage_dispatcher.stop(drain=True, timeout=15.0)
+            except Exception:
+                pass
         logger.info("platform_stopped")
 
 

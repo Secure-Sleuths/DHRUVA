@@ -13,6 +13,10 @@ from src.enrichment.threat_intel.feeds.openphish import OpenPhishCollector
 from src.enrichment.threat_intel.feeds.abuseipdb import AbuseIPDBCollector
 from src.enrichment.threat_intel.feeds.virustotal import VirusTotalCollector
 from src.enrichment.threat_intel.feeds.otx import OTXCollector
+# MISP is an optional Tier-2 feed. The module import is safe even in Community
+# builds because ``pymisp`` is imported lazily inside MISPCollector.collect(),
+# so a missing ``pymisp`` never breaks this import or the collector registry.
+from src.enrichment.threat_intel.feeds.misp import MISPCollector
 
 logger = structlog.get_logger(__name__)
 
@@ -28,6 +32,7 @@ FEED_REGISTRY = [
     ("abuseipdb", AbuseIPDBCollector),
     ("virustotal", VirusTotalCollector),
     ("alienvault_otx", OTXCollector),
+    ("misp", MISPCollector),
 ]
 
 

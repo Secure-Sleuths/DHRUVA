@@ -685,7 +685,7 @@ export function HostIntegrityTab(_props: TabProps) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <PageHeading
           title="Host integrity"
-          sub="File-integrity, policy monitoring, registry changes, and host vulnerabilities — the single pane over what changed on each endpoint. Read-only."
+          sub="File-integrity, policy monitoring, registry changes, and host vulnerabilities — the single pane over what changed on each endpoint."
         />
         <PollingStatus
           className="mt-1"
@@ -1039,7 +1039,7 @@ function SyscheckTable({
     );
   }
   return (
-    <div className="overflow-hidden rounded-lg border border-line">
+    <div className="max-h-[55vh] overflow-auto rounded-lg border border-line">
       <Table>
         <THead>
           <TR>
@@ -1108,7 +1108,7 @@ function RootcheckTable({ rows }: { rows: RootcheckEntry[] }) {
     );
   }
   return (
-    <div className="overflow-hidden rounded-lg border border-line">
+    <div className="max-h-[55vh] overflow-auto rounded-lg border border-line">
       <Table>
         <THead>
           <TR>
@@ -1218,7 +1218,7 @@ function AgentVulnTable({
   });
   return (
     <>
-      <div className="overflow-hidden rounded-lg border border-line">
+      <div className="max-h-[55vh] overflow-auto rounded-lg border border-line">
         <Table>
           <THead>
             <TR>
@@ -1363,7 +1363,7 @@ function CriticalVulnTable({ rows }: { rows: AgentVulnerability[] }) {
   });
   return (
     <>
-      <div className="overflow-hidden rounded-lg border border-line">
+      <div className="max-h-[55vh] overflow-auto rounded-lg border border-line">
         <Table>
           <THead>
             <TR>
@@ -1572,8 +1572,23 @@ function verifyPresentation(r: RemediationVerifyResult): {
   switch (r.status) {
     case "updated":
       return { text: r.message, className: "text-teal" };
+    // WO-H41: version unchanged AND a dispatch happened within the last scan
+    // interval — UNKNOWN, not a success claim. Either the inventory hasn't
+    // refreshed yet or the upgrade did not apply; the operator re-verifies
+    // after the next scan. NEUTRAL — neither success nor failure.
+    case "pending_inventory_refresh":
+      return {
+        text:
+          r.message ||
+          "Version unchanged in Wazuh's inventory — not yet confirmed. Re-verify after the agent's next package scan.",
+        className: "text-sev-low",
+      };
     case "possibly_updated":
       return { text: r.message, className: "text-sev-low" };
+    // WO-H36: version KNOWN and UNCHANGED — the upgrade did not take effect.
+    // Treated as a hard negative (like "unchanged"), never a soft maybe.
+    case "not_upgraded":
+      return { text: r.message, className: "text-sev-high" };
     case "unchanged":
       return { text: r.message, className: "text-sev-med" };
     case "not_found":
@@ -1637,6 +1652,27 @@ function RemediateAction({
           `The update command failed to dispatch${
             res.result?.error ? `: ${res.result.error}` : "."
           } Nothing changed on ${agentLabel}. The attempt is recorded server-side.`,
+        );
+        return;
+      }
+      if (res.status === "not_applied") {
+        // WO-H36: Wazuh accepted the call but dispatched it to no agent
+        // (total_affected_items=0 — e.g. the remediation AR capability isn't
+        // registered on this agent). Nothing was upgraded — surface it as a
+        // distinct not-applied state, never as a pending success.
+        setDialogError(
+          `Wazuh accepted the command but dispatched it to no agent — the remediation active-response capability is not registered on ${agentLabel}, so nothing was upgraded. The attempt is recorded server-side. Register dhruva-pkg-upgrade on the agent (see deploy/wazuh/active-response) and retry.`,
+        );
+        return;
+      }
+      if (res.status !== "pending") {
+        // WO-H36 QA (fail-CLOSED): only the known "pending" status is a
+        // dispatch-accepted success. Any OTHER value (an unexpected/newer
+        // server status) must NOT be shown as a pending-success — that would
+        // claim the update is in flight when we can't confirm it. Surface a
+        // neutral "unknown status" note and let the admin verify.
+        setDialogError(
+          `The server returned an unexpected remediation status ("${res.status}") for ${packageName} on ${agentLabel}. Do not assume the update was dispatched — check the audit trail and run Verify before trusting it.`,
         );
         return;
       }
@@ -1927,7 +1963,7 @@ function ProcessTable({ rows }: { rows: AgentProcess[] }) {
     );
   }
   return (
-    <div className="overflow-hidden rounded-lg border border-line">
+    <div className="max-h-[55vh] overflow-auto rounded-lg border border-line">
       <Table>
         <THead>
           <TR>
@@ -1981,7 +2017,7 @@ function PortTable({ rows }: { rows: AgentPort[] }) {
     );
   }
   return (
-    <div className="overflow-hidden rounded-lg border border-line">
+    <div className="max-h-[55vh] overflow-auto rounded-lg border border-line">
       <Table>
         <THead>
           <TR>
@@ -2019,7 +2055,7 @@ function PackageTable({ rows }: { rows: AgentPackage[] }) {
     );
   }
   return (
-    <div className="overflow-hidden rounded-lg border border-line">
+    <div className="max-h-[55vh] overflow-auto rounded-lg border border-line">
       <Table>
         <THead>
           <TR>
@@ -2124,7 +2160,7 @@ function ScaView({
   }
   return (
     <div>
-      <div className="overflow-hidden rounded-lg border border-line">
+      <div className="max-h-[55vh] overflow-auto rounded-lg border border-line">
         <Table>
           <THead>
             <TR>
@@ -2195,7 +2231,7 @@ function ScaChecksTable({ rows }: { rows: ScaCheck[] }) {
     );
   }
   return (
-    <div className="overflow-hidden rounded-lg border border-line">
+    <div className="max-h-[55vh] overflow-auto rounded-lg border border-line">
       <Table>
         <THead>
           <TR>

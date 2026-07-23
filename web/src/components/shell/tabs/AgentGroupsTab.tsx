@@ -137,7 +137,7 @@ export function AgentGroupsTab(_props: TabProps) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <PageHeading
           title="Agent groups"
-          sub="The Wazuh Manager's agent groups and their membership. Manager-global and restricted to the MSSP administrator. Read-only."
+          sub="The Wazuh Manager's agent groups and their membership. Manager-global and restricted to the MSSP administrator."
         />
         {isMssp && !locked && (
           <PollingStatus
@@ -175,7 +175,6 @@ export function AgentGroupsTab(_props: TabProps) {
         />
       ) : groups ? (
         <div className="flex flex-col gap-3">
-          <ReadOnlyNote />
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             <Tile label="Groups" value={fmtInt(groups.length)} sub="Manager-global" />
             <Tile
@@ -196,16 +195,6 @@ export function AgentGroupsTab(_props: TabProps) {
         </div>
       ) : null}
     </>
-  );
-}
-
-function ReadOnlyNote() {
-  return (
-    <div className="rounded-lg border border-line bg-panel2 px-3.5 py-2.5 text-kbd text-dim2">
-      Read-only view. Creating, editing, or assigning agents to a group is a gated
-      action delivered separately. This surface only lists the Manager&apos;s groups
-      and their membership counts.
-    </div>
   );
 }
 

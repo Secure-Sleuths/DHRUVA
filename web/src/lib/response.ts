@@ -66,6 +66,8 @@ export function arStatusPresentation(s: ArStatus): {
       return { label: "Expired", className: "text-dim" };
     case "denied":
       return { label: "Denied", className: "text-sev-crit" };
+    case "not_applied":
+      return { label: "Not applied · no agent target", className: "text-gated-ink" };
     default:
       return { label: String(s), className: "text-dim" };
   }

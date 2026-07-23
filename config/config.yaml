@@ -1,6 +1,6 @@
 platform:
   name: SecureSleuths DHRUVA
-  version: 5.0.0
+  version: 5.1.0
   log_level: INFO
   data_dir: /var/lib/ai-soc
 licensing:
@@ -24,6 +24,7 @@ wazuh:
     poll_interval_seconds: 10
     batch_size: 50
     min_severity: 3
+    look_back_seconds: 300
 opensearch:
   hosts:
   - ${OPENSEARCH_URL}
@@ -50,6 +51,7 @@ llm:
   temperature: 0.1
   rate_limit:
     cooldown_seconds: 5
+    max_concurrent_calls: 4
   anthropic:
     mode: auto
     api_key: ${ANTHROPIC_API_KEY}
@@ -71,6 +73,44 @@ agents:
     escalation_confidence_threshold: 0.5
     max_context_alerts: 20
     cooldown_seconds: 5
+    max_workers: 4
+    max_queue: 1000
+    cost_controls:
+      budget:
+        enabled: true
+        monthly_cap_usd: 0.0
+        warn_thresholds:
+        - 0.8
+        - 0.95
+        spend_cache_seconds: 30
+        estimated_call_cost_usd: 0.05
+        reservation_ttl_seconds: 600
+      dedup:
+        enabled: true
+        window_seconds: 300
+      prefilter:
+        enabled: true
+        max_rule_level: 5
+        max_risk_score: 15
+        require_allowlist: true
+        noise_rule_ids: []
+        noise_rule_groups: []
+        skip_rule_groups:
+        - vulnerability-detector
+        skip_rule_ids: []
+        verdict: auto_close
+        confidence: 0.6
+      decision_cache:
+        enabled: false
+        write_through: true
+        min_confidence: 0.7
+        max_age_hours: 168
+        cacheable_verdicts:
+        - auto_close
+        - false_positive
+        - benign
+        - needs_investigation
+        tokens_saved_per_hit: 1500
 enrichment:
   asset_inventory:
     source: file
@@ -153,11 +193,18 @@ threat_intel:
       enabled: true
       api_key: ${OTX_API_KEY}
       mode: on_demand
+    misp:
+      enabled: false
+      url: ${MISP_URL}
+      api_key: ${MISP_KEY}
+      verify_ssl: ${MISP_VERIFY_TLS}
+      interval_minutes: 360
 incidents:
   enabled: true
   auto_assign: false
   max_per_analyst: 15
   grouping_window_minutes: 30
+  auto_resolve_on_all_fp: true
   attack_chain:
     enabled: true
     window_minutes: 120
@@ -207,3 +254,15 @@ knowledge_base:
   max_agent_results: 3
 database:
   dsn: ${DATABASE_URL}
+retention:
+  enabled: true
+  run_hour: 3
+  batch_size: 10000
+  days:
+    operational_metrics: 90
+    agent_decisions: 365
+    decision_audit_trail: 365
+    soar_executions: 180
+    llm_usage_metrics: 400
+    webhook_requests: 14
+    llm_budget_reservations: 1

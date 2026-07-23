@@ -75,7 +75,7 @@ import { roleAtLeast } from "@/lib/rbac";
 import { apiSeverity, parseJsonArray, sortIncidentsWorstFirst } from "@/lib/incident";
 import { isLowGrounding } from "@/lib/grounding";
 import { riskSeverity, type Severity } from "@/lib/severity";
-import { verdictPresentation } from "@/lib/triage";
+import { decisionPresentation } from "@/lib/triage";
 import { DASH, fmtInt, fmtDateTime } from "@/lib/format";
 import type { TabProps } from "../tabRegistry";
 import type {
@@ -432,7 +432,7 @@ export function DailyReviewTab({ onNavigate }: TabProps) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <PageHeading
           title="Daily review"
-          sub="Your plain-English briefing — what happened overnight and what needs you now, in everyday language. Read-only."
+          sub="Your plain-English briefing — what happened overnight and what needs you now, in everyday language."
         />
         <PollingStatus
           className="mt-1"
@@ -917,7 +917,10 @@ function OvernightDecisions({
           </THead>
           <TBody>
             {decisions.value.slice(0, TOP_VERDICTS).map((d) => {
-              const vp = verdictPresentation(String(d.verdict));
+              const vp = decisionPresentation({
+                verdict: String(d.verdict),
+                llm_failed: d.llm_failed,
+              });
               const plain = plainSeverity(riskSeverity(d.risk_score));
               return (
                 <TR key={d.id}>

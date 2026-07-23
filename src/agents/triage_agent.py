@@ -12,6 +12,12 @@ from typing import Optional
 from pathlib import Path
 
 from src.agents.claude_backend import LLMBackend
+from src.agents.cost_controls import (
+    AlertDeduplicator,
+    BudgetGuard,
+    NoisePreFilter,
+    PersistentDecisionCache,
+)
 from src.agents.grounding import assess_triage_grounding, output_safety_metrics
 from src.agents.prompts import build_triage_prompt, PROMPT_VERSION
 from src.anonymization import AlertAnonymizer
@@ -71,10 +77,24 @@ class TriageAgent:
             self.guidance._escalation_logic.get("always_escalate", [])
         )
 
+        # ── WO-H5: LLM cost controls (all opt-in / graceful-degrade) ──
+        # Hard per-tenant spend cap that blocks the LLM call, structural dedup,
+        # and a cheap deterministic noise pre-filter. Each reads its config from
+        # agents.triage.cost_controls and is a no-op when disabled/unconfigured.
+        self.budget_guard = BudgetGuard(db, config, tenant_registry=tenant_registry)
+        self.deduplicator = AlertDeduplicator(config)
+        self.prefilter = NoisePreFilter(config)
+        # WO-H57: durable verdict cache BELOW the in-memory dedup window.
+        self.decision_cache = PersistentDecisionCache(config)
+
         logger.info("triage_agent_initialized",
                      auto_close_threshold=self.auto_close_threshold,
                      always_escalate_rules=len(self._always_escalate_rules),
-                     multi_tenant=self.tenant_registry is not None)
+                     multi_tenant=self.tenant_registry is not None,
+                     budget_cap_enabled=self.budget_guard.enabled,
+                     dedup_enabled=self.deduplicator.enabled,
+                     prefilter_enabled=self.prefilter.enabled,
+                     decision_cache_enabled=self.decision_cache.enabled)
 
     def _get_alert_field(self, alert: dict, enrichment: dict, field: str):
         """Resolve a field name from the alert or its enrichment data."""
@@ -210,6 +230,37 @@ class TriageAgent:
             raise RuntimeError("No LLM backend configured")
         return self.claude.call(system_prompt, user_message)
 
+    def _resolve_model_id(self, tenant_id: str = None) -> str:
+        """Resolved concrete provider/model id of the backend that ran a triage
+        call, for per-decision attribution (WO-H29 finding NEW-3).
+
+        Mirrors ``_call_claude``'s backend selection (per-tenant backend first,
+        then the global/legacy backend) so the recorded id matches the backend
+        that actually produced the verdict, rather than the dead ``'cli'``
+        constant the audit trail used before. Returns ``'unknown'`` only when no
+        backend can be resolved (never raises — this must never break triage).
+        """
+        backend = None
+        if self.tenant_registry and tenant_id:
+            try:
+                backend = self.tenant_registry.get_llm_backend(tenant_id)
+            except Exception:
+                backend = None
+        if backend is None:
+            backend = self.claude
+        if backend is None:
+            return "unknown"
+        try:
+            describe = getattr(backend, "describe_model", None)
+            if callable(describe):
+                return describe() or "unknown"
+            # Defensive fallback for any backend lacking describe_model().
+            provider = getattr(backend, "mode", "") or "unknown"
+            model = getattr(getattr(backend, "provider", None), "model", "") or ""
+            return f"{provider}/{model}" if model else provider
+        except Exception:
+            return "unknown"
+
     def triage_alert(self, enriched_alert: dict,
                      tenant_id: str = None) -> AgentDecision:
         """
@@ -273,6 +324,10 @@ class TriageAgent:
                     "src_ip": enriched_alert.get("src_ip"),
                     "rule_mitre_techniques": enriched_alert.get("rule_mitre_techniques", []),
                     "rule_mitre_tactics": enriched_alert.get("rule_mitre_tactics", []),
+                    # WO-H23: trimmed, display-only TI match (excluded from triage/hunt
+                    # prompts; anonymized on the detection path — see
+                    # _ti_match_summary).
+                    "threat_intel_match": self._ti_match_summary(enrichment),
                 }, default=str),
                 playbook_used=f"always_escalate:{escalate_rule}",
                 actions_taken=json.dumps(["Immediate human investigation required"]),
@@ -309,6 +364,15 @@ class TriageAgent:
                          bypass_rule=escalate_rule)
 
             return decision
+
+        # ── WO-H5: cheap deterministic noise pre-filter ──
+        # Runs ONLY after the always-escalate gate above has already returned
+        # for critical patterns — so the pre-filter is physically unreachable
+        # for an always-escalate alert and can never suppress one. It also
+        # refuses to dismiss anything with a positive signal (see NoisePreFilter).
+        prefilter = getattr(self, "prefilter", None)
+        if prefilter is not None and prefilter.is_noise(enriched_alert, enrichment):
+            return self._prefilter_dismiss(enriched_alert, _decision_tenant)
 
         # ── Standard AI triage path ──
 
@@ -358,8 +422,49 @@ class TriageAgent:
                     self.config.get("client_id") or
                     "default")
 
+        # ── WO-H5: hard per-tenant spend cap (blocks the LLM call) ──
+        # Checked against the SAME tenant the LLM call would bill under. When
+        # the cap is reached the alert is NOT sent to the LLM; instead it takes
+        # the budget fail-safe path, which ESCALATES (never auto-closes).
+        # Headroom warnings log before the hard stop.
+        budget_guard = getattr(self, "budget_guard", None)
+        _budget_reservation_id = None
+        if budget_guard is not None:
+            # WO-H28: reserve() is the atomic check-AND-debit — it serializes
+            # per tenant on a DB advisory lock and counts in-flight
+            # reservations, so N parallel workers can no longer all pass the
+            # same pre-call spend check and overshoot the cap. Falls back to
+            # check() for stub guards without reserve (older tests/plugins).
+            _reserve = getattr(budget_guard, "reserve", None) or budget_guard.check
+            budget_status = _reserve(tenant_id)
+            _budget_reservation_id = budget_status.get("reservation_id")
+            if budget_status.get("warn"):
+                logger.warning("triage_budget_headroom_warning",
+                               tenant_id=tenant_id,
+                               spend=round(budget_status["spend"], 4),
+                               cap=budget_status["cap"],
+                               utilization=round(budget_status["utilization"], 4),
+                               warn_threshold=budget_status["warn_threshold"])
+            if not budget_status.get("allowed", True):
+                logger.warning("triage_budget_exhausted_blocking_llm",
+                               tenant_id=tenant_id,
+                               spend=round(budget_status["spend"], 4),
+                               cap=budget_status["cap"],
+                               alert_id=alert_id)
+                return self._budget_exhausted_decision(
+                    enriched_alert, _decision_tenant, budget_status)
+
         try:
-            result = self._call_claude(system_prompt, user_message, tenant_id)
+            try:
+                result = self._call_claude(system_prompt, user_message, tenant_id)
+            finally:
+                # WO-H28: settle the budget reservation as soon as the call
+                # returns (success OR failure) — by now the usage tracker has
+                # recorded the real cost row, so the estimate must stop
+                # counting against the cap.
+                if _budget_reservation_id and budget_guard is not None:
+                    budget_guard.release(tenant_id, _budget_reservation_id)
+                    _budget_reservation_id = None
             _latency_ms = int((time.monotonic() - _t0) * 1000)
             # Deanonymize structured fields (verdict, actions) but keep
             # reasoning anonymized for secure storage
@@ -390,7 +495,15 @@ class TriageAgent:
                 r'|[a-f0-9]{40,})',
                 '[REDACTED]', _raw_err)
             logger.error("triage_call_failed", alert_id=alert_id, error=_raw_err)
-            # Fail safe: escalate on error
+            # Fail safe: escalate on error.
+            # WO-H46-b: `_llm_failed` marks this row as a FAILURE rather than a
+            # verdict. The verdict/confidence/escalation fields below are
+            # deliberately unchanged — failing closed is the correct safety
+            # behaviour and must stay byte-identical. The flag exists so the
+            # failure is queryable and alertable (it is otherwise
+            # indistinguishable from a considered escalation in the `verdict`
+            # column) and so un-analyzed rows can be excluded from FP
+            # statistics that feed the prompt and the tuning loop.
             result = {
                 "verdict": "needs_investigation",
                 "confidence": 0.0,
@@ -399,7 +512,8 @@ class TriageAgent:
                 "recommended_actions": ["Manual investigation required"],
                 "escalation_required": True,
                 "escalation_reason": f"Agent error: {_safe_err}",
-                "detection_feedback": {"rule_quality": "unknown"}
+                "detection_feedback": {"rule_quality": "unknown"},
+                "_llm_failed": True,
             }
 
         # Validate and clamp LLM output to prevent malicious overrides
@@ -528,6 +642,7 @@ class TriageAgent:
             "score": grounding_assessment["score"],
             "token_leaks": _safety["token_leaks"],
             "injection_echoes": _safety["injection_echoes"],
+            "breakout_markers": _safety["breakout_markers"],
         })
 
         # Build decision record
@@ -551,6 +666,11 @@ class TriageAgent:
                 "src_ip": enriched_alert.get("src_ip"),
                 "rule_mitre_techniques": enriched_alert.get("rule_mitre_techniques", []),
                 "rule_mitre_tactics": enriched_alert.get("rule_mitre_tactics", []),
+                # WO-H23: trimmed, display-only TI match (excluded from triage/
+                # hunt prompts; anonymized on the detection path — see
+                # _ti_match_summary).
+                "threat_intel_match": self._ti_match_summary(
+                    enriched_alert.get("enrichment", {})),
                 **({"override_learning": override_learning} if override_learning else {}),
             }, default=str),
             playbook_used=playbook[:100] if playbook else None,
@@ -563,6 +683,8 @@ class TriageAgent:
             resolved_at=None if escalated else datetime.now(timezone.utc).isoformat(),
             client_id=_decision_tenant,
             grounding=grounding_json,
+            # WO-H46-b: True only on the fail-closed LLM-error path above.
+            llm_failed=bool(result.get("_llm_failed", False)),
         )
 
         # Save decision
@@ -589,7 +711,12 @@ class TriageAgent:
                     "override_learning_applied": feedback_applied,
                     "override_learning_delta": override_learning["delta"] if override_learning else 0,
                 }),
-                "model_backend": getattr(self, '_claude_backend_type', 'cli'),
+                # WO-H29 (NEW-3): resolved concrete provider/model id of the
+                # backend that ACTUALLY produced this verdict (was the dead
+                # constant 'cli' — _claude_backend_type was never set), so a
+                # silent provider/model swap is attributable per-decision. Routed
+                # by the same tenant_id used for the LLM call above.
+                "model_backend": self._resolve_model_id(tenant_id),
                 "latency_ms": _latency_ms,
                 "created_at": decision.created_at,
             })
@@ -629,6 +756,381 @@ class TriageAgent:
 
         return decision
 
+    # WO-H23: whitelisted display-safe fields copied from a
+    # ``threat_intel_details`` entry into the trimmed, persisted match record.
+    # External indicators + feed metadata only — never a client identity field.
+    _TI_MATCH_FIELDS = ("indicator", "type", "source", "severity",
+                        "category", "last_seen", "description")
+    _TI_MATCH_MAX = 10
+
+    @staticmethod
+    def _ti_match_summary(enrichment: dict) -> list:
+        """Trim ``threat_intel_details`` to a display-safe subset (WO-H23).
+
+        ``threat_intel_details`` is deliberately EXCLUDED from the persisted
+        ``enrichment_summary`` blob (it can be large and feed-shape-specific).
+        This re-adds a TRIMMED, DISPLAY-ONLY projection so the analyst can see
+        the EXACT matched indicator behind ``is_known_malicious`` inline in the
+        case view. Only whitelisted feed/indicator fields are copied — never a
+        raw feed object — and the list is capped.
+
+        LLM BOUNDARY (honest, and the canonical note for ALL of WO-H23's new
+        display-only keys — ``threat_intel_match``, ``host_top_cve_details``,
+        ``host_rootcheck_signatures``, ``host_fim_changed_paths``):
+
+          * ``build_triage_prompt`` reads a FIXED allowlist of enrichment keys
+            that does NOT include any of these, so they never reach the triage
+            LLM. ``build_hunt_prompt`` takes aggregate patterns, not the blob —
+            also walled off.
+          * ``build_detection_prompt`` is DIFFERENT: it serializes the WHOLE
+            persisted ``enrichment_summary`` blob for each FP example
+            (``json.dumps(...)[:300]``) and passes it through
+            ``anonymizer.anonymize_fp_text``. So these fields DO egress to the
+            DETECTION LLM — but only AFTER anonymization tokenizes registered
+            client identifiers (and truncated to 300 chars). This is the
+            documented detection posture (per ``_DETECTION_EXCLUDE_KEYS``,
+            file-path / command free-text is verbatim-by-design; only REGISTERED
+            identifiers are tokenized), and WO-H23 does not change it — it just
+            adds more free-text (FIM paths, rootcheck signatures) into that same
+            already-anonymized detection channel. The matched INDICATOR here is
+            an external threat indicator (un-anonymized by design), not a client
+            identity field.
+
+        This method itself runs at PERSIST time only. Defensive: any non-list /
+        bad entry degrades to []."""
+        details = enrichment.get("threat_intel_details") \
+            if isinstance(enrichment, dict) else None
+        if not isinstance(details, list):
+            return []
+        matches: list = []
+        for entry in details:
+            if not isinstance(entry, dict):
+                continue
+            trimmed: dict = {}
+            for k in TriageAgent._TI_MATCH_FIELDS:
+                v = entry.get(k)
+                if v is None or v == "" or v == []:
+                    continue
+                trimmed[k] = v
+            # Derive a human-readable category from feed-specific fields when no
+            # explicit one is present (OTX pulse names / tags).
+            if "category" not in trimmed:
+                cat = entry.get("pulse_names") or entry.get("tags")
+                if isinstance(cat, list) and cat:
+                    trimmed["category"] = ", ".join(str(c) for c in cat[:3])
+            if trimmed.get("indicator"):
+                matches.append(trimmed)
+            if len(matches) >= TriageAgent._TI_MATCH_MAX:
+                break
+        return matches
+
+    def _enrichment_blob(self, enriched_alert: dict, extra: dict = None) -> str:
+        """Build the persisted enrichment_summary blob consistent with the main
+        and always-escalate paths (host/network fields + MITRE lists), with an
+        optional ``extra`` merged in (e.g. a cost_control marker)."""
+        enrichment = enriched_alert.get("enrichment", {})
+        blob = {
+            **{k: v for k, v in enrichment.items()
+               if k not in ("threat_intel_details",)},
+            "agent_name": enriched_alert.get("agent_name"),
+            "agent_ip": enriched_alert.get("agent_ip"),
+            "src_ip": enriched_alert.get("src_ip"),
+            "rule_mitre_techniques": enriched_alert.get("rule_mitre_techniques", []),
+            "rule_mitre_tactics": enriched_alert.get("rule_mitre_tactics", []),
+            # WO-H23: trimmed, display-only TI match (see _ti_match_summary).
+            "threat_intel_match": self._ti_match_summary(enrichment),
+        }
+        if extra:
+            blob.update(extra)
+        return json.dumps(blob, default=str)
+
+    def _budget_exhausted_decision(self, enriched_alert: dict,
+                                   tenant: str, status: dict) -> AgentDecision:
+        """WO-H5 fail-safe: the tenant's LLM spend cap is reached, so NO LLM
+        call is made. SAFETY INVARIANT — this path ESCALATES and is *never*
+        auto-closed: the verdict is hard-coded to ``needs_investigation`` and
+        ``escalated=True`` here so a budget-exhausted alert can never become a
+        ``false_positive``/``auto_close``."""
+        alert_id = enriched_alert.get("alert_id", str(uuid.uuid4()))
+        rule_id = enriched_alert.get("rule_id", 0)
+        enrichment = enriched_alert.get("enrichment", {})
+        reasoning = (
+            "BUDGET-EXHAUSTED FAIL-SAFE — AI triage was NOT performed because "
+            f"this tenant's LLM spend cap for the period was reached "
+            f"(${status.get('spend', 0):.2f} / ${status.get('cap', 0):.2f}). "
+            "Per the cost-control safety invariant this alert is ESCALATED for "
+            "human review; it is never auto-closed on budget grounds."
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        decision = AgentDecision(
+            id=str(uuid.uuid4()),
+            alert_id=alert_id,
+            rule_id=rule_id,
+            rule_description=enriched_alert.get("rule_description", ""),
+            agent_type="triage",
+            verdict="needs_investigation",   # SAFETY: never auto_close/false_positive
+            confidence=0.0,
+            risk_score=enrichment.get("risk_score", 0),
+            reasoning=reasoning,
+            enrichment_summary=self._enrichment_blob(enriched_alert, {
+                "cost_control": {
+                    "budget_exhausted": True,
+                    "spend_usd": round(status.get("spend", 0), 4),
+                    "cap_usd": round(status.get("cap", 0), 4),
+                },
+            }),
+            playbook_used="cost_control:budget_exhausted",
+            actions_taken=json.dumps(
+                ["Manual investigation required (LLM budget cap reached)"]),
+            escalated=True,                  # SAFETY: always escalate
+            human_override=None,
+            human_verdict=None,
+            feedback_applied=False,
+            created_at=now,
+            resolved_at=None,                # escalated => unresolved
+            client_id=tenant,
+            grounding=json.dumps({
+                "grounding": "not_assessed",
+                "score": 0.0,
+                "unsupported": [],
+                "reasons": ["budget_exhausted fail-safe — no LLM inference performed"],
+            }),
+        )
+        self.db.save_decision(decision)
+        self.db.record_metric("triage_budget_exhausted", 1, {
+            "verdict": "needs_investigation",
+            "escalated": True,
+            "rule_id": rule_id,
+            "spend": round(status.get("spend", 0), 4),
+            "cap": round(status.get("cap", 0), 4),
+        })
+        logger.warning("triage_completed_budget_exhausted",
+                       alert_id=alert_id,
+                       verdict="needs_investigation",
+                       escalated=True)
+        return decision
+
+    def _prefilter_dismiss(self, enriched_alert: dict,
+                           tenant: str) -> AgentDecision:
+        """WO-H5: dismiss an obviously-benign noise alert WITHOUT an LLM call.
+        Only reachable for non-critical alerts (the always-escalate gate returns
+        before the pre-filter is consulted)."""
+        pf = self.prefilter
+        alert_id = enriched_alert.get("alert_id", str(uuid.uuid4()))
+        rule_id = enriched_alert.get("rule_id", 0)
+        enrichment = enriched_alert.get("enrichment", {})
+        verdict = pf.verdict if pf.verdict in (
+            "auto_close", "false_positive") else "auto_close"
+        now = datetime.now(timezone.utc).isoformat()
+        reasoning = (
+            "PRE-FILTER DISMISSAL — matched a deterministic known-noise rule "
+            f"(rule_id={rule_id}, rule_level={enriched_alert.get('rule_level', 0)}, "
+            f"risk_score={enrichment.get('risk_score', 0)}) with no threat-intel "
+            "hit, not known-malicious, and no baseline anomaly. Dismissed before "
+            "the LLM call to save cost. Not applicable to always-escalate "
+            "critical patterns (those bypass the pre-filter entirely)."
+        )
+        decision = AgentDecision(
+            id=str(uuid.uuid4()),
+            alert_id=alert_id,
+            rule_id=rule_id,
+            rule_description=enriched_alert.get("rule_description", ""),
+            agent_type="triage",
+            verdict=verdict,
+            confidence=pf.confidence,
+            risk_score=enrichment.get("risk_score", 0),
+            reasoning=reasoning,
+            enrichment_summary=self._enrichment_blob(enriched_alert, {
+                "cost_control": {"prefilter_dismissed": True},
+            }),
+            playbook_used="cost_control:prefilter",
+            actions_taken=json.dumps(["Dismissed as known noise (pre-filter)"]),
+            escalated=False,
+            human_override=None,
+            human_verdict=None,
+            feedback_applied=False,
+            created_at=now,
+            resolved_at=now,                 # dismissed => resolved
+            client_id=tenant,
+            grounding=json.dumps({
+                "grounding": "not_assessed",
+                "score": 0.0,
+                "unsupported": [],
+                "reasons": ["deterministic noise pre-filter — no LLM inference"],
+            }),
+        )
+        self.db.save_decision(decision)
+        self.db.record_metric("triage_prefilter_dismissed", 1, {
+            "verdict": verdict,
+            "rule_id": rule_id,
+        })
+        logger.info("triage_completed_prefilter",
+                    alert_id=alert_id, verdict=verdict)
+        return decision
+
+    def _fanout_duplicate(self, enriched_alert: dict, rep: dict,
+                          tenant: str, *, origin: str = "dedup") -> AgentDecision:
+        """Clone a representative verdict onto a structurally-identical alert
+        WITHOUT a new LLM call. Each reuse still gets its own persisted
+        AgentDecision referencing the origin, so the audit trail stays intact.
+
+        ``origin="dedup"`` — WO-H5 in-memory dedup (within the ~300s window).
+        ``origin="cache"`` — WO-H57 durable decision cache (across the window /
+        restarts); records a cache hit + the token-saving estimate.
+        """
+        alert_id = enriched_alert.get("alert_id", str(uuid.uuid4()))
+        rule_id = enriched_alert.get("rule_id", 0)
+        enrichment = enriched_alert.get("enrichment", {})
+        now = datetime.now(timezone.utc).isoformat()
+        origin_alert_id = rep.get("alert_id")
+        if origin == "cache":
+            origin_ref = (f"cached decision {origin_alert_id}"
+                          if origin_alert_id else "a cached decision")
+            reasoning = (
+                f"[CACHE] Verdict restored from the persistent decision cache "
+                f"(same fingerprint as {origin_ref}); the alert carries no new "
+                "threat signal, so no LLM call was made. This reuse is visible "
+                "and revocable in Admin → Decision Cache.\n\n"
+                f"{rep.get('reasoning', '')}"
+            )
+            playbook_used = f"cost_control:decision_cache:{rep.get('cache_id')}"
+            metric_name = "triage_decision_cache_hit"
+        else:
+            reasoning = (
+                f"[DEDUP] Structurally identical to alert {origin_alert_id} (same "
+                "fingerprint) triaged within the dedup window. Verdict fanned out "
+                "from that decision — no additional LLM call was made.\n\n"
+                f"{rep.get('reasoning', '')}"
+            )
+            playbook_used = f"cost_control:dedup:{origin_alert_id}"
+            metric_name = "triage_dedup_fanout"
+        decision = AgentDecision(
+            id=str(uuid.uuid4()),
+            alert_id=alert_id,
+            rule_id=rule_id,
+            rule_description=enriched_alert.get("rule_description", ""),
+            agent_type="triage",
+            verdict=rep["verdict"],
+            confidence=rep["confidence"],
+            risk_score=enrichment.get("risk_score", rep.get("risk_score", 0)),
+            reasoning=reasoning,
+            enrichment_summary=self._enrichment_blob(enriched_alert, {
+                "cost_control": {
+                    f"{origin}_of": origin_alert_id,
+                    "fingerprint": rep.get("fingerprint"),
+                },
+            }),
+            playbook_used=playbook_used[:100],
+            actions_taken=rep.get("actions_taken", "[]"),
+            escalated=rep["escalated"],
+            human_override=None,
+            human_verdict=None,
+            feedback_applied=False,
+            created_at=now,
+            resolved_at=None if rep["escalated"] else now,
+            client_id=tenant,
+            grounding=rep.get("grounding"),
+        )
+        self.db.save_decision(decision)
+        self.db.record_metric(metric_name, 1, {
+            "verdict": rep["verdict"],
+            "rule_id": rule_id,
+            "origin_alert_id": origin_alert_id,
+        })
+        if origin == "cache":
+            cache = getattr(self, "decision_cache", None)
+            if cache is not None:
+                cache.record_hit(self.db, rep.get("cache_id"))
+        logger.info(f"triage_{origin}_fanout",
+                    alert_id=alert_id,
+                    origin_alert_id=origin_alert_id,
+                    verdict=rep["verdict"])
+        return decision
+
+    def _process_one(self, enriched_alert: dict,
+                     tenant_id: str = None) -> AgentDecision:
+        """Process a single alert with WO-H5 structural dedup applied.
+
+        Dedup never applies to an always-escalate critical alert (those cost no
+        LLM call and must remain distinct escalations) and never collapses
+        across tenants (the fingerprint map is keyed by tenant)."""
+        _tenant = (tenant_id
+                   or enriched_alert.get("client_id")
+                   or self.config.get("client_id")
+                   or "default")
+        dedup = getattr(self, "deduplicator", None)
+        cache = getattr(self, "decision_cache", None)
+        enrichment = enriched_alert.get("enrichment", {})
+        # QA dedup-signal-drift hardening: a duplicate must NOT inherit a benign
+        # representative's verdict if THIS alert's own enrichment carries a
+        # threat signal the representative may not have had. Reuse the same
+        # positive-signal keys NoisePreFilter treats as disqualifiers so the two
+        # controls stay consistent (cheap, no extra DB call).
+        has_positive_signal = bool(
+            (enrichment.get("threat_intel_hits", 0) or 0)
+            or enrichment.get("is_known_malicious")
+            or enrichment.get("baseline_anomaly")
+        )
+        # THE SHARED SAFETY GATE for BOTH reuse mechanisms (in-memory dedup and
+        # the WO-H57 durable cache): re-evaluated on THIS alert, so a stored
+        # benign verdict is never reused for an alert that itself carries a
+        # threat signal or must always escalate. Neither reuse path is reachable
+        # unless this holds — that is the no-suppression invariant.
+        reuse_safe = (
+            not has_positive_signal
+            and not self._check_always_escalate(enriched_alert, enrichment)
+        )
+        dedup_enabled = dedup is not None and dedup.enabled
+        cache_enabled = cache is not None and cache.enabled
+        fingerprint = None
+        if reuse_safe and (dedup_enabled or cache_enabled):
+            # Same structural fingerprint for both reuse paths.
+            fingerprint = AlertDeduplicator.fingerprint(enriched_alert)
+            # 1) In-memory dedup window (WO-H5) — fastest, collapses bursts.
+            if dedup_enabled:
+                rep = dedup.lookup(_tenant, fingerprint)
+                if rep is not None:
+                    return self._fanout_duplicate(enriched_alert, rep, _tenant)
+            # 2) Durable decision cache (WO-H57) — BELOW the in-memory window,
+            #    so a recurring alert reuses its verdict for $0 after the window
+            #    expired / the process restarted. Independent of dedup being on.
+            if cache_enabled:
+                cached = cache.lookup(self.db, fingerprint)
+                if cached is not None:
+                    return self._fanout_duplicate(
+                        enriched_alert, cached, _tenant, origin="cache")
+
+        decision = self.triage_alert(enriched_alert, tenant_id=tenant_id)
+
+        if reuse_safe and fingerprint is not None:
+            # Register as the in-memory representative for later duplicates.
+            if dedup_enabled:
+                dedup.register(_tenant, fingerprint, decision)
+            # WO-H57: write-through to the durable cache when the verdict is
+            # confident + benign (see PersistentDecisionCache.should_cache). A
+            # human-confirmed override later upgrades the entry via the feedback
+            # loop; this first-pass write is only the LLM's own benign call.
+            if cache_enabled and cache.should_cache(decision):
+                cache.store(
+                    self.db, fingerprint, decision,
+                    rule_description=enriched_alert.get("rule_description", ""),
+                    entity_summary=self._cache_entity_summary(enriched_alert))
+        return decision
+
+    @staticmethod
+    def _cache_entity_summary(alert: dict) -> str:
+        """A short human-readable entity line for the Decision Cache tab, so an
+        admin can see WHAT a cached entry matches without reversing a hash. Uses
+        only the structural entities already in the fingerprint (no raw PII)."""
+        parts = []
+        for label, key in (("host", "agent_name"), ("agent", "agent_id"),
+                           ("src", "src_ip"), ("dst", "dst_ip"),
+                           ("user", "src_user")):
+            val = alert.get(key)
+            if val:
+                parts.append(f"{label}={val}")
+        return ", ".join(parts)
+
     def process_batch(self, enriched_alerts: list[dict],
                       tenant_id: str = None) -> list[AgentDecision]:
         """Process a batch of enriched alerts.
@@ -640,7 +1142,7 @@ class TriageAgent:
         decisions = []
         for alert in enriched_alerts:
             try:
-                decision = self.triage_alert(alert, tenant_id=tenant_id)
+                decision = self._process_one(alert, tenant_id=tenant_id)
                 decisions.append(decision)
             except Exception as e:
                 logger.error("triage_batch_item_failed",

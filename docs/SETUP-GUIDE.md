@@ -288,6 +288,57 @@ Access detailed usage reports at `/api/v1/llm-usage/`:
 - **Monthly budget alerts**
 - **Optimization suggestions**
 
+### Reducing LLM Cost (`cost_controls`)
+
+The LLM is only billed in **API mode** (a real `ANTHROPIC_API_KEY`); in
+subscription/CLI mode these levers still cut load but the spend is notional.
+All of them live under `agents.triage.cost_controls` in `config/config.yaml` and
+are **safe by construction** — none can suppress an alert that carries a threat
+signal (threat-intel hit / known-malicious / baseline anomaly) or that must
+always escalate.
+
+> **IMPORTANT — after an upgrade you must edit the config by hand.**
+> `scripts/upgrade.sh` **preserves your existing `config.yaml`**, so a new
+> toggle shipped in a release does **not** appear in your file automatically.
+> Copy the block from the packaged `config/config.yaml` into your live config,
+> set the value, and restart (`python main.py config/config.yaml`).
+
+The four levers, cheapest first:
+
+1. **Budget cap** — `cost_controls.budget`: a hard per-tenant monthly spend cap
+   that blocks the LLM and escalates once hit.
+2. **Dedup** — `cost_controls.dedup` (`enabled: true` by default): collapses a
+   burst of identical alerts (~5-min window) to one LLM call.
+3. **Noise pre-filter / CVE skip** — `cost_controls.prefilter`: skips whole
+   deterministic categories from the LLM. Shipped with
+   `skip_rule_groups: ["vulnerability-detector"]` — CVE alerts (the #1 cost
+   driver) are dismissed deterministically and stay fully visible on the
+   Vulnerabilities tab.
+4. **Persistent decision cache** — `cost_controls.decision_cache`
+   (**`enabled: false` by default — opt in**): remembers a benign verdict so a
+   recurring alert reuses it for **$0** instead of re-calling the LLM, even days
+   later or after a restart. To turn it on, set:
+
+   ```yaml
+   agents:
+     triage:
+       cost_controls:
+         decision_cache:
+           enabled: true          # <-- turn the cache ON here
+           write_through: true    # store qualifying verdicts as they happen
+           min_confidence: 0.7    # only cache verdicts at/above this confidence
+           max_age_hours: 168     # entries go stale after 7 days (0 = never)
+           cacheable_verdicts: ["auto_close", "false_positive", "benign", "needs_investigation"]
+   ```
+
+   Then restart the platform. Everything the cache stores is visible and
+   editable to an admin / senior analyst under **Decision Cache** in the
+   dashboard (System group): each entry shows what it matches, how many LLM
+   calls it has saved, and **Disable / Edit / Delete** controls — disabling or
+   deleting an entry sends the next matching alert back to the LLM. Watch the
+   tab's savings strip (and the Metrics/Reports LLM-usage panel) to confirm the
+   effect.
+
 ### Multi-Tenant Management
 
 For MSPs managing multiple clients:
@@ -473,6 +524,207 @@ Then restart the platform:
 ```bash
 sudo systemctl restart ai-soc
 ```
+
+---
+
+## Recommended: Detection Coverage for File Malware + DNS (what TI can and cannot see)
+
+**DHRUVA's threat intelligence is an *alert-enrichment* layer, not a scanner.**
+It matches indicators (IPs, domains, file hashes, emails) found **inside Wazuh
+alerts** against its IOC store (~68k indicators across 10 feeds). It does NOT
+independently sweep disks for malicious files or watch DNS traffic. The
+consequence, verified live: a malware file dropped on an endpoint, or a DNS
+query to a known-bad domain, produces **no TI flag if Wazuh never raises an
+alert carrying that indicator** — there is nothing to enrich.
+
+TI matching itself works end-to-end today: a bad IP in any alert is matched,
+and a **FIM (syscheck) alert that carries file hashes is matched against the
+hash IOCs automatically** — the enricher reads `syscheck.md5_after` /
+`sha1_after` / `sha256_after` and a known-bad hash sets `is_known_malicious`
+(2× risk boost, TI-priority triage). What is usually missing on a fresh Wazuh
+install is the **Wazuh-side configuration that makes those alerts exist**.
+Three additions close the gap:
+
+### 1. FIM with hash reporting on the paths malware lands in
+
+Wazuh's default FIM watches system directories on a 12-hour schedule. Add the
+common drop directories with `check_all` (which includes MD5/SHA1/SHA256
+hashes — those are what TI matches on) and `report_changes`. On the **agent**
+(or via a centralized agent.conf group):
+
+```xml
+<syscheck>
+  <!-- Linux drop points: fast, realtime, hashed -->
+  <directories check_all="yes" realtime="yes">/tmp,/var/tmp,/dev/shm</directories>
+  <directories check_all="yes" realtime="yes">/home</directories>
+
+  <!-- Windows agents: user-writable drop points -->
+  <directories check_all="yes" realtime="yes">C:\Users\*\Downloads</directories>
+  <directories check_all="yes" realtime="yes">C:\Users\*\AppData\Local\Temp</directories>
+</syscheck>
+```
+
+A new/changed file now raises a syscheck alert (rule 550/554 family) carrying
+its hashes → DHRUVA's TI enricher checks them against MalwareBazaar,
+ThreatFox, and the other hash feeds automatically. No DHRUVA-side config is
+needed.
+
+### 2. VirusTotal integration (managed AV verdict on every FIM hash)
+
+With a free VirusTotal key (same one as in the TI feeds section above), the
+Wazuh **manager** can look up every FIM hash and raise a dedicated
+high-severity alert when VT flags it:
+
+```xml
+<integration>
+  <name>virustotal</name>
+  <api_key>your_virustotal_api_key</api_key>
+  <group>syscheck</group>
+  <alert_format>json</alert_format>
+</integration>
+```
+
+VT-positive alerts (rule 87105) arrive in DHRUVA already flagged as malware
+findings and get TI enrichment + triage like any other alert. Mind the free
+tier's 4 lookups/min — scope the FIM directories (step 1) accordingly.
+
+### 3. DNS query logging + a rule (so a bad domain becomes an alert)
+
+Nothing in a default Wazuh install logs endpoint DNS queries, so a query to a
+known-bad domain is invisible. Two proven routes:
+
+- **Windows:** install Sysmon with DNS logging (event ID 22) and ingest the
+  Sysmon channel — the Wazuh Sysmon ruleset decodes `queryName`, and DHRUVA's
+  TI enricher matches the domain/URL fields.
+
+  ```xml
+  <!-- agent ossec.conf -->
+  <localfile>
+    <location>Microsoft-Windows-Sysmon/Operational</location>
+    <log_format>eventchannel</log_format>
+  </localfile>
+  ```
+
+- **Linux:** log resolver traffic (e.g. `dnsmasq` with `log-queries`, or Zeek's
+  `dns.log`), ingest it with a `<localfile>` block, and add a small local rule
+  so queries become alerts, e.g. `/var/ossec/etc/rules/local_rules.xml`:
+
+  ```xml
+  <group name="dns,">
+    <rule id="110050" level="3">
+      <decoded_as>json</decoded_as>
+      <field name="dns_query">\.+</field>
+      <description>DNS query logged: $(dns_query)</description>
+    </rule>
+  </group>
+  ```
+
+Once the query surfaces in an alert field, the TI enricher's domain matching
+takes over (ClearFake-style bad domains are in the feeds).
+
+**Rule of thumb:** if you can find the indicator in an alert in the Wazuh
+dashboard, DHRUVA can enrich it. If no alert carries it, fix the Wazuh config
+above — not the TI layer.
+
+---
+
+## Required for the Ransomware + Credential-Dumping Playbooks: Install DHRUVA's Trigger Rules
+
+**In plain terms:** DHRUVA has an investigation playbook for ransomware and one
+for credential dumping (LSASS/Mimikatz). Neither one will ever run until you
+install one extra rules file on your Wazuh manager. This section is how.
+
+**Why it's needed.** When an alert arrives, DHRUVA picks which playbook to use
+by looking at the alert's Wazuh **rule groups**. Stock Wazuh has no group called
+`ransomware` or `credential_access` — it records those behaviours as MITRE tags
+instead, and the playbook matcher doesn't read MITRE tags. So without this file
+those two playbooks sit on disk and never fire. The file ships in the package at:
+
+```
+config/wazuh/dhruva-playbook-triggers.xml
+```
+
+It adds 19 rules (IDs 120000–120199, a range reserved for DHRUVA) that tag
+ransomware and credential-dumping behaviour into the two groups the playbooks
+look for.
+
+### 1. Check your prerequisites
+
+Most of the credential-dumping rules read **Sysmon** data. If Sysmon isn't
+installed on your Windows endpoints and its log channel isn't being collected,
+those rules stay silent. Set that up first (see the Sysmon `<localfile>` block
+in the DNS section above). The ransomware rules also rely on FIM — make sure
+Wazuh's file integrity monitoring covers your file shares and user directories.
+
+### 2. Copy the file onto the Wazuh manager
+
+```bash
+sudo cp config/wazuh/dhruva-playbook-triggers.xml /var/ossec/etc/rules/
+sudo chown wazuh:wazuh /var/ossec/etc/rules/dhruva-playbook-triggers.xml
+sudo chmod 660 /var/ossec/etc/rules/dhruva-playbook-triggers.xml
+```
+
+> **Do not paste these rules into `ai-soc-tuned.xml`.** That file belongs to
+> DHRUVA's Detection Agent, which rewrites it in full every time you approve and
+> deploy a tuning proposal. Anything you add there by hand is erased on the next
+> deploy. Always keep these in their own file.
+
+### 3. Validate before you restart — don't skip this
+
+These rules were written against the Wazuh 4.x ruleset but **must be validated
+against your specific Wazuh version** before you rely on them. Rule IDs and
+field names shift between releases, and a rule that references a parent rule
+your version doesn't have will simply never match — silently.
+
+```bash
+sudo /var/ossec/bin/wazuh-logtest -v
+```
+
+Paste in a sample log line (for example a Sysmon process-creation event) and
+confirm the rule you expect actually fires. If `wazuh-logtest` reports an error
+loading the file, fix it **before** restarting — a broken rules file can stop
+the manager from starting cleanly.
+
+### 4. Restart Wazuh
+
+```bash
+sudo /var/ossec/bin/wazuh-control restart
+```
+
+### 5. Tune the two exclusion rules (important, or you'll get noise)
+
+Two rules ship as deliberately empty placeholders because the right values
+depend on your environment:
+
+| Rule | What to add |
+|------|-------------|
+| **120010** | Your approved **backup software**. Backup tools legitimately touch shadow copies and would otherwise look like ransomware. Note this rule matches the **parent** process (`parentImage`) — the backup product launches `vssadmin`/`wmic`, it isn't the process named in the alert. |
+| **120030** | Your **EDR/antivirus**. Security tools legitimately read LSASS memory and would otherwise look like credential dumping. |
+
+Edit those two rules to match the tools you actually run. Scope exclusions as
+tightly as you can — by **full path**, not just executable name. An attacker who
+drops a file named `MsMpEng.exe` into a temp directory gets excluded by a
+name-only rule. A broad exclusion is exactly the blind spot an attacker wants.
+
+Rule **120008** (100+ file changes in 60 seconds) is the other one to watch. It
+ships at **level 10 on purpose** — it's the most false-positive-prone rule in
+the set, because 100 file changes in a minute is routine on a file server during
+a patch window, a backup restore, or an antivirus signature drop. At level 10 a
+false alarm won't land as `high` severity or burn an AI triage call every
+maintenance window.
+
+Scope it to the directories that actually matter for you, and once it's quiet,
+you can raise the level. Don't just delete it — it's the rule that catches
+ransomware families which randomise file extensions and therefore slip past the
+signature-based rule above it.
+
+### 6. Confirm it worked
+
+In the Wazuh dashboard, search for rule IDs in the `120000` range, or check that
+new alerts carry `ransomware` or `credential_access` in their rule groups. Once
+they do, DHRUVA's triage will start routing those alerts to the matching
+playbook automatically. You can confirm which playbook was used on any triaged
+alert in the dashboard's decision detail (`playbook_used`).
 
 ---
 

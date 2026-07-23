@@ -1,7 +1,12 @@
 # =============================================================================
 # Investigation Playbook: Suspicious Login Activity
 # Rule Groups: authentication_failures, authentication_success, pam, sshd, web-log
-# MITRE: T1078 (Valid Accounts), T1110 (Brute Force)
+# MITRE: T1078 (Valid Accounts), T1110 (Brute Force), T1110.003 (Password Spray),
+#        T1621 (MFA Request Generation / "MFA fatigue"), T1070.001 (Log Clearing),
+#        T1136 (Account Creation), T1114.003 (Email Forwarding Rule)
+# Methodology reference (steps 6-8, identity/WEL content): socworkflows.com
+#   "Identity Compromise" + "Windows Event Log Analyser" (facts/checklist mined
+#   and rewritten into DHRUVA schema; prose not copied)
 # =============================================================================
 
 name: "Suspicious Login Investigation"
@@ -109,31 +114,116 @@ investigation_steps:
       - Any connections to other internal hosts (lateral movement)?
       - Any data exfiltration indicators (large outbound transfers)?
 
+  - step: 6
+    name: "Classify the authentication attack pattern"
+    query_template: |
+      SELECT srcip, dstuser, agent_name,
+             COUNT(*) as attempts,
+             COUNT(DISTINCT dstuser) as accounts_targeted,
+             MIN(timestamp) as first_seen, MAX(timestamp) as last_seen
+      FROM {enriched_alerts_index}
+      WHERE rule_group IN ('authentication_failures', 'win_authentication', 'pam')
+        AND timestamp >= '{alert_timestamp}' - INTERVAL 24 HOURS
+      GROUP BY srcip, dstuser, agent_name
+      ORDER BY attempts DESC
+      LIMIT 100
+    assess: |
+      Distinguish the pattern — they carry different severity and response:
+      - BRUTE FORCE: many failures against ONE account (>5 failures/account is the
+        working threshold; tune per client). Windows EID 4625.
+      - PASSWORD SPRAY: few failures each across MANY accounts (3+ accounts from a
+        single source) — often evades lockout policy and is easy to miss.
+      - CREDENTIAL STUFFING: single attempt per account across many accounts, often
+        distributed across source IPs, with a high success ratio on reused passwords.
+      - MFA FATIGUE (T1621): repeated MFA push prompts to one user, especially
+        off-hours, followed by an eventual approval. Treat an approval after a
+        prompt burst as compromise until disproven.
+      - IMPOSSIBLE TRAVEL: successful logons from geographies too far apart for the
+        elapsed time. Confirm the second login is not a VPN/proxy egress before calling it.
+
+  - step: 7
+    name: "Correlate Windows event chains around the logon"
+    query_template: |
+      SELECT timestamp, agent_name, rule_id, rule_description, srcuser, dstuser,
+             srcip, rule_group, data_command
+      FROM {enriched_alerts_index}
+      WHERE agent_id = '{alert_agent_id}'
+        AND rule_group IN ('windows', 'win_authentication', 'sysmon')
+        AND timestamp BETWEEN '{alert_timestamp}' - INTERVAL 1 HOUR
+            AND '{alert_timestamp}' + INTERVAL 4 HOURS
+      ORDER BY timestamp ASC
+      LIMIT 200
+    assess: |
+      Look for these chains within short (~5 minute) windows after a successful logon:
+      - LOGON -> PRIVILEGE ASSIGNMENT -> PROCESS CREATION
+        (EID 4624 -> 4672 special privileges -> 4688 process create)
+      - Logon Type matters: 3 = network, 10 = RDP, 4/5 = service/batch.
+        Type 10 from an unusual source, or Type 3 fan-out, indicates lateral movement.
+      - EID 4648 (explicit credential logon) — classic pass-the-hash / runas marker.
+      - PERSISTENCE created post-logon: new service (7045 / 4697), scheduled task
+        (4698), new local or domain account (4720 / 4728 group add).
+      - DEFENSE EVASION: event log cleared (Security 1102 / System 104), audit policy
+        changed (4719). Log clearing right after a logon is a HIGH-CONFIDENCE
+        malicious indicator — legitimate admins rarely clear logs ad hoc.
+
+  - step: 8
+    name: "Assess blast radius of the compromised identity"
+    query_template: |
+      SELECT timestamp, agent_name, srcip, dstip, dstuser,
+             rule_description, rule_group, data_command
+      FROM {enriched_alerts_index}
+      WHERE (srcuser = '{alert_user}' OR dstuser = '{alert_user}')
+        AND timestamp >= '{alert_timestamp}'
+        AND timestamp <= '{alert_timestamp}' + INTERVAL 24 HOURS
+      ORDER BY timestamp ASC
+      LIMIT 200
+    assess: |
+      What did the account DO after authenticating? These actions escalate severity:
+      - Password reset or MFA method changed/added (attacker establishing persistence)
+      - Mailbox forwarding or inbox rule created (T1114.003 — silent exfiltration)
+      - Privilege escalation: added to an admin/privileged group
+      - Mass file download, mass deletion, or bulk data access
+      - Access to systems the account has never touched before
+      - New OAuth app consent or API token issued
+      - Which systems, mailboxes, and data sets were reachable with this identity?
+
 verdict_criteria:
   true_positive:
     - "Successful auth following brute force from external IP"
     - "Login from never-before-seen geo + immediate privilege use"
     - "Service account login from non-infrastructure IP"
     - "Post-auth lateral movement or credential dumping detected"
-    
+    - "MFA approval following a burst of unsolicited push prompts (MFA fatigue)"
+    - "Impossible travel between successful logons, with VPN/proxy egress ruled out"
+    - "Password spray pattern: 3+ accounts probed from one source, then a success"
+    - "Post-logon persistence: MFA method added, forwarding rule created, or account added to a privileged group"
+    - "Event log cleared (1102/104) shortly after an anomalous logon"
+
   false_positive:
     - "Known CI/CD or monitoring system auth patterns"
     - "User VPN IP change during maintenance window"
     - "Password rotation triggering temporary failures"
     - "Load balancer health checks"
-    
+    - "Corporate VPN/proxy egress producing apparent geo jumps (verify egress ranges before calling impossible travel)"
+    - "Genuine user travel corroborated by calendar/HR context or prior notice"
+    - "Bulk failures from one host caused by a stale cached credential or a mapped drive/service still using an old password after rotation"
+
   needs_investigation:
     - "Failures from user's historical IP range but unusual time"
     - "New user account (< 7 days) with login anomalies"
     - "Moderate failure count without clear success or known pattern"
+    - "Geo anomaly where the source IP is an unclassified VPN/proxy endpoint"
+    - "MFA prompt burst with no approval observed (attempt, not yet compromise)"
 
 recommended_actions:
   if_true_positive:
     - "Force password reset for affected user"
+    - "REVOKE active sessions and refresh tokens — a password reset alone does not evict an attacker holding a live session or token"
     - "Disable account if service account compromise suspected"
     - "Block source IP at firewall/WAF"
     - "Collect forensic artifacts from target host"
     - "Check for persistence mechanisms"
+    - "IDENTITY PERSISTENCE: audit and remove attacker-added MFA methods, mailbox forwarding/inbox rules, OAuth app consents, and privileged group additions"
     - "Notify client security team via escalation channel"
     
   if_false_positive:

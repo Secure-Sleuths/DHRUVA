@@ -355,7 +355,8 @@ def init_api(db, enrichment, triage_agent, detection_agent, feedback_engine,
                 enrichment_service=enrichment,
                 tenant_registry=tenant_registry,
                 triage_agent=triage_agent,
-                incident_engine=incident_engine
+                incident_engine=incident_engine,
+                config=config
             )
         except ModuleNotFoundError as e:
             if e.name and not "src.api.routes.webhooks".startswith(e.name):

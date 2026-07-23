@@ -509,7 +509,16 @@ class WazuhClient:
     # ----- Vulnerability & SCA -----
 
     def get_agent_vulnerabilities(self, agent_id: str) -> list[dict]:
-        """Get vulnerability data for an agent."""
+        """Get vulnerability data for an agent via the Manager API.
+
+        DEPRECATED (WO-H11): the Manager endpoint ``GET /vulnerability/{agent}``
+        was REMOVED in Wazuh 4.8+ and 404s on modern stacks. The M4
+        vuln-context enricher no longer calls this — it reads the vuln STATE
+        index (``wazuh-states-vulnerabilities-*``) from OpenSearch instead (see
+        ``VulnerabilityContextEnricher._fetch_vulns`` /
+        ``OpenSearchClient.get_vulnerabilities``). Retained only for backward
+        compatibility with any legacy caller on a pre-4.8 Manager.
+        """
         try:
             result = self._get(f"/vulnerability/{agent_id}", params={"limit": 100})
             return result.get("data", {}).get("affected_items", [])
@@ -541,16 +550,42 @@ class WazuhClient:
                          agent_id=agent_id, error=str(e))
             return []
 
-    def get_agent_packages(self, agent_id: str, limit: int = 500) -> list[dict]:
-        """Get installed packages for an agent."""
+    def get_agent_packages(self, agent_id: str, limit: int = 500,
+                           name: str = None) -> list[dict]:
+        """Get installed packages for an agent.
+
+        When ``name`` is given, the Wazuh API is filtered to that EXACT package
+        name (``q=name=<pkg>``) so the target is returned regardless of the
+        agent's total package count. Without it, the historical behavior is
+        preserved: the first ``limit`` packages sorted by name (WO-H40: that
+        top-N slice truncates large inventories, so a package sorting past the
+        limit was falsely reported "not found" — by-name lookup fixes that for
+        the CVE-remediation before/after version checks)."""
         try:
+            params = {"limit": limit, "sort": "name"}
+            if name:
+                # Exact-match filter — Wazuh's query grammar; keeps the result
+                # to the one package regardless of inventory size.
+                params["q"] = f"name={name}"
             result = self._get(f"/syscollector/{agent_id}/packages",
-                               params={"limit": limit, "sort": "name"})
+                               params=params)
             return result.get("data", {}).get("affected_items", [])
         except Exception as e:
             logger.error("syscollector_packages_failed",
                          agent_id=agent_id, error=str(e))
             return []
+
+    def get_agent_package_version(self, agent_id: str,
+                                  package_name: str) -> str | None:
+        """Resolve the installed version of ONE package by exact name, or None
+        if it is not installed. Queries the Wazuh API by name (WO-H40) instead
+        of scanning a truncated top-N list, so it is correct on agents with
+        more than ``limit`` packages. Exact-matches by name in the returned
+        items as a belt-and-suspenders check against a substring filter."""
+        for p in self.get_agent_packages(agent_id, name=package_name):
+            if p.get("name", "").lower() == package_name.lower():
+                return p.get("version")
+        return None
 
     def get_agent_os(self, agent_id: str) -> dict:
         """Get OS information for an agent."""
@@ -650,6 +685,12 @@ class WazuhClient:
         "kill-process", "quarantine", "restart-wazuh",
         "dns-sinkhole", "proxy-blocklist", "email-quarantine",
         "revoke-session", "run-command",
+        # WO-H38: the SAFE CVE-remediation upgrade script (validates the
+        # package name + only does --only-upgrade). execute_remediation
+        # dispatches this command name instead of run-command so the shipped
+        # ossec.conf registration (deploy/wazuh/active-response) is actually
+        # what runs.
+        "dhruva-pkg-upgrade",
     ])
 
     # Characters that indicate shell injection attempts

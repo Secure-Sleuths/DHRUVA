@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none" role="img" aria-label="DHRUVA">
+  <!-- DHRUVA brand mark — the Pole Star (Dhruva) with a satellite tracing its orbit.
+       Palette: Signal Cyan #35b9d1 orbit/satellite/core, Cream #f2ecd6 star. -->
+  <ellipse cx="60" cy="60" rx="50" ry="27" transform="rotate(-24 60 60)"
+           stroke="#35b9d1" stroke-width="3" stroke-opacity=".85"/>
+  <circle cx="105.7" cy="39.7" r="5.5" fill="#35b9d1"/>
+  <polygon points="60,16 66,54 92,60 66,66 60,104 54,66 28,60 54,54" fill="#f2ecd6"/>
+  <circle cx="60" cy="60" r="4" fill="#35b9d1"/>
+</svg>

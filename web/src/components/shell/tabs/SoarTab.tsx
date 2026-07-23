@@ -345,7 +345,7 @@ export function SoarTab(_props: TabProps) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <PageHeading
           title="SOAR"
-          sub="Automation playbooks and their executions — read the trigger conditions like a rule, and act on what fired. Every action is human-approved and confirmed."
+          sub="Automation playbooks and their executions — read the trigger conditions like a rule, and act on what fired."
         />
         {!locked && (
           <PollingStatus
@@ -420,12 +420,10 @@ function PostureNote({
 }) {
   return (
     <div className="rounded-lg border border-gated-border bg-panel2 px-3.5 py-2.5 text-kbd text-gated-ink">
-      SOAR playbooks contain containment actions, so every action here is{" "}
-      <b>human-approved and never auto</b>. Enabling a playbook only makes it
-      eligible — a containment step still routes to the human approval queue and
-      never auto-runs from being enabled. Approving a queued execution{" "}
-      <b>dispatches its actions</b>; it is behind an explicit confirm that lists
-      them. This UI changes no server default and auto-executes nothing.
+      Enabling a playbook only makes it <b>eligible</b> — a containment step
+      still routes to the human approval queue; it does not auto-run. Approving a
+      queued execution <b>dispatches its actions</b>, behind an explicit confirm
+      that lists them.
       {(pbGate.lockNote || exGate.approveLockNote) && (
         <span className="mt-1 block text-dim2">
           {exGate.approveLockNote ?? pbGate.lockNote}

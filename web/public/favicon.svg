@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none" role="img" aria-label="DHRUVA">
+  <!-- Favicon variant — per the brand system, the orbit is DROPPED at small sizes
+       so the star stays crisp; star + cyan core only, on the app-icon ground. -->
+  <defs>
+    <linearGradient id="favBg" x1="0.28" y1="0" x2="0.72" y2="1">
+      <stop offset="0" stop-color="#123a4e"/>
+      <stop offset="1" stop-color="#08202c"/>
+    </linearGradient>
+  </defs>
+  <rect width="120" height="120" rx="27" fill="url(#favBg)"/>
+  <polygon points="60,20 66,54 92,60 66,66 60,100 54,66 28,60 54,54" fill="#f2ecd6"/>
+  <circle cx="60" cy="60" r="6" fill="#35b9d1"/>
+</svg>

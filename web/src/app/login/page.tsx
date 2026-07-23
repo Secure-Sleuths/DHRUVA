@@ -53,16 +53,26 @@ export default function LoginPage() {
   return (
     <main className="flex min-h-screen items-center justify-center bg-bg p-6">
       <div className="w-full max-w-sm">
-        <div className="mb-6 flex items-center gap-3">
-          <div className="flex h-8 w-8 items-center justify-center rounded-md bg-gradient-to-br from-teal to-acc text-[#04121f]">
-            ◆
-          </div>
+        <div className="mb-6 flex items-center gap-4">
+          {/* WO-H52 / WO-H55: the DHRUVA Pole-Star mark, sized up from 32px. */}
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src="/dhruva-mark.svg"
+            alt="DHRUVA"
+            width={56}
+            height={56}
+            className="h-14 w-14 shrink-0"
+          />
           <div>
-            <div className="text-title font-bold tracking-wide text-ink">
+            <div className="text-h1 font-bold tracking-[0.16em] text-ink">
               DHRUVA
             </div>
             <div className="text-micro tracking-[0.13em] text-dim2">
               AI-SOC · sign in
+            </div>
+            {/* WO-H55: attribution — the platform is built by Secure Sleuths. */}
+            <div className="mt-0.5 text-micro tracking-[0.08em] text-dim2">
+              by <span className="text-teal">Secure Sleuths</span>
             </div>
           </div>
         </div>
@@ -118,10 +128,13 @@ export default function LoginPage() {
             {submitting ? "Signing in…" : "Sign in"}
           </button>
 
-          <p className="mt-4 text-kbd leading-relaxed text-dim2">
-            Anonymization is the LLM boundary — identifiers are tokenized before
-            AI analysis; you see the real values. Active response stays
-            human-approved.
+          {/* WO-H55: the pre-auth anonymization/active-response blurb was
+              removed — it's redundant with the in-app "Anonymized before AI
+              analysis" header indicator and doesn't help sign-in. Replaced with
+              a clean product attribution. */}
+          <p className="mt-4 text-center text-micro tracking-[0.06em] text-dim2">
+            DHRUVA · AI SOC on Wazuh · built by{" "}
+            <span className="text-dim">Secure Sleuths</span>
           </p>
         </form>
       </div>

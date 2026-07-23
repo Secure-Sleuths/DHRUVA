@@ -93,6 +93,7 @@ import type {
   TIStatsResponse,
   TicketsResponse,
   TicketStats,
+  TriageDecision,
   TriageDecisionsResponse,
   TriageReviewBody,
   TriageSort,
@@ -105,6 +106,8 @@ import type {
   IocMatch,
   MitreCoverageHeatmap,
 } from "./types";
+// WO-H21 — complete-context case view read contracts (raw event + playbook).
+import type { DecisionPlaybookResponse, RawAlertResponse } from "./types";
 
 /**
  * Screenshot/dev fixtures gate. When `NEXT_PUBLIC_DHRUVA_FIXTURES` is "true"
@@ -337,6 +340,133 @@ export async function getRuleStats(
 }
 
 /**
+ * `GET /api/triage/decisions/{id}/raw-alert` (WO-H21) → the raw underlying
+ * Wazuh event behind a decision, from the enriched-alert index (the derived
+ * `enrichment` blob is dropped server-side — the case already renders it).
+ * Backs the "Raw Wazuh event" drill on the decision card, fetched LAZILY on
+ * first expand. READ-ONLY (`verify_jwt`), tenant-scoped server-side; a
+ * degraded deployment (no OpenSearch / event rotated out) answers
+ * `found: false` + `reason` — an empty state, never an error.
+ *
+ * Fixture mode short-circuits to a small synthetic event ("empty" → an honest
+ * not-found) so the drill's states can be captured without a live backend.
+ */
+export async function getDecisionRawAlert(
+  decisionId: string,
+  signal?: AbortSignal,
+): Promise<RawAlertResponse> {
+  if (FIXTURES === "true" || FIXTURES === "empty") {
+    if (FIXTURES === "empty") {
+      return {
+        found: false,
+        alert: null,
+        reason:
+          "The underlying event was not found in the enriched-alert index (it may have been rotated out of retention).",
+      };
+    }
+    return {
+      found: true,
+      alert: {
+        alert_id: "1713520200.987654",
+        timestamp: "2026-04-19T10:30:00+00:00",
+        rule_id: 5710,
+        rule_level: 10,
+        rule_description: "sshd: authentication success.",
+        rule_groups: ["syslog", "sshd", "authentication_success"],
+        agent_id: "001",
+        agent_name: "prod-db-01",
+        src_ip: "185.220.101.34",
+        data: { srcip: "185.220.101.34", dstuser: "root" },
+        full_log:
+          "Apr 19 10:30:00 prod-db-01 sshd[1234]: Accepted publickey for root from 185.220.101.34 port 54321 ssh2",
+        decoder: { name: "sshd" },
+        location: "/var/log/auth.log",
+      },
+      reason: null,
+    };
+  }
+  return request<RawAlertResponse>(
+    `/api/triage/decisions/${encodeURIComponent(decisionId)}/raw-alert`,
+    { signal },
+  );
+}
+
+/**
+ * `GET /api/triage/decisions/{id}/playbook` (WO-H21) → the matched playbook's
+ * CONTENT (investigation steps + verdict/escalation criteria + recommended
+ * actions), resolved server-side from the decision's stored `playbook_used`
+ * against the currently loaded guidance. Backs the "Matched playbook" drill on
+ * the decision card, fetched LAZILY on first expand. READ-ONLY (`verify_jwt`).
+ * `matched: false` + `reason` covers every honest no-playbook state (none
+ * recorded / generic no-match / guidance unavailable) — an empty state, never
+ * an error.
+ *
+ * Fixture mode short-circuits to a small synthetic playbook ("empty" → an
+ * honest no-match) so the drill's states can be captured without a backend.
+ */
+export async function getDecisionPlaybook(
+  decisionId: string,
+  signal?: AbortSignal,
+): Promise<DecisionPlaybookResponse> {
+  if (FIXTURES === "true" || FIXTURES === "empty") {
+    if (FIXTURES === "empty") {
+      return {
+        matched: false,
+        playbook: null,
+        reason:
+          "No specific playbook matched this alert — the AI applied the general investigation methodology.",
+      };
+    }
+    return {
+      matched: true,
+      playbook: {
+        key: "suspicious_login",
+        name: "Suspicious Login Investigation",
+        trigger_rule_groups: ["authentication_failures", "sshd"],
+        trigger_rule_ids: [5710, 5712],
+        investigation_steps: [
+          {
+            step: 1,
+            name: "Identify the user and source",
+            assess:
+              "- How many unique source IPs are involved?\n- Is the user a known service account or human?",
+            query_template: "",
+          },
+          {
+            step: 2,
+            name: "Check for successful auth following failures",
+            assess:
+              "- Did authentication failures precede a successful login?",
+            query_template: "",
+          },
+        ],
+        verdict_criteria: {
+          true_positive: [
+            "Successful auth following brute force from external IP",
+          ],
+          false_positive: ["Known CI/CD or monitoring system auth patterns"],
+          needs_investigation: [
+            "New user account (< 7 days) with login anomalies",
+          ],
+        },
+        escalation_criteria: [
+          "New user account (< 7 days) with login anomalies",
+        ],
+        recommended_actions: {
+          if_true_positive: ["Force password reset for affected user"],
+          if_false_positive: ["Tag alert with FP reason for feedback loop"],
+        },
+      },
+      reason: null,
+    };
+  }
+  return request<DecisionPlaybookResponse>(
+    `/api/triage/decisions/${encodeURIComponent(decisionId)}/playbook`,
+    { signal },
+  );
+}
+
+/**
  * `GET /api/triage/pending-review` (WO-U13) → `{ pending, count }`, the
  * human-review backlog (decisions ESCALATED with NO human verdict yet). Each
  * item is a full decision dict — the SAME entity the Triage queue renders — so
@@ -430,6 +560,56 @@ export async function submitTriageReview(
     body,
     signal,
   });
+}
+
+// ---- Alert-level claim (WO-H25) ----------------------------------------------
+/** `POST /api/triage/decisions/{id}/claim|unclaim` envelope. */
+export interface DecisionClaimResult {
+  status: string;
+  decision_id: string;
+  /** the (server-authenticated) owner after the call — null after unclaim */
+  claimed_by: string | null;
+}
+
+/**
+ * `POST /api/triage/decisions/{id}/claim` (WO-H25) — claim a triage decision
+ * for YOURSELF. There is NO body: the server takes the claimant from the JWT
+ * `sub` (never a client-supplied field). Role: analyst+ (L1 is operator).
+ * Self-claim, unowned-only — a decision owned by another user is a 409 with
+ * no write (mirror this with `rbac.ts::triageClaimGate` so the control is
+ * never a dead button); re-claiming your own is an idempotent 200.
+ * FIXTURE-GATED like `submitTriageReview`: fixture mode short-circuits to a
+ * synthetic success with an "you" placeholder owner and performs NO mutation.
+ */
+export async function claimDecision(
+  decisionId: string,
+  signal?: AbortSignal,
+): Promise<DecisionClaimResult> {
+  if (FIXTURES === "true" || FIXTURES === "empty") {
+    return { status: "ok", decision_id: decisionId, claimed_by: "you" };
+  }
+  return request<DecisionClaimResult>(
+    `/api/triage/decisions/${encodeURIComponent(decisionId)}/claim`,
+    { method: "POST", signal },
+  );
+}
+
+/**
+ * `POST /api/triage/decisions/{id}/unclaim` (WO-H25) — release YOUR OWN claim.
+ * Idempotent when already unclaimed; releasing a colleague's claim is a 409
+ * server-side (only the owner releases). Fixture-gated like `claimDecision`.
+ */
+export async function unclaimDecision(
+  decisionId: string,
+  signal?: AbortSignal,
+): Promise<DecisionClaimResult> {
+  if (FIXTURES === "true" || FIXTURES === "empty") {
+    return { status: "ok", decision_id: decisionId, claimed_by: null };
+  }
+  return request<DecisionClaimResult>(
+    `/api/triage/decisions/${encodeURIComponent(decisionId)}/unclaim`,
+    { method: "POST", signal },
+  );
 }
 
 // ---- Incident case-management writes (WO-U4 case writes) --------------------
@@ -596,6 +776,7 @@ export async function getOverviewSummary(
  */
 export async function getCampaigns(
   signal?: AbortSignal,
+  scope: "active" | "contained" = "active",
 ): Promise<CampaignsResponse> {
   // "locked" is a MITRE-only fixture (the `mitre` endpoints 403); campaigns are
   // not gated by that feature, so under "locked" they still return populated —
@@ -604,7 +785,26 @@ export async function getCampaigns(
     const { campaignsFixture } = await import("./fixtures/overview");
     return campaignsFixture({ empty: FIXTURES === "empty" });
   }
-  return request<CampaignsResponse>("/api/campaigns", { signal });
+  // WO-H47: request ACTIVE campaigns only.
+  //
+  // This call previously passed no filter, so it returned every campaign ever
+  // recorded, capped at the API's default limit=100. Measured on a live
+  // install: 930 campaigns, of which only 3 were active — and because the
+  // rollup sorts by (severity, dwell) WITHOUT considering status, the active
+  // ones ranked 10th, 244th and 440th. The top 100 was 99 contained + 1 open,
+  // so the Campaign map rendered a wall of closed campaigns while silently
+  // dropping TWO of the three that actually needed attention.
+  //
+  // The panel is titled "Active campaigns" and has a "No active campaigns"
+  // empty state, so active-only is the intent this call was always missing.
+  //
+  // `scope` keeps the contained history REACHABLE rather than merely hidden —
+  // the Overview's toggle flips this. Defaulting to "active" means every
+  // existing caller (MitreTab's live-campaign overlay) gets the corrected
+  // behaviour without change.
+  const query =
+    scope === "contained" ? "?status=contained" : "?active_only=true";
+  return request<CampaignsResponse>(`/api/campaigns${query}`, { signal });
 }
 
 // ---- NL-Query copilot (WO-B8) — Investigate (WO-U6) -------------------------
@@ -2122,7 +2322,8 @@ export async function reverseResponseAction(
 //
 // Server RBAC (never widen client-side):
 //   - review (approve/reject) → require_role("admin","senior_analyst") [+mssp]
-//   - deploy / rollback       → require_role("mssp_admin") ONLY (shared Wazuh)
+//   - deploy / rollback       → require_deploy_authority() (WO-H30): mssp_admin
+//                               ONLY in multi-tenant, admin+ in single-tenant
 //   - validate (test/dry-run) → require_admin (admin | mssp_admin)
 // All are behind require_license_feature("detection") (402/403 → locked).
 // NOTE: there is NO server endpoint to edit a proposal's XML before deploy —
@@ -2231,6 +2432,8 @@ import type {
   AdminIdentitiesResponse,
   AdminLocalIocsResponse,
   AssignTenantAgentsResult,
+  DecisionCacheResponse,
+  UpdateDecisionCacheBody,
   CreateAssetBody,
   CreateIdentityBody,
   CreateLocalIocBody,
@@ -2395,6 +2598,30 @@ export async function createAdminAsset(
     signal,
   });
 }
+
+/**
+ * WO-H51: seed asset context from the enrolled Wazuh agents. The server reads
+ * the agent inventory and upserts a stub per host WITHOUT clobbering any tier/
+ * owner an analyst already set (insert-if-absent for classification). Returns
+ * how many were newly added vs already present.
+ */
+export interface DiscoverAssetsResult {
+  status: string;
+  discovered: number;
+  new: number;
+  existing: number;
+}
+export async function discoverAdminAssets(
+  signal?: AbortSignal,
+): Promise<DiscoverAssetsResult> {
+  if (FIXTURES === "true" || FIXTURES === "empty") {
+    return { status: "ok", discovered: 3, new: 3, existing: 0 };
+  }
+  return request<DiscoverAssetsResult>(
+    "/api/admin/settings/assets/discover",
+    { method: "POST", signal },
+  );
+}
 export async function updateAdminAsset(
   assetId: string,
   body: UpdateAssetBody,
@@ -2418,6 +2645,59 @@ export async function deleteAdminAsset(
   return request<SettingsWriteResult>(
     `/api/admin/settings/assets/${encodeURIComponent(assetId)}`,
     { method: "DELETE", signal },
+  );
+}
+
+// ---- Decision cache (WO-H57) — senior_analyst+ ------------------------------
+// View / disable / edit / delete the persistent verdict cache that lets a
+// recurring alert reuse its stored verdict for $0 instead of re-calling the LLM.
+export async function getDecisionCache(
+  opts?: { includeDisabled?: boolean; limit?: number },
+  signal?: AbortSignal,
+): Promise<DecisionCacheResponse> {
+  if (FIXTURES === "true" || FIXTURES === "empty") {
+    const { decisionCacheFixture } = await import("./fixtures/admin");
+    return decisionCacheFixture({ empty: FIXTURES === "empty" });
+  }
+  return request<DecisionCacheResponse>("/api/admin/decision-cache", {
+    query: {
+      include_disabled: String(opts?.includeDisabled ?? true),
+      limit: opts?.limit ?? 500,
+    },
+    signal,
+  });
+}
+export async function updateDecisionCacheEntry(
+  cacheId: string,
+  body: UpdateDecisionCacheBody,
+  signal?: AbortSignal,
+): Promise<SettingsWriteResult> {
+  if (FIXTURES === "true" || FIXTURES === "empty") return { status: "updated" };
+  return request<SettingsWriteResult>(
+    `/api/admin/decision-cache/${encodeURIComponent(cacheId)}`,
+    { method: "PATCH", body, signal },
+  );
+}
+export async function deleteDecisionCacheEntry(
+  cacheId: string,
+  signal?: AbortSignal,
+): Promise<SettingsWriteResult> {
+  if (FIXTURES === "true" || FIXTURES === "empty") return { status: "deleted" };
+  return request<SettingsWriteResult>(
+    `/api/admin/decision-cache/${encodeURIComponent(cacheId)}`,
+    { method: "DELETE", signal },
+  );
+}
+export async function purgeDecisionCache(
+  scope: "expired" | "all",
+  signal?: AbortSignal,
+): Promise<{ status: string; scope: string; removed: number }> {
+  if (FIXTURES === "true" || FIXTURES === "empty") {
+    return { status: "purged", scope, removed: 0 };
+  }
+  return request<{ status: string; scope: string; removed: number }>(
+    "/api/admin/decision-cache/purge",
+    { method: "POST", query: { scope }, signal },
   );
 }
 
@@ -3226,6 +3506,8 @@ export async function getTriageDecisionsFiltered(
     /** Widen the server window (default 200, max 1000) — used for the anomaly
      * filter so it isn't starved by the default page size. */
     limit?: number;
+    /** WO-H33: rows to skip (SQL-side) — pages past the first window. */
+    offset?: number;
   } = {},
   signal?: AbortSignal,
 ): Promise<TriageDecisionsResponse> {
@@ -3240,9 +3522,36 @@ export async function getTriageDecisionsFiltered(
       since: params.since,
       anomaly: params.anomaly ? "true" : undefined,
       limit: params.limit,
+      offset: params.offset,
     },
     signal,
   });
+}
+
+/**
+ * `GET /api/triage/decisions/{id}` (WO-H33) → a single flattened decision row,
+ * tenant-scoped server-side (foreign/unknown id → 404). Lets the deep-linked
+ * case view resolve a decision that sits beyond the currently-loaded queue
+ * window instead of dead-ending on "not in the current slice". READ-ONLY
+ * (`verify_jwt`). Fixture mode resolves from the same fixture list as the
+ * queue and 404s when the id isn't there (mirrors the server).
+ */
+export async function getTriageDecision(
+  decisionId: string,
+  signal?: AbortSignal,
+): Promise<TriageDecision> {
+  if (FIXTURES === "true" || FIXTURES === "empty") {
+    const { triageFixture } = await import("./fixtures/triage");
+    const row = triageFixture({ empty: FIXTURES === "empty" }).decisions.find(
+      (d) => d.id === decisionId,
+    );
+    if (!row) throw new ApiError(404, "Decision not found");
+    return row;
+  }
+  return request<TriageDecision>(
+    `/api/triage/decisions/${encodeURIComponent(decisionId)}`,
+    { signal },
+  );
 }
 
 /** One incident approaching/breaching SLA (`GET /api/incidents/sla-at-risk`). */

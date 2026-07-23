@@ -207,6 +207,13 @@ export function RespondTab(_props: TabProps) {
     try {
       if (kind === "approve") {
         const res = await approveResponseAction(row.id);
+        if (res.status === "not_applied") {
+          setActionError(
+            `Wazuh accepted the ${actionLabel(row.action)} command but dispatched it to no agent (the target has no dispatchable active-response agent) — nothing was applied. The attempt is recorded in the audit trail as not-applied.`,
+          );
+          await load(true);
+          return;
+        }
         if (res.success === false || res.status === "failed") {
           setActionError(
             `The proposal was approved but the dispatch to Wazuh failed${
@@ -282,7 +289,7 @@ export function RespondTab(_props: TabProps) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <PageHeading
           title="Respond"
-          sub="The active-response queue and the durable audit trail — what is awaiting a human decision, what is live, and everything that has run. Approving or reversing a containment is a deliberate, confirmed human action."
+          sub="The active-response queue and the durable audit trail — what is awaiting a human decision, what is live, and everything that has run."
         />
         {!locked && (
           <PollingStatus
@@ -370,11 +377,9 @@ export function RespondTab(_props: TabProps) {
 function PostureNote({ gate }: { gate: ResponseActionGate }) {
   return (
     <div className="rounded-lg border border-gated-border bg-panel2 px-3.5 py-2.5 text-kbd text-gated-ink">
-      Active response is <b>human-approved by default and never auto</b>. This
-      surface only performs the existing server-gated human actions — it changes
-      no default and auto-executes nothing. Approving a proposal dispatches it{" "}
-      <b>immediately</b> (and logs it); reversing clears an active block. Both are
-      senior_analyst+ and always behind an explicit confirm.
+      Approving a proposal dispatches it <b>immediately</b> (and logs it);
+      reversing clears an active block. Both are senior_analyst+ and always
+      behind an explicit confirm.
       {gate.lockNote && (
         <span className="mt-1 block text-dim2">{gate.lockNote}</span>
       )}

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
   Dialog,
   FeatureLockedState,
@@ -44,6 +44,19 @@ function pickActiveTab(role: Role, tierLocked: (id: string) => boolean, current:
   return "overview";
 }
 
+/**
+ * Serialize the navigation state into the dashboard query string. `tab` is
+ * always present; the deep-linked entity id (`incident`) only when navigation
+ * carries one. Kept in a stable key order so two equal states stringify
+ * identically (the URL-reconciliation effect compares these strings).
+ */
+function buildTabQuery(tab: string, entity?: string): string {
+  const p = new URLSearchParams();
+  p.set("tab", tab);
+  if (entity) p.set("incident", entity);
+  return p.toString();
+}
+
 export function AppShell() {
   const {
     role,
@@ -60,14 +73,23 @@ export function AppShell() {
     setDevTier,
   } = useAuth();
 
-  const [active, setActive] = useState("overview");
-  // Deep-link param threaded to the active tab (e.g. an incident id for the
-  // Incidents case view). Cleared whenever navigation carries no id.
-  const [navParam, setNavParam] = useState<string | undefined>(undefined);
   const [copilotOpen, setCopilotOpen] = useState(false);
   const [lockedTab, setLockedTab] = useState<string | null>(null);
   const [seconds, setSeconds] = useState(22);
   const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  // ---- URL is the source of truth for navigation (WO-H22) -----------------
+  // The active tab and the deep-linked entity live in the query string
+  // (`/dashboard?tab=<id>&incident=<id>`) so every view is bookmarkable,
+  // shareable, and survives refresh + browser back/forward. We DERIVE the active
+  // tab from the URL each render instead of holding it in React state, giving a
+  // single source of truth and no bidirectional-sync loop: back/forward mutate
+  // the URL, `useSearchParams` re-renders, and the derived tab follows. The raw
+  // values below are gated (never rendered directly) a few lines down.
+  const urlTab = searchParams.get("tab") ?? "overview";
+  const urlEntity = searchParams.get("incident") ?? undefined;
 
   // Auth guard: once bootstrap settles, an unauthenticated real session (no
   // JWT) is sent to the login page. In dev-preview builds the switcher stands
@@ -79,10 +101,27 @@ export function AppShell() {
 
   const tierLocked = useCallback((id: string) => isTabLocked(id, tier), [tier]);
 
-  // Keep the active tab valid whenever role/tier gating changes.
+  // Gate the URL-requested tab EXACTLY as a sidebar click would — through the
+  // same RBAC role + license-tier gating (`pickActiveTab`). A deep-link to a tab
+  // the current role/tier can't reach falls back to a safe tab; the URL can
+  // NEVER force a gated tab to render. This is the RBAC-bypass guard.
+  const active = pickActiveTab(role, tierLocked, urlTab);
+  // The deep-linked entity applies ONLY if the requested tab actually resolved
+  // (was not gated away). Cleared whenever navigation carries no id, or when the
+  // tab it belonged to was denied.
+  const navParam = active === urlTab ? urlEntity : undefined;
+
+  // Keep the URL honest with what is actually shown: if gating overrode the
+  // requested tab (or dropped an entity whose tab was denied), rewrite the URL
+  // to the resolved state. Guarded on `loading` so we never clobber a legitimate
+  // deep-link before the real role/tier settle (the JWT-derived role starts at
+  // the least-privilege default during bootstrap).
   useEffect(() => {
-    setActive((cur) => pickActiveTab(role, tierLocked, cur));
-  }, [role, tierLocked]);
+    if (loading) return;
+    const desired = buildTabQuery(active, navParam);
+    const current = buildTabQuery(urlTab, urlEntity);
+    if (desired !== current) router.replace(`${pathname}?${desired}`);
+  }, [loading, active, navParam, urlTab, urlEntity, pathname, router]);
 
   // Close the shell's contextual rail when leaving the tabs that host its
   // launcher. (Investigate owns its own rail, so it isn't in COPILOT_TABS.)
@@ -96,10 +135,19 @@ export function AppShell() {
     return () => clearInterval(t);
   }, []);
 
-  const onSelect = useCallback((id: string, param?: string) => {
-    setActive(id);
-    setNavParam(param);
-  }, []);
+  const onSelect = useCallback(
+    (id: string, param?: string) => {
+      const url = `${pathname}?${buildTabQuery(id, param)}`;
+      // replace-vs-push: a lateral tab switch is NOT worth a history entry (it
+      // would bloat back/forward on every sidebar click), so it REPLACES.
+      // Drilling into a specific entity (a deep-link, e.g. opening an incident
+      // case) IS a distinct navigation worth a Back step, so it PUSHES — Back
+      // then returns from the case to the list it was opened from.
+      if (param) router.push(url);
+      else router.replace(url);
+    },
+    [pathname, router],
+  );
   const onLockedSelect = useCallback((id: string) => setLockedTab(id), []);
   const refresh = useCallback(() => setSeconds(0), []);
 
@@ -196,12 +244,6 @@ export function AppShell() {
           )}
         </div>
 
-        <div className="border-t border-line px-5 py-2 text-[10.5px] text-dim2">
-          Glass-box shell · campaign Overview · grounded copilot · nothing is a
-          bare number (expand any panel to its source) · polling (no live socket)
-          · severity = p-scale + label + glyph · active response is
-          human-approved · verdict/status change requires a reason.
-        </div>
       </div>
 
       {/* tier-lock overlay — license gate, independent of role; Admin never locked */}

@@ -19,6 +19,7 @@ import {
   BarChart3,
   BookOpen,
   Crosshair,
+  DatabaseZap,
   FileSearch,
   FileText,
   Grid3x3,
@@ -103,6 +104,7 @@ export const GROUPS: readonly NavGroup[] = [
     [
       { id: "metrics", label: "Metrics", icon: BarChart3 },
       { id: "reports", label: "Reports", icon: FileText },
+      { id: "decisioncache", label: "Decision Cache", icon: DatabaseZap },
       { id: "admin", label: "Admin", icon: Settings },
     ],
   ],
@@ -136,6 +138,7 @@ export const TAB_ACCESS: Record<string, readonly Role[]> = {
   groups: ["mssp_admin"],
   metrics: ["mssp_admin", "admin", "senior_analyst"],
   reports: ["mssp_admin", "admin", "senior_analyst"],
+  decisioncache: ["mssp_admin", "admin", "senior_analyst"],
   admin: ["mssp_admin", "admin"],
 };
 
@@ -202,6 +205,92 @@ export function triageReviewGate(
   };
 }
 
+// ---- Triage alert-claim gate (WO-H25) — MIRRORS the server -------------------
+/**
+ * Client-side mirror of the authorization on
+ * `POST /api/triage/decisions/{id}/claim` and `/unclaim`
+ * (src/api/routes/triage.py). The server gates both to
+ * `require_role("admin","senior_analyst","analyst")` (L1 is an operator —
+ * WO-H24's ratified decision extended to the individual decision) and then
+ * enforces, for EVERY role:
+ *   - claim is ALWAYS to the caller themselves (the JWT `sub` — there is no
+ *     claimant field to send), and only an UNOWNED decision (or one already
+ *     yours — idempotent re-claim) may be claimed. Owned-by-another → 409,
+ *     no write, even for admin: taking over a colleague's in-progress work is
+ *     deliberately not a thing; the owner releases it via unclaim.
+ *   - unclaim releases YOUR OWN claim only (already-unclaimed is an
+ *     idempotent 200; a colleague's claim is a 409).
+ * The server always re-checks; this only prevents dead controls. FAIL CLOSED:
+ * a role below `analyst` (or an unknown role) gets neither verb. NEVER widen.
+ *
+ * @param role      the effective (mirrored) role.
+ * @param claimedBy the decision's current owner (`claimed_by`); null/empty/
+ *                  undefined = unclaimed (older backends omit the field —
+ *                  treated as unclaimed, never a crash).
+ * @param self      the caller's own username (JWT `sub`); null when unknown
+ *                  (dev-preview) — claiming is then NOT offered (we cannot
+ *                  know whom the server would record; fail toward no control).
+ */
+export interface TriageClaimGate {
+  /** may claim THIS decision (analyst+, and it is unowned or already yours). */
+  canClaim: boolean;
+  /** may release THIS decision's claim (analyst+ and it is currently yours). */
+  canUnclaim: boolean;
+  /** the decision is claimed by the caller themselves. */
+  ownedBySelf: boolean;
+  /** the decision is claimed by a DIFFERENT user (claim shown locked). */
+  ownedByOther: boolean;
+  /** plain-language reason the claim control is locked/absent. */
+  lockNote?: string;
+}
+
+export function triageClaimGate(
+  role: Role,
+  claimedBy: string | null | undefined,
+  self: string | null,
+): TriageClaimGate {
+  const owner = claimedBy ?? "";
+  const ownedBySelf = !!owner && !!self && owner === self;
+  const ownedByOther = !!owner && !ownedBySelf;
+  if (!roleAtLeast(role, "analyst")) {
+    return {
+      canClaim: false,
+      canUnclaim: false,
+      ownedBySelf,
+      ownedByOther,
+      lockNote:
+        "Claiming an alert requires an analyst or higher — the server rejects this write from your role.",
+    };
+  }
+  if (!self) {
+    // Unknown identity (dev-preview, no `sub` claim) — no claim control; the
+    // server would still record ITS authenticated sub, but we can't render an
+    // honest "claim as <you>" affordance without knowing who "you" is.
+    return {
+      canClaim: false,
+      canUnclaim: false,
+      ownedBySelf: false,
+      ownedByOther: !!owner,
+      lockNote: "Your username isn't known in this session, so the claim control is unavailable.",
+    };
+  }
+  if (ownedByOther) {
+    return {
+      canClaim: false,
+      canUnclaim: false,
+      ownedBySelf,
+      ownedByOther,
+      lockNote: `Already claimed by ${owner} — only they can release it. The server enforces this (409).`,
+    };
+  }
+  return {
+    canClaim: true, // unowned (fresh claim) or own (harmless idempotent re-claim)
+    canUnclaim: ownedBySelf,
+    ownedBySelf,
+    ownedByOther,
+  };
+}
+
 // ---- Incident case-management write gate (WO-U4) — MIRRORS the server -------
 /**
  * The client-side mirror of the per-action authorization the server enforces in
@@ -214,7 +303,15 @@ export function triageReviewGate(
  *     PLUS `_check_incident_access`: an `analyst` may act ONLY on an incident
  *     assigned to them (admin / senior_analyst bypass the ownership check).
  *   - flag                      → `require_role(...,"analyst")`, NO ownership check.
- *   - assign / escalate / merge / review → `require_role("admin","senior_analyst")`.
+ *   - escalate                  → `require_role("admin","senior_analyst","analyst")`
+ *     (WO-H24: opened to `analyst` — L1 as operator, hand up-tier with context).
+ *     NO ownership check.
+ *   - assign                    → `require_role("admin","senior_analyst","analyst")`
+ *     but ASYMMETRIC (WO-H24): a plain `analyst` may SELF-CLAIM only
+ *     (`assigned_to == own username`); assigning to ANY OTHER user stays
+ *     senior_analyst+ (server 403s otherwise). Modelled by `incidentAssignGate`,
+ *     NOT the plain `incidentActionGate` canSubmit boolean.
+ *   - merge / review            → `require_role("admin","senior_analyst")`.
  *   - merge ALSO needs the `incidents_merge` LICENSE feature (see `mergeLicensed`).
  *
  * `read_only` has no write path for any of these (excluded by `require_role`),
@@ -230,10 +327,12 @@ export type IncidentAction =
   | "merge"
   | "review";
 
-/** Actions the server restricts to senior_analyst+ (no ownership check applies). */
+/**
+ * Actions the server restricts to senior_analyst+ (no ownership check applies).
+ * WO-H24 removed `escalate` (now analyst+) and `assign` (now analyst self-claim,
+ * senior+ to assign anyone — see `incidentAssignGate`) from this set.
+ */
 const SENIOR_ACTIONS: ReadonlySet<IncidentAction> = new Set([
-  "assign",
-  "escalate",
   "merge",
   "review",
 ]);
@@ -302,6 +401,42 @@ export function incidentActionGate(
     };
   }
   return { visible: true, canSubmit: true, reason: "ok" };
+}
+
+// ---- Incident ASSIGN gate (WO-H24) — MIRRORS the server's self-claim split ---
+/**
+ * Client-side mirror of the ASYMMETRIC assign authorization in
+ * `src/api/routes/incidents.py::assign_incident`. The server gates the endpoint
+ * to `require_role("admin","senior_analyst","analyst")` but then enforces, for a
+ * plain `analyst`, that `body.assigned_to == user.sub` (SELF-CLAIM ONLY) — an
+ * analyst assigning to any OTHER user is rejected (403). admin / senior_analyst /
+ * mssp_admin may assign to anyone. The server always re-checks; this only decides
+ * WHICH assign control to render (never widens):
+ *   - senior_analyst+ → the arbitrary "assign to username" control.
+ *   - analyst         → a "Claim / assign to me" self-claim affordance only.
+ *   - read_only       → no assign path (the section is hidden upstream).
+ * FAIL CLOSED: a role below `analyst` gets neither.
+ */
+export interface IncidentAssignGate {
+  /** may assign the incident to ANY user (senior_analyst+). */
+  canAssignAnyone: boolean;
+  /** may self-claim (assign it to themselves) — analyst+ (WO-H24). */
+  canSelfClaim: boolean;
+  /** plain-language note shown to an analyst limited to self-claim. */
+  selfOnlyNote?: string;
+}
+
+export function incidentAssignGate(role: Role): IncidentAssignGate {
+  const canAssignAnyone = roleAtLeast(role, "senior_analyst");
+  const canSelfClaim = roleAtLeast(role, "analyst");
+  return {
+    canAssignAnyone,
+    canSelfClaim,
+    selfOnlyNote:
+      !canAssignAnyone && canSelfClaim
+        ? "As an analyst you can self-claim this incident (assign it to yourself). Reassigning it to another user requires a senior analyst — the server rejects that (403)."
+        : undefined,
+  };
 }
 
 /**
@@ -512,14 +647,18 @@ export function vulnRemediationGate(role: Role): VulnRemediationGate {
 // (TAB_ACCESS.detection), but the WRITE actions have DIFFERENT, stricter gates —
 // this mirrors each one EXACTLY and FAILS CLOSED. The server re-checks every
 // call and remains the enforcement point; this only prevents dead controls.
-// NEVER widen (in particular: deploy/rollback are mssp_admin ONLY — never admin).
+// NEVER widen. deploy/rollback are MODE-AWARE (WO-H30): mssp_admin ONLY in
+// multi-tenant; admin+ in single-tenant. FAIL CLOSED when the mode is unknown
+// (→ multi-tenant → mssp_admin only).
 //
 // Server contract mirrored here:
 //   - review (approve/reject) → require_role("admin","senior_analyst") [+mssp
 //     bypass] ⇒ senior_analyst+.
-//   - deploy                  → require_role("mssp_admin") ONLY. A Wazuh rule
-//     change hits the SHARED backend across every tenant.
-//   - rollback                → require_role("mssp_admin") ONLY.
+//   - deploy                  → require_deploy_authority() (WO-H30). A Wazuh
+//     rule change hits the SHARED backend. MULTI-TENANT → mssp_admin ONLY (it
+//     crosses every tenant). SINGLE-TENANT → admin+ (there is no mssp_admin and
+//     the closed loop must be able to deploy).
+//   - rollback                → require_deploy_authority() (same mode-aware gate).
 //   - test / dry-run (validate) → require_admin ⇒ admin | mssp_admin.
 // All are also behind require_license_feature("detection") (a runtime 402/403
 // degrades the whole surface to FeatureLockedState — handled in the tab, not
@@ -529,9 +668,9 @@ export function vulnRemediationGate(role: Role): VulnRemediationGate {
 export interface DetectionActionGate {
   /** approve/reject a proposal — senior_analyst+ (a lifecycle transition). */
   canReview: boolean;
-  /** deploy an approved proposal to the SHARED Wazuh backend — mssp_admin ONLY. */
+  /** deploy an approved proposal — mode-aware (WO-H30): mssp_admin in multi-tenant, admin+ in single-tenant. */
   canDeploy: boolean;
-  /** roll a deployed rule back — mssp_admin ONLY. */
+  /** roll a deployed rule back — same mode-aware gate as deploy. */
   canRollback: boolean;
   /** dry-run-test rule XML via wazuh-logtest — admin+ (read-only, no live change). */
   canTest: boolean;
@@ -543,12 +682,27 @@ export interface DetectionActionGate {
   testLockNote?: string;
 }
 
-export function detectionActionGate(role: Role): DetectionActionGate {
+/**
+ * @param role            the effective (mirrored) role.
+ * @param deploymentMode  the install's deployment mode from tier-info
+ *                        (`LicenseTierInfo.deployment_mode`): "single_tenant" |
+ *                        "multi_tenant". ABSENT/unknown → FAIL CLOSED to
+ *                        multi-tenant (mssp_admin only) — never widen.
+ */
+export function detectionActionGate(
+  role: Role,
+  deploymentMode?: string | null,
+): DetectionActionGate {
   const canReview = roleAtLeast(role, "senior_analyst");
-  // mssp_admin ONLY — require_role("mssp_admin"). Do NOT widen to admin: a
-  // shared-Wazuh rule change is intentionally the most privileged action.
-  const canDeploy = role === "mssp_admin";
-  const canRollback = role === "mssp_admin";
+  // Mode-aware deploy authority (WO-H30) mirroring require_deploy_authority():
+  //   multi-tenant → mssp_admin ONLY (a shared-Wazuh rule change crosses every
+  //   tenant); single-tenant → admin+ (no mssp_admin exists and the loop must
+  //   close). FAIL CLOSED: only an EXPLICIT "single_tenant" widens to admin —
+  //   any other value (incl. unknown/absent) stays mssp_admin-only.
+  const singleTenant = deploymentMode === "single_tenant";
+  const canDeploy =
+    role === "mssp_admin" || (singleTenant && roleAtLeast(role, "admin"));
+  const canRollback = canDeploy;
   const canTest = roleAtLeast(role, "admin"); // require_admin ⇒ admin | mssp_admin
   return {
     canReview,
@@ -560,7 +714,9 @@ export function detectionActionGate(role: Role): DetectionActionGate {
       : "Approving or rejecting a proposal requires a senior analyst or higher — the server rejects this write from your role.",
     deployLockNote: canDeploy
       ? undefined
-      : "Deploying or rolling back a rule changes the shared Wazuh ruleset for every tenant, so the server restricts it to mssp_admin. The control is shown locked, not hidden, so the proposal stays reviewable.",
+      : singleTenant
+        ? "Deploying or rolling back a rule changes the Wazuh ruleset, so the server restricts it to an administrator. The control is shown locked, not hidden, so the proposal stays reviewable."
+        : "Deploying or rolling back a rule changes the shared Wazuh ruleset for every tenant, so the server restricts it to mssp_admin. The control is shown locked, not hidden, so the proposal stays reviewable.",
     testLockNote: canTest
       ? undefined
       : "Testing rule XML against wazuh-logtest requires an admin or higher — the server rejects this from your role.",

@@ -196,7 +196,7 @@ export function AdminTab(_props: TabProps) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <PageHeading
           title="Administration"
-          sub="Manage users, tenants (MSSP), assets/identities/local-IOCs, runtime reloads, and shift handoff. Every write mirrors the server's role gates and is audit-logged; destructive actions confirm first."
+          sub="Manage users, tenants (MSSP), assets/identities/local-IOCs, runtime reloads, and shift handoff."
         />
         {section === "overview" && (
           <PollingStatus
@@ -490,7 +490,7 @@ function GovernanceSection() {
 
       <SectionShell
         title="Data-access policy"
-        note="How client data is handled at the anonymization / LLM boundary — read-only."
+        note="How client data is handled at the anonymization boundary."
       >
         {dataAccess.loading && !dataAccess.data ? (
           <StatusState variant="loading" title="Loading data-access policy…" />
@@ -532,7 +532,7 @@ function AnonMappingsSection() {
   return (
     <SectionShell
       title="Anonymization mappings"
-      note="The admin-only token↔value map DHRUVA uses to resolve anonymized AI output back to real identifiers. Anonymization protects the LLM call, not an authenticated admin. Read-only."
+      note="The admin-only token↔value map DHRUVA uses to resolve anonymized AI output back to real identifiers. Anonymization protects the LLM call, not an authenticated admin."
     >
       {loading && !data ? (
         <StatusState variant="loading" title="Loading mappings…" />
@@ -678,8 +678,7 @@ function PipelineHealthSection() {
       <div className="rounded-lg border border-line bg-panel2 px-3.5 py-2.5 text-kbd text-dim2">
         Global infrastructure telemetry — log-source heartbeats, ingest-rate
         anomaly, parser failure-rate, and automation health. mssp_admin-only,
-        read-only. Figures are exactly what the pipeline monitor reported; empty
-        or error sub-checks are shown as such, never filled in.
+        read-only. Figures are exactly what the pipeline monitor reported; empty or error sub-checks are shown as such.
       </div>
 
       {health?.status === "unavailable" && (

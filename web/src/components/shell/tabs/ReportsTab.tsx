@@ -132,7 +132,7 @@ export function ReportsTab(_props: TabProps) {
     <>
       <PageHeading
         title="Reports"
-        sub="SOC operational reports, LLM usage & cost, and the strategic threat-intel landscape — generated on demand as structured JSON. Read-only."
+        sub="SOC operational reports, LLM usage & cost, and the strategic threat-intel landscape — generated on demand as structured JSON."
       />
       <div
         className="mb-1 flex flex-wrap gap-1.5"

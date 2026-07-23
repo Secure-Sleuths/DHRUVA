@@ -1,0 +1,150 @@
+# =============================================================================
+# Investigation Playbook: Phishing (Email + URL)
+# Rule Groups: office365, ms-exchange, postfix, spamd, web-log, proxy
+# MITRE: T1566.001 (Attachment), T1566.002 (Link), T1204 (User Execution),
+#        T1078 (Valid Accounts — post-compromise), T1114 (Email Collection)
+# Methodology reference: socworkflows.com "Phishing Email Analyser" +
+#   "Phishing URL Analyser" (facts/checklist mined and rewritten into DHRUVA
+#   schema; prose not copied)
+#
+# TELEMETRY DEPENDENCY — READ THIS:
+#   DHRUVA triages Wazuh alerts from OpenSearch. This playbook only fires if the
+#   client ships mail telemetry (O365/Exchange/Postfix) or proxy/web logs into
+#   Wazuh. If that telemetry is absent, the triage agent MUST report it under
+#   enrichment_gaps and must NOT infer a verdict from the alert name alone.
+# =============================================================================
+
+name: "Phishing Email & URL Investigation"
+
+# TRIGGER GROUPS — corrected against the stock Wazuh ruleset:
+#   "exchange"  (0050-ms-exchange_rules.xml declares groups `ms,exchange,`;
+#                the earlier "ms-exchange" was not a real group and never fired)
+#   "squid"     (Squid proxy rules; the earlier "proxy" was not a real group)
+#   "postfix" / "spamd"  — verified real
+#   "web-log"   REMOVED: only rule id 4, a level="0" noalert template
+#
+# OPEN ISSUE — "office365" is over-broad: that single group covers all ~128 O365
+# rules (SharePoint, OneDrive, Teams, DLP, Azure AD sign-ins), so unrelated O365
+# alerts would be triaged against phishing verdict criteria. Left OUT until the
+# Exchange/ThreatIntelligence sub-rule IDs are pinned down for the client's
+# deployment. Do NOT re-add the bare group without narrowing it.
+trigger_rule_groups:
+  - "exchange"
+  - "postfix"
+  - "spamd"
+
+# NOTE: mail/proxy rule IDs are integration-specific — VERIFY against the
+# client's Wazuh decoders/ruleset before relying on these.
+trigger_rule_ids: []
+
+investigation_steps:
+  - step: 1
+    name: "Analyze sender authentication and headers"
+    assess: |
+      Work only from headers actually present in the alert — if headers were not
+      captured, say so in enrichment_gaps instead of guessing.
+      - Originating IP: consistent with the claimed sender domain's infrastructure?
+      - SPF result: pass / fail / softfail / none?
+      - DKIM result: pass / fail? Which domain signed it — does it match the From?
+      - DMARC result: pass / fail? What is the domain's policy (none/quarantine/reject)?
+      - From display name vs actual From address — mismatch is a classic spoof.
+      - Reply-To differing from From — strong redirection indicator.
+      - Routing hops: any unexpected relays or geographically odd path?
+      - Authentication risk level: Low / Medium / High.
+
+  - step: 2
+    name: "Analyze the URL / domain (if the mail carries links)"
+    assess: |
+      - Base domain, subdomain, TLD. High-abuse TLDs (.top .xyz .click .tk .pw .cc)
+        raise suspicion but are NOT proof on their own.
+      - Path contains credential-harvest keywords (login, verify, secure, account,
+        update, confirm, signin)?
+      - Query parameters encoded/obfuscated (Base64, hex) hiding a redirect target?
+      - Brand impersonation via typosquatting or homograph/IDN characters?
+      - Redirect chains or URL-shortener abuse?
+      - Subdomain abuse of a legitimate service (e.g. brand.legit-saas.com)?
+      - Domain age: newly registered domains are a strong phishing indicator —
+        BUT DHRUVA has no WHOIS/domain-age enrichment and no URL detonation.
+        If registration date is not present in the enrichment context, record
+        "domain age unavailable" under enrichment_gaps. Do NOT assert or estimate it.
+      - Domain risk level: Low / Medium / High — based only on observable structure
+        (TLD, typosquatting, encoding, path keywords), not on assumed domain age.
+
+  - step: 3
+    name: "Assess social engineering and targeting"
+    assess: |
+      - Urgency/fear language — quote the exact phrases used.
+      - Who is impersonated (brand, internal executive, IT helpdesk, vendor)?
+      - What action is requested (credentials, payment, MFA approval, attachment)?
+      - Spear-phishing markers: recipient's real name, role, internal project names,
+        or a real vendor relationship referenced.
+      - Business Email Compromise markers: payment/bank-detail change requests,
+        executive impersonation, pressure to bypass process.
+      - Sophistication: Low (mass generic) / Medium / High (targeted, well-crafted).
+
+  - step: 4
+    name: "Determine whether the user interacted (this drives severity)"
+    query_template: |
+      SELECT timestamp, agent_name, srcip, dstip, srcuser, dstuser,
+             rule_description, rule_group, data_url
+      FROM {enriched_alerts_index}
+      WHERE (srcuser = '{alert_user}' OR dstuser = '{alert_user}')
+        AND rule_group IN ('web-log', 'proxy', 'firewall', 'network_connection')
+        AND timestamp >= '{alert_timestamp}' - INTERVAL 1 HOUR
+        AND timestamp <= '{alert_timestamp}' + INTERVAL 24 HOURS
+      ORDER BY timestamp ASC
+    assess: |
+      - Did the recipient's host resolve or connect to the phishing domain?
+      - Was an attachment opened / a process spawned from a mail client?
+      - CRITICAL PIVOT: if credentials may have been submitted, this becomes an
+        identity-compromise incident — continue with the suspicious_login playbook.
+      - Any post-click authentication anomaly for that user (new geo, new device,
+        MFA prompt burst, mailbox forwarding rule created)?
+
+  - step: 5
+    name: "Scope the campaign across the organization"
+    query_template: |
+      SELECT DISTINCT dstuser, agent_name, timestamp, rule_description
+      FROM {enriched_alerts_index}
+      WHERE rule_group IN ('office365', 'ms-exchange', 'postfix', 'spamd')
+        AND timestamp >= '{alert_timestamp}' - INTERVAL 7 DAYS
+      ORDER BY timestamp ASC
+      LIMIT 200
+    assess: |
+      - How many other recipients received the same sender/subject/URL?
+      - Are any of them high-value targets (finance, executives, IT admins)?
+      - Did any other recipient interact with the link or attachment?
+
+verdict_criteria:
+  true_positive:
+    - "Authentication failures (SPF/DKIM/DMARC) combined with brand impersonation"
+    - "Credential-harvest page confirmed at the linked domain — only if a sandbox/detonation result is actually present in enrichment; DHRUVA does not detonate URLs itself, so otherwise treat as needs_investigation"
+    - "Sender domain is a typosquat/homograph of a legitimate brand"
+    - "Recipient connected to the phishing infrastructure or opened the payload"
+    - "Multiple recipients targeted with the same lure (campaign confirmed)"
+    - "BEC pattern: payment or bank-detail change requested via spoofed executive"
+
+  false_positive:
+    - "Legitimate marketing or bulk mail from an approved vendor with weak SPF"
+    - "Internal security-awareness phishing simulation (verify against the scheduled simulation window before dispositioning)"
+    - "Misconfigured but legitimate internal sender (new relay, forgotten SPF update)"
+    - "Forwarded mail breaking SPF/DKIM as an artifact of forwarding, not spoofing"
+
+  needs_investigation:
+    - "Auth failures present but no impersonation or malicious link identified"
+    - "Suspicious URL that is unreachable or sandboxed at analysis time"
+    - "Headers unavailable — cannot assess authentication (log as enrichment gap)"
+
+recommended_actions:
+  if_true_positive:
+    - "CONTAIN: purge the message from all recipient mailboxes"
+    - "BLOCK: block sender, sending IP, and phishing domain at mail gateway + DNS"
+    - "IDENTIFY: enumerate every recipient and who interacted"
+    - "IF CLICKED: reset that user's credentials, revoke sessions/tokens, check for mailbox forwarding rules and MFA changes — pivot to identity compromise"
+    - "NOTIFY: warn targeted users; brief the wider org if a campaign is confirmed"
+    - "HUNT: sweep proxy/DNS logs for any host that resolved the phishing domain"
+
+  if_false_positive:
+    - "Tag alert with FP reason for the feedback loop"
+    - "If a simulation, record it so the pattern is recognized next cycle"
+    - "If a legitimate sender, request the sender's SPF/DKIM be corrected rather than allow-listing broadly"

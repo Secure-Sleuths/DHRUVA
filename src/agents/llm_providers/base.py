@@ -25,6 +25,13 @@ class BaseLLMProvider:
         # llm.max_tokens in config.yaml or per-tenant LLM config.
         self.max_tokens = config.get("max_tokens", 8192)
         self.temperature = config.get("temperature", 0.1)
+        # WO-H50: real usage from the most recent call_text(), when the provider
+        # can obtain it. Shape: {"input_tokens": int, "output_tokens": int,
+        # "cost_usd": float|None, "estimated": bool}. None until the first call,
+        # or when a provider cannot report usage (LLMBackend then falls back to
+        # a character-length estimate and flags the row estimated). Non-breaking:
+        # call_text() still returns a plain str; this is read out-of-band.
+        self.last_usage: dict | None = None
 
     def call_text(self, system_prompt: str, user_message: str) -> str:
         """Send a prompt to the LLM and return raw text response.

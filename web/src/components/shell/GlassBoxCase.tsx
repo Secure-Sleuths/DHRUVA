@@ -26,15 +26,36 @@ import {
   type ReactNode,
 } from "react";
 import { Chip, ConfidenceBar, Panel, StatusState } from "@/components";
-import { ApiError, getRuleStats, submitTriageReview } from "@/lib/api";
+import {
+  ApiError,
+  getDecisionPlaybook,
+  getDecisionRawAlert,
+  getRuleStats,
+  lookupIoc,
+  submitTriageReview,
+} from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { triageReviewGate } from "@/lib/rbac";
 import { SEVERITY, riskSeverity, type Severity } from "@/lib/severity";
-import { verdictPresentation } from "@/lib/triage";
-import { alertEnrichment, anonymizationCopy, riskMath } from "@/lib/incident";
+import { verdictPresentation, decisionPresentation } from "@/lib/triage";
+import {
+  alertEnrichment,
+  anonymizationCopy,
+  caseContext,
+  parseJsonArray,
+  riskMath,
+  type CaseContext,
+} from "@/lib/incident";
 import { parseGrounding, type GroundingAssessment } from "@/lib/grounding";
 import { cn, focusRing } from "@/lib/ui";
-import type { IncidentAlert, RuleStats, TriageVerdict } from "@/lib/types";
+import type {
+  DecisionPlaybookResponse,
+  IncidentAlert,
+  IocLookupResponse,
+  RawAlertResponse,
+  RuleStats,
+  TriageVerdict,
+} from "@/lib/types";
 
 // ---- one member alert / decision as a glass-box card ------------------------
 
@@ -50,7 +71,10 @@ export function GlassBoxAlertCard({
   // Non-primary cards start collapsed to keep the case focused on the driver.
   const [open, setOpen] = useState(primary);
   const bodyId = useId();
-  const verdict = verdictPresentation(String(alert.verdict));
+  const verdict = decisionPresentation({
+    verdict: String(alert.verdict),
+    llm_failed: alert.llm_failed,
+  });
   const enr = alertEnrichment(alert);
   const stage = enr.tactic_ids[0];
 
@@ -102,9 +126,12 @@ export function GlassBoxAlertCard({
       {/* detail body */}
       <div id={bodyId} hidden={!open} className="mt-3 flex flex-col gap-2.5">
         <RiskMathExpander alert={alert} />
+        <ContextRecordsSection alert={alert} />
         <ReasoningExpander alert={alert} />
         <RecommendedActionsExpander alert={alert} />
+        <PlaybookExpander alert={alert} />
         <RuleStatsExpander alert={alert} />
+        <RawEventExpander alert={alert} />
         <div className="flex flex-col gap-2.5 sm:flex-row">
           <ProvenancePanel alert={alert} />
           <AnonymizationPanel alert={alert} />
@@ -482,6 +509,817 @@ function RuleStat({ label, value }: { label: string; value: string }) {
       <span className="text-dim2">{label} </span>
       <b className="tabular text-ink">{value}</b>
     </span>
+  );
+}
+
+// ---- WO-H21: complete-context case view --------------------------------------
+// The records BEHIND each risk factor, the matched playbook's content, and the
+// raw underlying Wazuh event — inline in the case so no team member has to
+// pivot to Admin config / ThreatIntel / HostIntegrity / the copilot for them.
+// DISPLAY-ONLY on the human (deanonymized) side: everything here is a read of
+// already-stored data; nothing feeds the LLM and no action gains a new path.
+// No role gate beyond seeing the case itself (whole-team visibility).
+
+/**
+ * Shared lazy drill: collapsible panel whose `load` fetch fires only on the
+ * FIRST expand (mirrors the WO-U13 RuleStatsExpander pattern — never an
+ * up-front fetch per card). Handles loading / error(+retry) / loaded states;
+ * `children` renders the loaded value.
+ */
+function LazyDrill<T>({
+  summary,
+  hint,
+  load,
+  children,
+}: {
+  summary: string;
+  hint?: string;
+  load: (signal: AbortSignal) => Promise<T>;
+  children: (data: T) => ReactNode;
+}) {
+  const id = useId();
+  const [open, setOpen] = useState(false);
+  const [fetched, setFetched] = useState(false);
+  const [data, setData] = useState<T | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const run = useCallback(async () => {
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await load(ac.signal);
+      if (ac.signal.aborted) return;
+      setData(res);
+    } catch (e) {
+      if (ac.signal.aborted) return;
+      setError(errMessage(e));
+    } finally {
+      if (!ac.signal.aborted) setLoading(false);
+    }
+  }, [load]);
+
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && !fetched) {
+      setFetched(true);
+      run();
+    }
+  };
+
+  return (
+    <div className="rounded-lg border border-line bg-panel px-3 py-2">
+      <button
+        type="button"
+        onClick={toggle}
+        aria-expanded={open}
+        aria-controls={id}
+        className={cn(
+          "flex w-full items-center gap-1.5 text-left text-data text-teal",
+          focusRing,
+        )}
+      >
+        <span aria-hidden="true">{open ? "⌄" : "›"}</span>
+        <span>{summary}</span>
+        {hint && <span className="text-kbd text-dim2">{hint}</span>}
+      </button>
+      <div id={id} hidden={!open} className="mt-2">
+        {!fetched ? null : loading ? (
+          <StatusState variant="loading" title="Loading…" />
+        ) : error ? (
+          <StatusState
+            variant="error"
+            title="Couldn't load"
+            description={error}
+            action={<Chip onClick={run}>Retry</Chip>}
+          />
+        ) : data !== null ? (
+          children(data)
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/** One `label value` line in a record card (em-dash when absent). */
+function RecordLine({ label, value }: { label: string; value: ReactNode }) {
+  return (
+    <div>
+      <span className="text-dim2">{label} </span>
+      {value != null && value !== "" ? (
+        <span className="text-ink">{value}</span>
+      ) : (
+        <span className="text-dim2">—</span>
+      )}
+    </div>
+  );
+}
+
+function RecordEmpty({ what }: { what: string }) {
+  return (
+    <div className="text-kbd text-dim">
+      No {what} record was stored with this decision (older decision, or the
+      enrichment blob is missing/degraded).
+    </div>
+  );
+}
+
+/** The per-dimension record renderers. Pure display of the stored record. */
+function AssetRecordBody({ ctx }: { ctx: CaseContext }) {
+  const a = ctx.asset;
+  if (!a) return <RecordEmpty what="asset" />;
+  return (
+    <div className="font-mono text-kbd leading-relaxed">
+      <RecordLine label="hostname" value={a.hostname} />
+      <RecordLine label="agent IP" value={a.agentIp} />
+      <RecordLine label="criticality tier" value={a.tier} />
+      <RecordLine label="owner / business tag" value={a.owner} />
+      <RecordLine label="environment" value={a.environment} />
+      {a.tags.length > 0 && (
+        <RecordLine label="tags" value={a.tags.join(", ")} />
+      )}
+      {a.services.length > 0 && (
+        <RecordLine label="services" value={a.services.join(", ")} />
+      )}
+    </div>
+  );
+}
+
+function IdentityRecordBody({ ctx }: { ctx: CaseContext }) {
+  const u = ctx.identity;
+  if (!u) return <RecordEmpty what="identity" />;
+  return (
+    <div className="font-mono text-kbd leading-relaxed">
+      <RecordLine
+        label="privileged"
+        value={u.hasAdmin ? "yes — admin roles" : "no"}
+      />
+      <RecordLine
+        label="account type"
+        value={u.isServiceAccount ? "service account" : "user account"}
+      />
+      <RecordLine label="risk level" value={u.riskLevel} />
+      {u.roles.length > 0 && (
+        <RecordLine label="roles" value={u.roles.join(", ")} />
+      )}
+      <RecordLine label="department" value={u.department} />
+      <div className="mt-1 text-dim2">
+        Principal context from the identity inventory at enrichment time. An
+        &quot;elevated&quot; level with no roles means the account was unknown
+        to the inventory.
+      </div>
+    </div>
+  );
+}
+
+function TimeRecordBody({ ctx }: { ctx: CaseContext }) {
+  const t = ctx.time;
+  if (!t) return <RecordEmpty what="time-context" />;
+  const yn = (v: boolean | null) => (v == null ? null : v ? "yes" : "no");
+  return (
+    <div className="font-mono text-kbd leading-relaxed">
+      <RecordLine
+        label="context"
+        value={t.context ? t.context.replace(/_/g, " ") : null}
+      />
+      <RecordLine label="business hours" value={yn(t.isBusinessHours)} />
+      <RecordLine label="weekend" value={yn(t.isWeekend)} />
+      <RecordLine
+        label="maintenance window"
+        value={yn(t.isMaintenanceWindow)}
+      />
+    </div>
+  );
+}
+
+function MitreRecordBody({ ctx }: { ctx: CaseContext }) {
+  const m = ctx.mitre;
+  if (!m) return <RecordEmpty what="MITRE" />;
+  return (
+    <div className="flex flex-col gap-1.5 text-kbd">
+      {m.techniqueIds.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-dim2">techniques</span>
+          {m.techniqueIds.map((t) => (
+            <Chip key={t}>{t}</Chip>
+          ))}
+        </div>
+      )}
+      {m.tacticIds.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-dim2">tactics</span>
+          {m.tacticIds.map((t) => (
+            <Chip key={t}>{t}</Chip>
+          ))}
+        </div>
+      )}
+      <div className="text-dim2">
+        The boost engages when a technique is on the guidance&apos;s
+        critical-techniques list.
+      </div>
+    </div>
+  );
+}
+
+function TiRecordBody({ ctx }: { ctx: CaseContext }) {
+  const ti = ctx.ti;
+  if (!ti) return <RecordEmpty what="threat-intel" />;
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="font-mono text-kbd leading-relaxed">
+        <RecordLine label="feed hits" value={String(ti.hits)} />
+        {ti.sources.length > 0 && (
+          <RecordLine label="sources" value={ti.sources.join(", ")} />
+        )}
+        <RecordLine label="highest severity" value={ti.highestSeverity} />
+        <RecordLine
+          label="known malicious"
+          value={ti.isKnownMalicious ? "yes" : "no"}
+        />
+      </div>
+
+      {/* WO-H23: the EXACT matched indicator(s) behind known-malicious — the
+          trimmed match stored at triage time, so the analyst sees WHICH
+          indicator and feed matched without pivoting to the ThreatIntel tab. */}
+      {ti.matches.length > 0 && (
+        <div className="rounded-md border border-line bg-field px-2.5 py-2">
+          <div className="mb-1 text-micro uppercase tracking-wide text-dim2">
+            Matched indicator{ti.matches.length > 1 ? "s" : ""} (as of triage)
+          </div>
+          <div className="flex flex-col gap-2">
+            {ti.matches.map((m, i) => (
+              <div key={i} className="font-mono text-kbd leading-relaxed">
+                <RecordLine label="indicator" value={m.indicator} />
+                <RecordLine label="type" value={m.type} />
+                <RecordLine label="feed source" value={m.source} />
+                <RecordLine label="severity" value={m.severity} />
+                <RecordLine label="category" value={m.category} />
+                <RecordLine label="last seen" value={m.lastSeen} />
+                <RecordLine label="description" value={m.description} />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {ti.srcIp ? (
+        <LazyDrill<IocLookupResponse>
+          summary={`IOC lookup — ${ti.srcIp}`}
+          hint="local IOC store · lazy"
+          load={(signal) => lookupIoc(ti.srcIp as string, signal)}
+        >
+          {(res) =>
+            res.matches.length === 0 ? (
+              <div className="text-kbd text-dim">
+                No matches for {res.ioc_value} in the local IOC store (the
+                feed hit above may have come from a live feed lookup at
+                enrichment time).
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {res.matches.map((m, i) => (
+                  <div key={i} className="font-mono text-kbd leading-relaxed">
+                    <RecordLine label="source" value={m.source} />
+                    <RecordLine label="type" value={m.ioc_type} />
+                    <RecordLine label="severity" value={m.severity} />
+                    <RecordLine
+                      label="confidence"
+                      value={m.confidence != null ? String(m.confidence) : null}
+                    />
+                    <RecordLine label="last seen" value={m.last_seen} />
+                    <RecordLine label="description" value={m.description} />
+                    {parseJsonArray(m.tags).length > 0 && (
+                      <RecordLine
+                        label="tags"
+                        value={parseJsonArray(m.tags).join(", ")}
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+            )
+          }
+        </LazyDrill>
+      ) : (
+        <div className="text-kbd text-dim2">
+          No external indicator (source IP) was stored on this decision to
+          look up.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HistoricalRecordBody({ ctx }: { ctx: CaseContext }) {
+  const h = ctx.historical;
+  if (!h) return <RecordEmpty what="historical" />;
+  return (
+    <div className="font-mono text-kbd leading-relaxed">
+      <RecordLine
+        label="FP rate (7d, this rule)"
+        value={h.fpRate != null ? `${Math.round(h.fpRate * 100)}%` : null}
+      />
+      <RecordLine
+        label="same rule (7d)"
+        value={h.sameRule7d != null ? String(h.sameRule7d) : null}
+      />
+      <RecordLine
+        label="same source (7d)"
+        value={h.sameSource7d != null ? String(h.sameSource7d) : null}
+      />
+      <RecordLine
+        label="same user (7d)"
+        value={h.sameUser7d != null ? String(h.sameUser7d) : null}
+      />
+      <RecordLine
+        label="pattern seen before"
+        value={h.previouslySeenPattern ? "yes" : "no"}
+      />
+      <div className="mt-1 text-dim2">
+        As-of-enrichment snapshot. The &quot;Rule stats (7d)&quot; drill below
+        shows the live per-rule history.
+      </div>
+    </div>
+  );
+}
+
+function AnomalyRecordBody({ ctx }: { ctx: CaseContext }) {
+  const a = ctx.anomaly;
+  if (!a) return <RecordEmpty what="baseline-anomaly" />;
+  if (!a.isAnomaly && a.details.length === 0) {
+    return (
+      <div className="text-kbd text-dim">
+        No baseline anomaly was flagged for this alert.
+      </div>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-1.5 text-kbd">
+      <div className="font-mono leading-relaxed">
+        <RecordLine
+          label="max deviation"
+          value={a.deviation != null ? `${a.deviation}σ` : null}
+        />
+      </div>
+      {a.details.map((d, i) => (
+        <div key={i} className="font-mono leading-relaxed">
+          <span className="text-dim2">{d.dimension} </span>
+          <span className="text-ink">{d.value}</span>
+          <span className="text-dim2">
+            {" — "}
+            {d.current24h != null ? `${d.current24h} in 24h` : "—"}
+            {d.baselineMean != null ? ` vs baseline ${d.baselineMean}` : ""}
+            {d.zScore != null ? ` (z ${d.zScore}` : ""}
+            {d.zScore != null && d.sampleDays != null
+              ? `, ${d.sampleDays} sample days)`
+              : d.zScore != null
+                ? ")"
+                : ""}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function VulnRecordBody({ ctx }: { ctx: CaseContext }) {
+  const v = ctx.vuln;
+  if (!v) return <RecordEmpty what="vulnerability" />;
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="font-mono text-kbd leading-relaxed">
+        <RecordLine label="critical CVEs on host" value={String(v.critical)} />
+        <RecordLine label="high CVEs on host" value={String(v.high)} />
+        {/* Fall back to bare CVE-id chips only when no per-CVE detail exists
+            (older decision) — otherwise the detail table below supersedes it. */}
+        {v.topCveDetails.length === 0 && v.topCves.length > 0 && (
+          <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+            <span className="text-dim2">top critical</span>
+            {v.topCves.map((c) => (
+              <Chip key={c}>{c}</Chip>
+            ))}
+          </div>
+        )}
+        <RecordLine label="failed SCA checks" value={String(v.scaFailed)} />
+        {v.reason && <RecordLine label="why it engaged" value={v.reason} />}
+      </div>
+
+      {/* WO-H23: per-CVE CVSS / EPSS / KEV so the analyst sees exploitability
+          inline instead of pivoting to the Vuln tab. Missing scores show an
+          honest em-dash — never a fabricated 0.0. */}
+      {v.topCveDetails.length > 0 && (
+        <div className="rounded-md border border-line bg-field px-2.5 py-2">
+          <div className="mb-1 text-micro uppercase tracking-wide text-dim2">
+            Top critical CVEs — CVSS / EPSS / KEV
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {v.topCveDetails.map((d) => (
+              <div
+                key={d.cve}
+                className="flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono text-kbd"
+              >
+                <Chip>{d.cve}</Chip>
+                <span>
+                  <span className="text-dim2">CVSS </span>
+                  {d.cvss != null ? (
+                    <b className="tabular text-ink">
+                      {d.cvss}
+                      {d.cvssVersion ? ` (v${d.cvssVersion})` : ""}
+                    </b>
+                  ) : (
+                    <span className="text-dim2">—</span>
+                  )}
+                </span>
+                <span>
+                  <span className="text-dim2">EPSS </span>
+                  {d.epss != null ? (
+                    <b className="tabular text-ink">
+                      {(d.epss * 100).toFixed(1)}%
+                    </b>
+                  ) : (
+                    <span className="text-dim2">—</span>
+                  )}
+                </span>
+                {d.kev === true ? (
+                  <span className="rounded border border-sev-crit px-1 text-micro font-semibold text-sev-crit">
+                    CISA KEV
+                  </span>
+                ) : d.kev === false ? (
+                  <span className="text-dim2">not in KEV</span>
+                ) : (
+                  <span className="text-dim2">KEV data unavailable</span>
+                )}
+              </div>
+            ))}
+          </div>
+          <div className="mt-1.5 text-micro text-dim2">
+            CVSS from the host vuln record; EPSS/KEV from the CVE intel feed. A
+            dash means that score was not available (not zero).
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HostIntegrityRecordBody({ ctx }: { ctx: CaseContext }) {
+  const hi = ctx.hostIntegrity;
+  if (!hi) return <RecordEmpty what="host-integrity" />;
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="font-mono text-kbd leading-relaxed">
+        <RecordLine
+          label="open rootcheck findings"
+          value={String(hi.rootcheckFindings)}
+        />
+        <RecordLine
+          label="recent FIM changes"
+          value={String(hi.fimRecentChanges)}
+        />
+        {hi.reason && <RecordLine label="why it engaged" value={hi.reason} />}
+      </div>
+
+      {/* WO-H23: the specific rootcheck signature(s) behind the count. */}
+      {hi.rootcheckSignatures.length > 0 && (
+        <div>
+          <div className="mb-1 text-micro uppercase tracking-wide text-dim2">
+            Rootcheck finding{hi.rootcheckSignatures.length > 1 ? "s" : ""}
+          </div>
+          <ul className="flex flex-col gap-1">
+            {hi.rootcheckSignatures.map((s, i) => (
+              <li
+                key={i}
+                className="flex gap-2 font-mono text-kbd leading-relaxed text-ink"
+              >
+                <span aria-hidden="true" className="text-teal">
+                  •
+                </span>
+                <span className="break-all">{s}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* WO-H23: the specific recently-changed FIM file path(s). */}
+      {hi.fimChangedPaths.length > 0 && (
+        <div>
+          <div className="mb-1 text-micro uppercase tracking-wide text-dim2">
+            Recently changed files (FIM)
+          </div>
+          <ul className="flex flex-col gap-0.5">
+            {hi.fimChangedPaths.map((p, i) => (
+              <li
+                key={i}
+                className="break-all font-mono text-kbd leading-relaxed text-ink"
+              >
+                {p}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <div className="text-dim2">
+        FIM/rootcheck posture of the host at enrichment time (rootcheck is the
+        primary driver; FIM engages only above the recent-change threshold).
+      </div>
+    </div>
+  );
+}
+
+/** Risk-factor key → its record's title + body, in `_compute_risk_score` order. */
+const CONTEXT_DIMENSIONS: ReadonlyArray<{
+  factorKey: string;
+  title: string;
+  body: (ctx: CaseContext) => ReactNode;
+  present: (ctx: CaseContext) => boolean;
+}> = [
+  {
+    factorKey: "asset_multiplier",
+    title: "Asset",
+    body: (ctx) => <AssetRecordBody ctx={ctx} />,
+    present: (ctx) => ctx.asset != null,
+  },
+  {
+    factorKey: "user_multiplier",
+    title: "Identity",
+    body: (ctx) => <IdentityRecordBody ctx={ctx} />,
+    present: (ctx) => ctx.identity != null,
+  },
+  {
+    factorKey: "time_multiplier",
+    title: "Time context",
+    body: (ctx) => <TimeRecordBody ctx={ctx} />,
+    present: (ctx) => ctx.time != null,
+  },
+  {
+    factorKey: "mitre_boost",
+    title: "MITRE",
+    body: (ctx) => <MitreRecordBody ctx={ctx} />,
+    present: (ctx) => ctx.mitre != null,
+  },
+  {
+    factorKey: "ti_boost",
+    title: "Threat intel",
+    body: (ctx) => <TiRecordBody ctx={ctx} />,
+    present: (ctx) => ctx.ti != null,
+  },
+  {
+    factorKey: "fp_discount",
+    title: "FP history",
+    body: (ctx) => <HistoricalRecordBody ctx={ctx} />,
+    present: (ctx) => ctx.historical != null,
+  },
+  {
+    factorKey: "anomaly_boost",
+    title: "Baseline anomaly",
+    body: (ctx) => <AnomalyRecordBody ctx={ctx} />,
+    present: (ctx) => ctx.anomaly != null,
+  },
+  {
+    factorKey: "vuln_context_multiplier",
+    title: "Vulnerabilities",
+    body: (ctx) => <VulnRecordBody ctx={ctx} />,
+    present: (ctx) => ctx.vuln != null,
+  },
+  {
+    factorKey: "host_integrity_multiplier",
+    title: "Host integrity",
+    body: (ctx) => <HostIntegrityRecordBody ctx={ctx} />,
+    present: (ctx) => ctx.hostIntegrity != null,
+  },
+];
+
+/**
+ * WO-H21 core: each risk factor that actually MOVED the score expands inline
+ * into the underlying record it was computed from (asset card, principal, TI
+ * verdict, CVEs, FIM/rootcheck finding, …). When no risk breakdown was
+ * recorded (older decision) it falls back to the dimensions that HAVE a stored
+ * record, so the context is still one click away. Renders nothing when there
+ * is neither a breakdown nor any record (the risk-math expander already shows
+ * its honest "not recorded" line).
+ */
+function ContextRecordsSection({ alert }: { alert: IncidentAlert }) {
+  const math = riskMath(alert.glass_box?.risk_breakdown);
+  const ctx = caseContext(alert);
+
+  const moved = math
+    ? new Map(math.factors.map((f) => [f.key, f.value]))
+    : null;
+  const rows = CONTEXT_DIMENSIONS.filter((d) =>
+    moved ? moved.has(d.factorKey) : d.present(ctx),
+  );
+  if (rows.length === 0) return null;
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="text-micro uppercase tracking-wide text-dim2">
+        Context behind the score — the records each factor came from
+      </div>
+      {rows.map((d) => {
+        const v = moved?.get(d.factorKey);
+        return (
+          <Expander
+            key={d.factorKey}
+            summary={
+              v != null ? `${d.title} — ×${fmtNum(v)}` : d.title
+            }
+            hint="underlying record"
+          >
+            {d.body(ctx)}
+          </Expander>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---- WO-H21: matched playbook content (LAZY, READ-ONLY) ----------------------
+/**
+ * The matched playbook's steps + escalation criteria — the content, not just
+ * the `playbook_version` string in provenance. Lazy on first expand; a
+ * no-match / degraded deployment renders the server's honest `reason`.
+ */
+function PlaybookExpander({ alert }: { alert: IncidentAlert }) {
+  return (
+    <LazyDrill<DecisionPlaybookResponse>
+      summary="Matched playbook"
+      hint="steps + escalation criteria · read-only"
+      load={(signal) => getDecisionPlaybook(String(alert.id), signal)}
+    >
+      {(res) =>
+        !res.matched || !res.playbook ? (
+          <div className="text-kbd text-dim">
+            {res.reason ?? "No playbook was recorded for this decision."}
+          </div>
+        ) : (
+          <PlaybookBody pb={res.playbook} />
+        )
+      }
+    </LazyDrill>
+  );
+}
+
+function PlaybookBody({
+  pb,
+}: {
+  pb: NonNullable<DecisionPlaybookResponse["playbook"]>;
+}) {
+  return (
+    <div className="flex flex-col gap-2.5">
+      <div className="text-data font-semibold text-ink">{pb.name}</div>
+
+      {pb.investigation_steps.length > 0 && (
+        <div>
+          <div className="mb-1 text-micro uppercase tracking-wide text-dim2">
+            Investigation steps
+          </div>
+          <ol className="flex flex-col gap-1.5">
+            {pb.investigation_steps.map((s, i) => (
+              <li key={i} className="text-data leading-relaxed">
+                <span className="font-semibold text-ink">
+                  {s.step != null ? `${s.step}. ` : ""}
+                  {s.name}
+                </span>
+                {s.assess && (
+                  <div className="whitespace-pre-line pl-4 text-kbd text-dim">
+                    {s.assess.trim()}
+                  </div>
+                )}
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+
+      {pb.escalation_criteria.length > 0 && (
+        <div>
+          <div className="mb-1 text-micro uppercase tracking-wide text-dim2">
+            Escalate / needs investigation when
+          </div>
+          <ul className="flex flex-col gap-1">
+            {pb.escalation_criteria.map((c, i) => (
+              <li key={i} className="flex gap-2 text-data text-dim">
+                <span aria-hidden="true" className="text-teal">
+                  •
+                </span>
+                <span>{c}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {(pb.verdict_criteria.true_positive?.length ?? 0) +
+        (pb.verdict_criteria.false_positive?.length ?? 0) >
+        0 && (
+        <div className="flex flex-col gap-2 sm:flex-row">
+          {pb.verdict_criteria.true_positive?.length ? (
+            <div className="flex-1">
+              <div className="mb-1 text-micro uppercase tracking-wide text-dim2">
+                True positive when
+              </div>
+              <ul className="flex flex-col gap-1">
+                {pb.verdict_criteria.true_positive.map((c, i) => (
+                  <li key={i} className="text-kbd text-dim">
+                    {c}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {pb.verdict_criteria.false_positive?.length ? (
+            <div className="flex-1">
+              <div className="mb-1 text-micro uppercase tracking-wide text-dim2">
+                False positive when
+              </div>
+              <ul className="flex flex-col gap-1">
+                {pb.verdict_criteria.false_positive.map((c, i) => (
+                  <li key={i} className="text-kbd text-dim">
+                    {c}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
+      )}
+
+      <div className="text-micro text-dim2">
+        Read-only institutional guidance ({pb.key}) — the playbook the AI was
+        given for this alert class. Editing lives in config/guidance.
+      </div>
+    </div>
+  );
+}
+
+// ---- WO-H21: raw underlying Wazuh event (LAZY, READ-ONLY) ---------------------
+/**
+ * The raw event behind the decision — `full_log` up front, the full document
+ * as collapsible JSON below. Lazy on first expand; a degraded deployment or a
+ * rotated-out event renders the server's honest `reason` as an empty state.
+ */
+function RawEventExpander({ alert }: { alert: IncidentAlert }) {
+  return (
+    <LazyDrill<RawAlertResponse>
+      summary="Raw Wazuh event"
+      hint="as ingested · lazy"
+      load={(signal) => getDecisionRawAlert(String(alert.id), signal)}
+    >
+      {(res) =>
+        !res.found || !res.alert ? (
+          <div className="text-kbd text-dim">
+            {res.reason ?? "The underlying event could not be loaded."}
+          </div>
+        ) : (
+          <RawEventBody doc={res.alert} />
+        )
+      }
+    </LazyDrill>
+  );
+}
+
+function RawEventBody({ doc }: { doc: Record<string, unknown> }) {
+  const fullLog = typeof doc.full_log === "string" ? doc.full_log : "";
+  let json = "";
+  try {
+    json = JSON.stringify(doc, null, 2);
+  } catch {
+    json = String(doc);
+  }
+  return (
+    <div className="flex flex-col gap-2">
+      {fullLog && (
+        <div>
+          <div className="mb-1 text-micro uppercase tracking-wide text-dim2">
+            full_log
+          </div>
+          <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-md border border-line bg-field px-2.5 py-2 font-mono text-kbd text-ink">
+            {fullLog}
+          </pre>
+        </div>
+      )}
+      <div>
+        <div className="mb-1 text-micro uppercase tracking-wide text-dim2">
+          full event document
+        </div>
+        <pre className="max-h-80 overflow-auto rounded-md border border-line bg-field px-2.5 py-2 font-mono text-kbd leading-relaxed text-dim">
+          {json}
+        </pre>
+      </div>
+      <div className="text-micro text-dim2">
+        The event as ingested from Wazuh (host, user and IP fields shown are
+        the real values — anonymization applies only on the path to the AI).
+      </div>
+    </div>
   );
 }
 

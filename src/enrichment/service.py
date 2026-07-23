@@ -25,6 +25,45 @@ from src.database.store import SOCDatabase, _tenant_ctx, is_multi_tenant
 
 logger = structlog.get_logger(__name__)
 
+# WO-H13: bounded look-back overlap for late / out-of-order alerts.
+# The WO-H9 forward-only ``search_after`` cursor on (timestamp, _id) never
+# re-fetches an alert whose event ``timestamp`` lands BEHIND the current
+# high-water mark (clock skew, delayed agent ingest, bulk backfill). Each poll
+# therefore ALSO re-queries a small window immediately behind the high-water
+# mark so an out-of-order arrival within that window is picked up; the durable
+# processed-id dedup guarantees an already-handled alert is never re-triaged.
+# The window is bounded so it can never degenerate into the old full re-scan.
+# DOCUMENTED LIMIT: an alert arriving MORE than ``look_back_seconds`` behind the
+# high-water mark (i.e. its event timestamp is older than high_water -
+# look_back_seconds by the time we next poll) is NOT caught — that is the
+# accepted bound, not a silent guarantee.
+_DEFAULT_LOOK_BACK_SECONDS = 300      # 5 min — sensible default
+_MAX_LOOK_BACK_SECONDS = 3600         # 1 h hard ceiling — keeps it a small
+                                      # overlap, never the old sliding window
+
+
+def _sort_value_to_millis(val) -> Optional[int]:
+    """Convert a high-water cursor timestamp to epoch milliseconds.
+
+    The direct OpenSearch path stores the ``search_after`` sort tuple whose
+    first element is the date field's sort value — epoch millis (a number) by
+    default. The proxy path stores an ISO-8601 timestamp string. Accept either
+    and return epoch millis, or ``None`` if it can't be parsed.
+    """
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return int(val)
+    try:
+        parsed = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp() * 1000)
+    except Exception:
+        return None
+
 
 class EnrichmentService:
     """
@@ -119,13 +158,22 @@ class EnrichmentService:
         # enricher reads it late via providers so either path works.
         self._tenant_registry = tenant_registry
 
-        # Vulnerability/SCA host-context enricher (M4). It resolves the tenant
-        # from _tenant_ctx and uses the tenant-scoped Wazuh client only; in
-        # single-tenant mode it falls back to the global self.wazuh client.
+        # Vulnerability/SCA host-context enricher (M4 + WO-H11). Vulns are read
+        # from the Wazuh vuln STATE index in OpenSearch (the Manager API vuln
+        # endpoint was removed in Wazuh 4.8+); SCA still uses the tenant-scoped
+        # Wazuh client. It resolves the tenant from _tenant_ctx and, in
+        # multi-tenant mode, scopes the vuln query to the tenant's mapped agents
+        # (same fail-closed agent-id scoping as the alert-read path). In
+        # single-tenant mode it falls back to the global self.wazuh client and
+        # the shared self.opensearch handle with no agent restriction.
         self.vuln_context_enricher = VulnerabilityContextEnricher(
             enrich_cfg.get("vulnerability_context", {}),
             registry_provider=lambda: self._tenant_registry,
             wazuh_provider=lambda: self.wazuh,
+            opensearch_provider=lambda: self.opensearch,
+            # WO-H23: per-CVE EPSS/KEV lookups against the local (global) CVE TI
+            # table. Display-only detail; never fed to an LLM prompt.
+            db=self.db,
         )
 
         # Host-integrity (FIM/rootcheck) context enricher (M6b). Same tenant-
@@ -498,6 +546,18 @@ class EnrichmentService:
         wazuh_cfg = self.config["wazuh"]["alerts"]
         min_level = wazuh_cfg.get("min_severity", 3)
         batch_size = wazuh_cfg.get("batch_size", 50)
+        # WO-H13: bounded look-back overlap window (seconds). Clamped to
+        # [0, _MAX_LOOK_BACK_SECONDS]; 0 disables the look-back entirely. The
+        # ceiling keeps it a small overlap and forbids regressing to the old
+        # full sliding-window re-scan.
+        _cfg_look_back = wazuh_cfg.get("look_back_seconds",
+                                       _DEFAULT_LOOK_BACK_SECONDS)
+        try:
+            look_back_seconds = int(_cfg_look_back)
+        except (TypeError, ValueError):
+            look_back_seconds = _DEFAULT_LOOK_BACK_SECONDS
+        look_back_seconds = max(0, min(look_back_seconds,
+                                       _MAX_LOOK_BACK_SECONDS))
 
         # Determine fetch window: new tenants start from "now" (no backfill),
         # existing tenants use a rolling lookback window.
@@ -507,6 +567,23 @@ class EnrichmentService:
             self._tenant_first_fetch = {}
         if not hasattr(self, '_tenant_fetch_anchor'):
             self._tenant_fetch_anchor = {}  # tenant_id -> ISO timestamp of first poll
+        if not hasattr(self, '_tenant_cursor'):
+            # WO-H9: monotonic ASCENDING cursor per tenant. For the direct
+            # OpenSearch path this holds the ``search_after`` sort tuple
+            # ``[timestamp, _id]`` of the LAST alert fetched, so each poll pages
+            # strictly FORWARD past that exact (timestamp, _id) position. A plain
+            # gte-timestamp cursor would stall if >batch_size alerts shared one
+            # exact timestamp (the same top-N would return forever and the cursor
+            # never advances); pairing the timestamp with the tiebreaking ``_id``
+            # via search_after makes progress strictly monotonic. In-memory: on
+            # restart we re-seed from the fetch window and rely on the durable
+            # processed-id dedup to skip already-HANDLED alerts.
+            self._tenant_cursor = {}  # tenant_id -> [timestamp, _id] sort tuple
+        if not hasattr(self, '_tenant_ts_floor'):
+            # Proxy path only: a timestamp-string floor cursor (the dashboard
+            # proxy does not return per-hit sort values, so search_after can't be
+            # threaded through it). Advanced from the newest fetched timestamp.
+            self._tenant_ts_floor = {}  # tenant_id -> ISO timestamp
 
         if current_tenant and current_tenant not in self._tenant_first_fetch:
             # First poll for this tenant — check if they have any processed alerts
@@ -530,31 +607,79 @@ class EnrichmentService:
         else:
             fetch_window = "now-24h"
 
+        # WO-H9: prefer the monotonic ascending cursor once we have one for this
+        # tenant, so each poll continues FORWARD from the last alert seen rather
+        # than re-scanning a sliding desc window (which starved older alerts).
+
+        # Resolve the fetch route first — proxy vs direct — because the cursor
+        # strategy differs (search_after needs per-hit sort values the proxy
+        # doesn't return).
+        proxy_cfg = None
+        if self._tenant_registry and current_tenant:
+            tenant_cfg = self._tenant_registry.get_tenant_config(current_tenant)
+            proxy_cfg = tenant_cfg.get("dashboard_proxy")
+
+        # Precise ascending pagination cursor (direct path) vs timestamp floor.
+        search_after = None
+        if not proxy_cfg and current_tenant:
+            search_after = self._tenant_cursor.get(current_tenant)
+        # Timestamp floor: the proxy path's advancing cursor, or the first-poll
+        # window before we have a precise cursor.
+        lower_bound = fetch_window
+        if proxy_cfg and current_tenant and current_tenant in self._tenant_ts_floor:
+            lower_bound = self._tenant_ts_floor[current_tenant]
+
+        # WO-H13: capture the high-water mark this poll STARTS from (the cursor
+        # the forward scan pages past) BEFORE it is advanced below — the
+        # look-back window is measured behind exactly this point. Direct path:
+        # the timestamp element of the search_after tuple. Proxy path: the
+        # pre-poll ISO timestamp floor. None on the first poll (no cursor yet),
+        # where the wide initial fetch_window already covers late arrivals.
+        high_water_val = None
+        if search_after:
+            high_water_val = search_after[0]
+        elif proxy_cfg and current_tenant:
+            high_water_val = self._tenant_ts_floor.get(current_tenant)
+
         # Fetch raw alerts from Wazuh's alert index in OpenSearch
         # In multi-tenant mode, scope by the current tenant's allowed agent IDs
+        last_sort = None
+        # Shared query scoping — min rule level + fail-closed per-tenant agent
+        # scoping — built ONCE so the WO-H13 look-back query reuses the exact
+        # same restrictions and can never widen a tenant's visibility.
+        base_must = None
         try:
-            must_clauses = [
+            base_must = [
                 {"range": {"rule.level": {"gte": min_level}}},
-                {"range": {"timestamp": {"gte": fetch_window}}}
             ]
             if is_multi_tenant() and current_tenant:
                 allowed_agents = self.db.get_tenant_agent_ids(current_tenant)
                 if allowed_agents is not None:
-                    must_clauses.append({"terms": {"agent.id": allowed_agents}})
-                elif allowed_agents is None:
-                    # No agent mapping in MT mode — fetch nothing
-                    must_clauses.append({"terms": {"agent.id": []}})
+                    base_must.append({"terms": {"agent.id": allowed_agents}})
+                else:
+                    # No agent mapping in MT mode — fetch nothing (fail closed)
+                    base_must.append({"terms": {"agent.id": []}})
+
+            must_clauses = list(base_must)
+            # Only apply the timestamp floor when we have NO precise
+            # search_after cursor (first poll, or proxy path). Once search_after
+            # is set it supersedes the floor and paginates strictly forward.
+            if not search_after:
+                must_clauses.append(
+                    {"range": {"timestamp": {"gte": lower_bound}}})
 
             query = {
                 "query": {"bool": {"must": must_clauses}},
-                "sort": [{"timestamp": {"order": "desc"}}]
+                # ASCENDING (oldest-first) with a stable ``_id`` tiebreaker so the
+                # search_after cursor advances monotonically and >batch_size
+                # same-timestamp alerts can't stall the pipeline.
+                "sort": [
+                    {"timestamp": {"order": "asc"}},
+                    {"_id": {"order": "asc"}},
+                ],
             }
-
-            # Check if this tenant uses the dashboard proxy instead of direct OpenSearch
-            proxy_cfg = None
-            if self._tenant_registry and current_tenant:
-                tenant_cfg = self._tenant_registry.get_tenant_config(current_tenant)
-                proxy_cfg = tenant_cfg.get("dashboard_proxy")
+            if search_after:
+                query["search_after"] = search_after
 
             if proxy_cfg:
                 raw_alerts = self._fetch_alerts_dashboard_proxy(
@@ -565,12 +690,106 @@ class EnrichmentService:
                     body=query,
                     size=batch_size
                 )
-                raw_alerts = [hit["_source"] for hit in result["hits"]["hits"]]
+                hits = result["hits"]["hits"]
+                raw_alerts = [hit["_source"] for hit in hits]
+                # Capture the LAST hit's sort values as the next search_after
+                # cursor (ascending => last hit is the furthest-forward).
+                if hits and "sort" in hits[-1]:
+                    last_sort = hits[-1]["sort"]
                 if raw_alerts:
                     logger.info("wazuh_alerts_fetched_from_opensearch", count=len(raw_alerts))
         except Exception as e:
             logger.error("wazuh_alerts_fetch_failed", error=str(e)[:200])
             raw_alerts = []
+
+        # WO-H9: advance the cursor and emit the backlog-lag metric (how far
+        # behind real time we are). We advance from the RAW batch — even alerts
+        # that dedup out still count as "seen", so the cursor keeps moving
+        # forward and never re-scans them.
+        if current_tenant and raw_alerts:
+            newest_ts = None
+            for raw in raw_alerts:
+                ts = raw.get("timestamp") or raw.get("@timestamp")
+                if ts and (newest_ts is None or str(ts) > str(newest_ts)):
+                    newest_ts = ts
+            # Direct path: precise search_after cursor. Proxy path: timestamp
+            # floor (advance only forward).
+            if last_sort is not None:
+                self._tenant_cursor[current_tenant] = last_sort
+            elif proxy_cfg and newest_ts:
+                prev = self._tenant_ts_floor.get(current_tenant)
+                if prev is None or str(newest_ts) >= str(prev):
+                    self._tenant_ts_floor[current_tenant] = newest_ts
+            if newest_ts:
+                try:
+                    from datetime import datetime as _dt, timezone as _tz
+                    parsed = _dt.fromisoformat(
+                        str(newest_ts).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=_tz.utc)
+                    lag = (_dt.now(_tz.utc) - parsed).total_seconds()
+                    self.db.record_metric(
+                        "triage_backlog_seconds", max(0.0, lag),
+                        {"tenant": current_tenant,
+                         "cursor": str(newest_ts),
+                         "batch": len(raw_alerts)})
+                except Exception:
+                    pass
+
+        # WO-H13: bounded look-back overlap. In ADDITION to the forward scan,
+        # re-query the small window immediately BEHIND the high-water mark so an
+        # alert that arrived out-of-order within it (clock skew, delayed ingest,
+        # backfill) is picked up. This does NOT touch the forward cursor or the
+        # backlog metric — both stay driven solely by the forward scan above, so
+        # the cursor still advances strictly monotonically and can't stall. The
+        # look-back re-surfaces already-handled alerts too, but the processed-id
+        # dedup in the loop below skips them, so only GENUINELY-new late arrivals
+        # are triaged — never a re-triage. The same per-tenant agent scoping
+        # (base_must) is reused, so tenant isolation is unchanged. Applies to
+        # BOTH the direct-OpenSearch path and the dashboard-proxy path (a plain
+        # bounded range query needs no per-hit sort values, unlike search_after).
+        # DOCUMENTED BOUND: an alert whose event timestamp is older than
+        # (high_water - look_back_seconds) by the time of this poll is NOT caught.
+        if (look_back_seconds > 0 and base_must is not None
+                and current_tenant and high_water_val is not None):
+            hw_ms = _sort_value_to_millis(high_water_val)
+            if hw_ms is not None:
+                gte_ms = hw_ms - look_back_seconds * 1000
+                lookback_must = list(base_must)
+                lookback_must.append({
+                    "range": {"timestamp": {
+                        "gte": gte_ms, "lte": hw_ms,
+                        "format": "epoch_millis"}}})
+                lookback_query = {
+                    "query": {"bool": {"must": lookback_must}},
+                    # Ascending + stable _id tiebreaker, mirroring the forward
+                    # query; bounded by batch_size so it can't become a re-scan.
+                    "sort": [
+                        {"timestamp": {"order": "asc"}},
+                        {"_id": {"order": "asc"}},
+                    ],
+                }
+                try:
+                    if proxy_cfg:
+                        lookback_raw = self._fetch_alerts_dashboard_proxy(
+                            proxy_cfg, lookback_query, batch_size)
+                    else:
+                        lb_result = self.opensearch.client.search(
+                            index="wazuh-alerts-4.x-*",
+                            body=lookback_query,
+                            size=batch_size,
+                        )
+                        lookback_raw = [h["_source"]
+                                        for h in lb_result["hits"]["hits"]]
+                    if lookback_raw:
+                        raw_alerts = raw_alerts + lookback_raw
+                        logger.info("triage_lookback_window_scanned",
+                                    tenant=current_tenant,
+                                    look_back_seconds=look_back_seconds,
+                                    candidates=len(lookback_raw))
+                except Exception as e:
+                    logger.warning("triage_lookback_fetch_failed",
+                                   error=str(e)[:200])
 
         enriched_batch = []
         for raw in raw_alerts:
@@ -622,13 +841,18 @@ class EnrichmentService:
                                  alert_id=alert_id, index_result=stored)
                     continue  # Do NOT mark processed — alert should be retried
 
-            # Track processed — both in memory AND Postgres (survives restarts)
+            # WO-H9 crash-safe checkpoint: do NOT durably mark processed here.
+            # The DURABLE ``processed_alerts`` checkpoint is written only once an
+            # alert is fully HANDLED — atomically with the triage decision save
+            # (store.save_decision) for triaged alerts, or at the below-threshold
+            # skip point in the fetch loop. Marking at enrichment (pre-triage)
+            # meant a shutdown/crash that dropped the not-yet-triaged queue item
+            # left the alert durably "processed" → never re-fetched → SILENT
+            # detection loss. The IN-MEMORY add still de-dups boundary re-reads
+            # within this process; it is cleared on restart, so a dropped alert
+            # is safely re-fetched + re-enriched (idempotent by alert_id) +
+            # re-triaged.
             self.processed_ids.add(cache_key)
-            self.db.mark_alert_processed(
-                alert_id=alert_id,
-                rule_id=normalized.get("rule_id"),
-                rule_description=normalized.get("rule_description")
-            )
 
             # Trim in-memory cache (Postgres is source of truth)
             if len(self.processed_ids) > self._max_processed_cache:

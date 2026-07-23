@@ -45,6 +45,39 @@ const VERDICTS: Record<string, VerdictPresentation> = {
   },
 };
 
+/**
+ * WO-H46-c: presentation for a decision the AI never actually made.
+ *
+ * When the LLM backend is unreachable, triage fails CLOSED — it escalates with
+ * `verdict: 'needs_investigation'` and `confidence: 0` WITHOUT analyzing the
+ * alert. On the wire that is indistinguishable from a considered escalation,
+ * which is how a backend outage came to masquerade as a busy queue (1398
+ * un-analyzed rows on one install before anyone noticed).
+ *
+ * Rendering it as "Needs investigation" would repeat that lie in the UI, so it
+ * gets its own label. `text-sev-med` deliberately reads as a caution state:
+ * this is not a severity claim about the alert (nothing assessed its severity)
+ * — it is a warning that the queue entry is unprocessed work, not a judgement.
+ */
+export const NOT_ANALYZED: VerdictPresentation = {
+  label: "Not analyzed",
+  glyph: "⚠",
+  className: "text-sev-med",
+};
+
+/**
+ * Presentation for a whole decision row — prefer this over
+ * `verdictPresentation()` anywhere a `TriageDecision` is in hand, so a failed
+ * triage can never be displayed as if the AI had reached a conclusion.
+ */
+export function decisionPresentation(decision: {
+  verdict: string;
+  llm_failed?: boolean;
+}): VerdictPresentation {
+  if (decision.llm_failed) return NOT_ANALYZED;
+  return verdictPresentation(decision.verdict);
+}
+
 /** Humanise an unexpected/newer verdict value ("some_new" → "Some new"). */
 function humanize(value: string): string {
   const s = value.replace(/[_-]+/g, " ").trim();

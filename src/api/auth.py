@@ -299,3 +299,54 @@ def require_role(*roles: str):
             )
         return user
     return _check
+
+
+def require_deploy_authority():
+    """Mode-aware dependency for detection deploy / bulk-deploy / rollback (WO-H30).
+
+    Deploying (or rolling back) a proposal mutates the SHARED Wazuh ruleset:
+
+      * MULTI-TENANT — a rule change hits every tenant's signal, so authority
+        stays restricted to ``mssp_admin`` ONLY (unchanged from the original
+        ``require_role("mssp_admin")`` gate). A plain ``admin`` is a
+        per-tenant/customer administrator and must NOT reach across tenants.
+      * SINGLE-TENANT — there is exactly one customer and NO ``mssp_admin`` role
+        (the top role is ``admin``). Restricting deploy to ``mssp_admin`` there
+        means nobody can deploy and the compounding loop can never close, so
+        ``admin`` (and above) is granted deploy authority.
+
+    ``mssp_admin`` passes in BOTH modes (it is the superuser). ``senior_analyst``
+    and below NEVER get deploy authority in either mode.
+
+    FAIL CLOSED: if the deployment mode cannot be determined, treat the install
+    as multi-tenant (``mssp_admin`` only) — the strictest posture.
+
+    The mode is read at REQUEST time (not import time) because multi-tenant mode
+    can flip on at runtime when a second tenant is added
+    (admin._recompute_multi_tenant_mode).
+    """
+    async def _check(user: dict = Depends(verify_jwt)) -> dict:
+        if not _auth_enabled:
+            return user
+        # mssp_admin is the superuser — passes in both modes.
+        if user.get("role") == "mssp_admin":
+            logger.info("mssp_admin_role_bypass",
+                        actor=user.get("sub"),
+                        required_roles=("deploy_authority",))
+            return user
+        # Determine deployment mode from the single source of truth. Lazy import
+        # to avoid a circular dependency and fail closed to multi-tenant if it
+        # cannot be resolved.
+        try:
+            from src.database.store import is_multi_tenant
+            multi = is_multi_tenant()
+        except Exception:
+            multi = True  # fail closed → strictest (mssp_admin only)
+        allowed = ("mssp_admin",) if multi else ("admin", "mssp_admin")
+        if user.get("role") not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Requires one of: {', '.join(allowed)}",
+            )
+        return user
+    return _check

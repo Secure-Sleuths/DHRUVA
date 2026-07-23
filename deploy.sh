@@ -23,6 +23,31 @@ VENV_DIR="$INSTALL_DIR/venv"
 PYTHON="${PYTHON:-python3}"
 CURRENT_USER="$(whoami)"
 
+# ─── CLI flags ───────────────────────────────────────────────────────────────
+# By default deploy.sh NEVER regenerates a secret that already has a non-empty
+# value in .env (see ensure_secret below and docs/KEY-ROTATION.md). These opt-in
+# flags force rotation of ONE specific secret; each is gated behind a typed
+# destructive-consequences confirmation before anything is overwritten.
+ROTATE_JWT=0
+ROTATE_SALT=0
+ROTATE_TENANT_KEY=0
+for arg in "$@"; do
+    case "$arg" in
+        --rotate-jwt)        ROTATE_JWT=1 ;;
+        --rotate-salt)       ROTATE_SALT=1 ;;
+        --rotate-tenant-key) ROTATE_TENANT_KEY=1 ;;
+        -h|--help)
+            echo "Usage: ./deploy.sh [--rotate-jwt] [--rotate-salt] [--rotate-tenant-key]"
+            echo ""
+            echo "  Existing crypto secrets in .env are PRESERVED by default (never"
+            echo "  regenerated on re-run). The --rotate-* flags force regeneration of"
+            echo "  that one secret — destructive, and each prompts for typed confirmation."
+            echo "  See docs/KEY-ROTATION.md for each secret's blast radius."
+            exit 0 ;;
+        *) ;;
+    esac
+done
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 banner() {
@@ -89,6 +114,81 @@ update_env() {
     else
         echo "${key}=${value}" >> "$ENV_FILE"
     fi
+}
+
+# confirm_rotation KEY LABEL — print a bold destructive warning describing the
+# blast radius of rotating KEY and require the operator to type the exact secret
+# name to proceed. Returns 0 only on an exact-match typed confirmation; empty or
+# any other input returns non-zero (rotation is cancelled).
+confirm_rotation() {
+    local key="$1"
+    local label="$2"
+    echo ""
+    echo -e "  ${RED}${BOLD}!! DESTRUCTIVE: rotating ${key} (${label}) !!${NC}"
+    case "$key" in
+        JWT_SECRET)
+            warn "Rotating JWT_SECRET invalidates every issued token — ALL logged-in analysts are signed out immediately." ;;
+        ANONYMIZATION_SALT)
+            warn "Rotating ANONYMIZATION_SALT breaks anonymization-token consistency — the same client identifier tokenizes differently before vs. after, so historical anonymized references no longer correlate." ;;
+        TENANT_ENCRYPTION_KEY)
+            warn "Rotating TENANT_ENCRYPTION_KEY makes ALL existing tenant configs UNDECRYPTABLE (Wazuh creds, API keys, webhooks)."
+            warn "Every tenant fails closed and stops being polled until re-encrypted."
+            warn "For a safe, no-downtime rotation use tools/rotate_tenant_key.py — see docs/KEY-ROTATION.md. This flag is a last resort." ;;
+    esac
+    echo ""
+    ask "Type the secret name (${key}) to confirm rotation, or press Enter to cancel" _rot_confirm ""
+    if [ "$_rot_confirm" = "$key" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# ensure_secret KEY GENERATOR_CMD LABEL — generate a crypto secret only if it is
+# ABSENT. If .env already has a non-empty value for KEY it is PRESERVED (never
+# silently overwritten), so re-running deploy.sh does not rotate JWT/salt/tenant
+# keys out from under a live install. Rotation happens only when the matching
+# --rotate-* flag is set, and only after a typed confirmation.
+# See docs/KEY-ROTATION.md for the rationale and blast radius of each secret.
+ensure_secret() {
+    local key="$1"
+    local generator="$2"
+    local label="$3"
+
+    # Was explicit rotation requested for THIS secret via a --rotate-* flag?
+    local rotate="no"
+    if [ "$key" = "JWT_SECRET" ]            && [ "${ROTATE_JWT:-0}" = "1" ];        then rotate="yes"; fi
+    if [ "$key" = "ANONYMIZATION_SALT" ]    && [ "${ROTATE_SALT:-0}" = "1" ];       then rotate="yes"; fi
+    if [ "$key" = "TENANT_ENCRYPTION_KEY" ] && [ "${ROTATE_TENANT_KEY:-0}" = "1" ]; then rotate="yes"; fi
+
+    # Existing non-empty value? (pipeline exit status is cut's, so a no-match
+    # grep does not trip set -e)
+    local existing=""
+    if [ -f "$ENV_FILE" ]; then
+        existing=$(grep "^${key}=" "$ENV_FILE" 2>/dev/null | head -n1 | cut -d= -f2-)
+    fi
+
+    if [ -n "$existing" ] && [ "$rotate" != "yes" ]; then
+        success "existing ${label} preserved (not regenerated)"
+        return 0
+    fi
+
+    if [ -n "$existing" ] && [ "$rotate" = "yes" ]; then
+        if confirm_rotation "$key" "$label"; then
+            local value
+            value=$(eval "$generator")
+            update_env "$key" "$value"
+            warn "${label} ROTATED — previous value overwritten"
+        else
+            info "${label} rotation cancelled — existing value preserved"
+        fi
+        return 0
+    fi
+
+    # No existing value — first install, generate fresh.
+    local value
+    value=$(eval "$generator")
+    update_env "$key" "$value"
+    success "${label} generated"
 }
 
 update_config() {
@@ -179,12 +279,15 @@ install_local_postgres() {
     ask "Postgres database name" PG_DB "dhruva"
 
     info "Configuring role and database (idempotent)..."
+    # WO-H12-followup: the app role MUST be NOSUPERUSER NOBYPASSRLS or Postgres
+    # Row-Level Security (the WO-H12 tenant backstop) is silently bypassed. Set it
+    # explicitly on both create and re-run rather than relying on the PG default.
     if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${PG_USER}'" 2>/dev/null | grep -q 1; then
-        sudo -u postgres psql -c "ALTER USER ${PG_USER} WITH PASSWORD '${PG_PASS}';" >/dev/null
-        info "Role ${PG_USER} already existed — password updated"
+        sudo -u postgres psql -c "ALTER USER ${PG_USER} WITH PASSWORD '${PG_PASS}' NOSUPERUSER NOBYPASSRLS;" >/dev/null
+        info "Role ${PG_USER} already existed — password updated, NOSUPERUSER NOBYPASSRLS enforced"
     else
-        sudo -u postgres psql -c "CREATE USER ${PG_USER} WITH PASSWORD '${PG_PASS}';" >/dev/null
-        success "Role ${PG_USER} created"
+        sudo -u postgres psql -c "CREATE USER ${PG_USER} WITH PASSWORD '${PG_PASS}' NOSUPERUSER NOBYPASSRLS;" >/dev/null
+        success "Role ${PG_USER} created (NOSUPERUSER NOBYPASSRLS — RLS can take effect)"
     fi
 
     if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" 2>/dev/null | grep -q 1; then
@@ -765,16 +868,18 @@ if [ ${#ADMIN_PASS} -lt 8 ]; then
     warn "Password is short. Recommend 12+ characters for production."
 fi
 
-# Generate JWT secret
-JWT_SECRET=$($PYTHON -c "import secrets; print(secrets.token_hex(32))")
-
 update_env "SOC_ADMIN_USER" "$ADMIN_USER"
 update_env "SOC_ADMIN_PASSWORD" "$ADMIN_PASS"
-update_env "JWT_SECRET" "$JWT_SECRET"
 
-# Generate anonymization salt for persistent LLM prompt anonymization
-ANON_SALT=$($PYTHON -c "import secrets; print(secrets.token_hex(32))")
-update_env "ANONYMIZATION_SALT" "$ANON_SALT"
+# JWT signing secret — generate only if absent so re-running deploy.sh does not
+# rotate the key and log out every session. Rotate deliberately with
+# --rotate-jwt. See docs/KEY-ROTATION.md.
+ensure_secret "JWT_SECRET" '$PYTHON -c "import secrets; print(secrets.token_hex(32))"' "JWT secret"
+
+# Anonymization salt for persistent LLM prompt anonymization — generate only if
+# absent so re-runs keep anonymization tokens consistent. Rotate deliberately
+# with --rotate-salt. See docs/KEY-ROTATION.md.
+ensure_secret "ANONYMIZATION_SALT" '$PYTHON -c "import secrets; print(secrets.token_hex(32))"' "anonymization salt"
 
 if [ "$DEPLOY_MODE" = "multi" ]; then
     update_env "SOC_ADMIN_ROLE" "mssp_admin"
@@ -783,7 +888,6 @@ else
     update_env "SOC_ADMIN_ROLE" "admin"
     success "Dashboard credentials configured"
 fi
-success "JWT secret generated and saved"
 
 # Multi-tenant: generate encryption key and collect first tenant info
 if [ "$DEPLOY_MODE" = "multi" ]; then
@@ -793,9 +897,11 @@ if [ "$DEPLOY_MODE" = "multi" ]; then
     echo "     encrypted before being stored in the database. This encryption key"
     echo "     protects all of them. It is generated automatically."
     echo ""
-    TENANT_KEY=$($PYTHON -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
-    update_env "TENANT_ENCRYPTION_KEY" "$TENANT_KEY"
-    success "Tenant encryption key generated and saved to .env"
+    # Tenant master encryption key — generate only if absent. Regenerating this
+    # makes ALL existing tenant configs undecryptable, so a re-run must PRESERVE
+    # it. Rotate safely with tools/rotate_tenant_key.py (docs/KEY-ROTATION.md);
+    # --rotate-tenant-key here is a destructive last resort.
+    ensure_secret "TENANT_ENCRYPTION_KEY" '$PYTHON -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"' "tenant encryption key"
     warn "Back up your .env file securely — if this key is lost, client configs cannot be decrypted."
     echo ""
 

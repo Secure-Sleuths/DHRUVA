@@ -287,6 +287,30 @@ function showTab(t) {
 function badge(text, color) {
   return `<span class="badge" style="background:${color}18;color:${color};border:1px solid ${color}30">${esc(text)}</span>`;
 }
+// AIS2 grounding band from the persisted agent_decisions.grounding JSON blob.
+// Defensive: null / malformed / non-triage rows return '' (render nothing).
+// Mirrors web/src/lib/grounding.ts::parseGrounding.
+function groundingBand(d) {
+  var raw = d && d.grounding;
+  if (raw == null) return '';
+  var obj = raw;
+  if (typeof raw === 'string') {
+    var t = raw.trim();
+    if (!t) return '';
+    try { obj = JSON.parse(t); } catch (e) { return ''; }
+  }
+  if (!obj || typeof obj !== 'object') return '';
+  var lvl = obj.grounding;
+  return (lvl === 'low' || lvl === 'medium' || lvl === 'high') ? lvl : '';
+}
+// FLAG-ONLY low-grounding badge (WO-H8 / WO-U11): surfaced only for the 'low'
+// band, so the analyst knows the AI's OWN self-check was not confident in this
+// verdict. Amber (never severity-red). 'medium'/'high'/absent render nothing.
+function lowGroundingBadge(d) {
+  return groundingBand(d) === 'low'
+    ? badge('⚠ AI not confident — review', '#F59E0B')
+    : '';
+}
 function localTime(ts) {
   if (!ts) return '';
   // DB stores UTC without Z suffix — append Z so JS Date parses as UTC then converts to local
@@ -695,6 +719,7 @@ async function renderTriage() {
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px">
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           ${badge(VL[ev]||ev, vc)}
+          ${lowGroundingBadge(d)}
           <span style="color:#1E293B;font-size:13px;font-weight:700;font-family:'JetBrains Mono',monospace">Rule ${d.rule_id}</span>
           <span style="color:#64748B;font-size:12px">${esc((d.rule_description||'').slice(0,60))}</span>
           ${isAnomaly ? badge('ANOMALY '+deviation.toFixed(1)+'\u03C3', '#C084FC') : ''}
@@ -772,7 +797,7 @@ async function renderTriage() {
       ` : `
       <div style="color:#64748B;font-size:11px;line-height:1.5;margin-top:6px;max-height:40px;overflow:hidden">${isAnomaly?'<span style="color:#C084FC;font-weight:600">[ANOMALY] </span>':''}${esc((d.reasoning||'\u2014').slice(0,180))}...</div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px">
-        <span class="muted">${d.created_at?localTimeShort(d.created_at):''} — ${esc(d.alert_id)} ${(d.escalated||ev==='needs_investigation')&&!d.human_verdict?badge('⏳ Awaiting','#60A5FA'):''} ${d.human_verdict?badge('Human: '+(VL[d.human_verdict]||d.human_verdict),d.human_verdict===d.verdict?'#34D399':'#EF4444'):''}</span>
+        <span class="muted">${d.created_at?localTimeShort(d.created_at):''} — ${esc(d.alert_id)} ${lowGroundingBadge(d)} ${(d.escalated||ev==='needs_investigation')&&!d.human_verdict?badge('⏳ Awaiting','#60A5FA'):''} ${d.human_verdict?badge('Human: '+(VL[d.human_verdict]||d.human_verdict),d.human_verdict===d.verdict?'#34D399':'#EF4444'):''}</span>
         ${(d.escalated||ev==='needs_investigation')&&!d.human_verdict?`<div><button class="btn" style="background:#EF444418;color:#EF4444;margin-right:4px" data-action="review" data-id="${d.id}" data-verdict="true_positive" data-stop-propagation="true">TP</button><button class="btn" style="background:#FBBF2418;color:#FBBF24" data-action="review" data-id="${d.id}" data-verdict="false_positive" data-stop-propagation="true">FP</button></div>`:''}
       </div>
       `}

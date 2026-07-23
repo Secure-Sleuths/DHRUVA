@@ -75,12 +75,29 @@ def build_overview_summary(
     active = [c for c in campaigns if c.get("status") == "active"]
     contained = [c for c in campaigns if c.get("status") == "contained"]
 
-    # KPI 1 — Active campaigns: total tracked campaigns, split advancing (active)
-    # vs contained. Mirrors the mockup's "2 advancing · 1 contained" tile.
+    # KPI 1 — Active campaigns.
+    #
+    # WO-H48: ``value`` is the ACTIVE count, not the all-time total.
+    #
+    # It previously held ``len(campaigns)`` — every campaign ever recorded —
+    # under a key named ``active_campaigns``. On a live install that meant a
+    # tile labelled "Active campaigns" reading 934 while only 3 were actually
+    # active, permanently severity-critical (the tile reddens on ``value > 0``,
+    # which was true forever once any campaign existed). Worse, Daily Review
+    # renders this field as prose for a NON-TECHNICAL reader and was saying
+    # "934 coordinated attacks are in progress" — and its "no attacks in
+    # progress" branch was unreachable, because the all-time total is never 0.
+    # Telling an operator an attack is underway when none is, is the most
+    # expensive kind of wrong this dashboard can be.
+    #
+    # ``total`` keeps the all-time figure available for the expand-to-math
+    # detail; ``advancing`` is retained (equal to ``value``) so existing
+    # consumers of the split keep working.
     active_campaigns = {
-        "value": len(campaigns),
+        "value": len(active),
         "advancing": len(active),
         "contained": len(contained),
+        "total": len(campaigns),
     }
 
     # KPI 2 — Estate dwell (worst): the largest dwell among ACTIVE campaigns,
@@ -158,7 +175,18 @@ async def get_overview_summary(
     """
     _db = get_db()
     now = datetime.now(timezone.utc)
-    campaigns = _db.get_campaigns(now=now)
+    # WO-H47: count over ALL campaigns, not the default limit=100 window.
+    # These are KPI COUNTS ("N active · M contained", worst dwell, hosts on
+    # chain, furthest tactic) — a truncated list makes every one of them lie.
+    # On a live install with 930 campaigns the tile reported ~99 contained
+    # instead of 927, and (before the status-first sort landed) 1 active
+    # instead of 3, because two active campaigns ranked below the cut.
+    #
+    # This costs nothing extra: get_campaigns() already SELECTs every chained
+    # incident for the tenant and builds the full rollup — `limit` only
+    # truncates the finished list. The map still requests its own bounded page
+    # separately.
+    campaigns = _db.get_campaigns(now=now, limit=1_000_000)
     stats = _db.get_dashboard_stats()
 
     summary = build_overview_summary(

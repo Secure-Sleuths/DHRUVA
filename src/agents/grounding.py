@@ -198,6 +198,19 @@ _SEVERITY_SUPPORT = (
     "user_risk_level",
 )
 
+# Verdicts that DISMISS an alert (close it as benign / auto-close it).
+_DISMISSAL_VERDICTS = frozenset({"false_positive", "auto_close"})
+
+# The STRONG maliciousness signals whose presence should stop an alert from
+# being dismissed. A benign verdict laid over any of these — a TI hit, a
+# known-malicious IOC, a high risk_score, or an explicit escalation trigger —
+# is a hallucinated dismissal (the model waved away hard evidence). Narrower
+# than _SEVERITY_SUPPORT on purpose: baseline anomaly / elevated user risk are
+# softer context that a human may legitimately dismiss, so they don't trip this.
+_DISMISSAL_CONTRADICTING = (
+    "threat_intel_hits", "is_known_malicious", "risk_score", "escalation_trigger",
+)
+
 
 def _as_number(value) -> float:
     try:
@@ -243,7 +256,7 @@ def assess_triage_grounding(verdict: str, confidence: float,
                             evidence_refs, enrichment: dict) -> dict:
     """Deterministic faithfulness tripwire for a triage verdict.
 
-    This is a HEURISTIC tripwire, not a scoring model. Two explicit checks:
+    This is a HEURISTIC tripwire, not a scoring model. Three explicit checks:
 
     (i) Fabricated-citation check — if the model supplied ``evidence_refs``
         (names of enrichment signals it relied on), each ref must name a signal
@@ -256,8 +269,17 @@ def assess_triage_grounding(verdict: str, confidence: float,
          elevated user risk) is flagged "severity not supported by evidence".
          This check does not depend on the model's cooperation.
 
+    (iii) Dismissal-vs-evidence check (WO-H8) — the mirror image of (ii): a
+          ``false_positive`` / ``auto_close`` verdict that DISMISSES an alert
+          which still carries a STRONG maliciousness signal (a TI hit, a
+          known-malicious IOC, a high risk_score, or an explicit escalation
+          trigger) is flagged "dismissal contradicts strong signal". A confident
+          auto-dismissal of hard evidence is exactly the hallucination a
+          non-technical analyst is least equipped to catch. Cooperation-free.
+
     Bands:
-      * ``low``    — severity unsupported, OR every supplied ref is fabricated.
+      * ``low``    — severity unsupported, OR dismissal contradicts strong
+                     signal, OR every supplied ref is fabricated.
       * ``medium`` — some (but not all) supplied refs are fabricated.
       * ``high``   — no tripwire fired.
 
@@ -286,16 +308,28 @@ def assess_triage_grounding(verdict: str, confidence: float,
             "verdict 'true_positive' has no supporting enrichment evidence "
             "(no TI hit, low risk_score, no escalation trigger, no anomaly)")
 
-    # Score: fraction of supplied refs that are real, floored hard by the
-    # severity tripwire (the stronger, cooperation-free signal).
+    # (iii) dismissal contradicts strong signal (false_positive / auto_close) —
+    # the model closed an alert that still carries hard maliciousness evidence.
+    contradicting = [name for name in _DISMISSAL_CONTRADICTING
+                     if _KNOWN_SIGNALS[name](enrichment)]
+    dismissal_unsupported = (verdict in _DISMISSAL_VERDICTS
+                             and bool(contradicting))
+    if dismissal_unsupported:
+        reasons.append(
+            f"verdict '{verdict}' dismisses an alert carrying strong signal(s) "
+            + ", ".join(contradicting)
+            + " with no support")
+
+    # Score: fraction of supplied refs that are real, floored hard by either
+    # cooperation-free tripwire (severity or dismissal).
     if refs:
         score = (len(refs) - len(fabricated)) / len(refs)
     else:
         score = 1.0
-    if severity_unsupported:
+    if severity_unsupported or dismissal_unsupported:
         score = min(score, 0.2)
 
-    if severity_unsupported:
+    if severity_unsupported or dismissal_unsupported:
         grounding = "low"
     elif refs and len(fabricated) == len(refs):
         grounding = "low"
@@ -332,6 +366,14 @@ _INJECTION_ECHO_RE = re.compile(
     r"|system prompt\s*:)",
     re.IGNORECASE)
 
+# Trust-envelope breakout tripwire: a premature ``</untrusted_data>`` closing
+# marker in analyst-facing output means the model echoed the trust envelope's
+# closing tag — the tell-tale of a prompt-injection breakout attempt in the
+# alert data (an attacker planting ``</untrusted_data>`` in an alert field to
+# close the envelope early and inject instructions). Whitespace-tolerant so
+# ``</ untrusted_data >`` variants are also caught (WO-H3).
+_BREAKOUT_MARKER_RE = re.compile(r"<\s*/\s*untrusted_data\s*>", re.IGNORECASE)
+
 
 def output_safety_metrics(text: str, anonymizer=None) -> dict:
     """Lightweight in-house safety scan of FINAL analyst-facing output text.
@@ -343,13 +385,16 @@ def output_safety_metrics(text: str, anonymizer=None) -> dict:
           an exact-match check on top of the regex family scan.
       (b) does the output appear to echo an injection directive from untrusted
           data (an "ignore previous instructions"-class phrase)?
+      (c) did the output emit a premature ``</untrusted_data>`` breakout marker,
+          the signature of a trust-envelope escape attempt from the alert data?
 
-    Returns counts only (``{token_leaks, injection_echoes, leaked_tokens,
-    flagged}``); LangKit is the deferred richer option for this surface.
+    Returns counts only (``{token_leaks, injection_echoes, breakout_markers,
+    leaked_tokens, flagged}``); LangKit is the deferred richer option for this
+    surface.
     """
     if not isinstance(text, str) or not text:
         return {"token_leaks": 0, "injection_echoes": 0,
-                "leaked_tokens": [], "flagged": False}
+                "breakout_markers": 0, "leaked_tokens": [], "flagged": False}
 
     leaked = set(_ANON_TOKEN_RE.findall(text))
 
@@ -363,10 +408,12 @@ def output_safety_metrics(text: str, anonymizer=None) -> dict:
                 leaked.add(tok)
 
     injection_echoes = len(_INJECTION_ECHO_RE.findall(text))
+    breakout_markers = len(_BREAKOUT_MARKER_RE.findall(text))
 
     return {
         "token_leaks": len(leaked),
         "injection_echoes": injection_echoes,
+        "breakout_markers": breakout_markers,
         "leaked_tokens": sorted(leaked),
-        "flagged": bool(leaked) or injection_echoes > 0,
+        "flagged": bool(leaked) or injection_echoes > 0 or breakout_markers > 0,
     }

@@ -16,12 +16,30 @@ bodies) using the SAME reversible token scheme. It is gated on
 ``anonymization.free_text_pii`` and NEVER touches detection-relevant keys
 (command lines / file paths / process names) — enforced structurally via a
 field allowlist plus a detection key exclude-set.
+
+HONEST BOUNDARY (WO-H10) — what this DOES and does NOT strip:
+  * DOES tokenize structural identifiers: top-level hostnames, internal IPs,
+    usernames, and — nested inside raw ``data`` — Windows event identity fields
+    (``TargetUserName`` / ``SubjectUserName`` / ``SamAccountName`` /
+    ``WorkstationName`` / ``ComputerName`` …). See ``_HOST_IDENTITY_KEYS`` /
+    ``_USER_IDENTITY_KEYS``.
+  * DOES redact free-text semantic PII (email/phone/national-ID) from
+    non-detection string leaves.
+  * DOES NOT strip usernames/paths that live INSIDE a command line, file path,
+    or process-image field. Those keys (``_DETECTION_EXCLUDE_KEYS``) are passed
+    to the LLM verbatim ON PURPOSE — LOLBin / malware / persistence detection
+    depends on the exact command text, which routinely contains a username
+    (e.g. ``C:\\Users\\jdoe\\...`` or ``runas /user:jdoe``). So this is NOT a
+    guarantee that "no PII ever reaches the LLM"; it is a guarantee that
+    identifiers in structured identity fields are tokenized while
+    detection-bearing text is preserved.
 """
 
 import hashlib
 import ipaddress
 import json
 import re
+import threading
 import structlog
 from typing import Optional
 
@@ -85,6 +103,33 @@ _PHONE_RES = [
     re.compile(r"\b\d{3}[.\s\-]\d{3}[.\s\-]\d{4}\b"),
 ]
 
+# ---------------------------------------------------------------------------
+# Emitted-token grammar (WO-H20)
+#
+# Every prefix ``_tokenize`` can produce. Structural identity leaves emit
+# HOST / USER / INT-IP / OWNER (see the ``_tokenize("…")`` call sites); the
+# free-text PII detectors emit EMAIL / NID / PHONE (the prefixes in
+# ``_redact_free_text``'s ``detector_groups``). Kept as the single source so
+# the pre-claim regex below can never drift from what ``_tokenize`` actually
+# emits. If a new prefix is added, add it here too.
+_IDENTITY_TOKEN_PREFIXES = ("HOST", "USER", "INT-IP", "OWNER")
+_FREE_TEXT_TOKEN_PREFIXES = ("EMAIL", "NID", "PHONE")
+_ALL_TOKEN_PREFIXES = _IDENTITY_TOKEN_PREFIXES + _FREE_TEXT_TOKEN_PREFIXES
+
+# Shape of an already-emitted token: ``PREFIX-<12 lowercase hex>`` (the digest is
+# ``sha256(...).hexdigest()[:12]``). Prefixes are alternated longest-first so the
+# hyphenated ``INT-IP`` cannot be shadowed by a shorter alternative. Used by
+# ``_redact_free_text`` to pre-claim token spans injected by an EARLIER
+# anonymization pass, so no PII detector can re-consume/double-wrap them.
+_TOKEN_SPAN_RE = re.compile(
+    r"(?:"
+    + "|".join(
+        re.escape(p)
+        for p in sorted(_ALL_TOKEN_PREFIXES, key=len, reverse=True)
+    )
+    + r")-[0-9a-f]{12}"
+)
+
 # Keys inside raw alert ``data`` whose STRING leaves are DETECTION-RELEVANT
 # (command lines, file paths, process/image names). Their values are never
 # passed through the PII redactor — guaranteeing structural preservation of
@@ -107,6 +152,52 @@ _DETECTION_EXCLUDE_KEYS = frozenset({
     "processname",
     "scriptblocktext",
     "executable",
+})
+
+
+# Keys inside raw alert ``data`` whose STRING leaf is a HOSTNAME / computer
+# identity — including Windows Security-event and Sysmon field names. Their
+# leaf value is tokenized with the HOST prefix (gated on ``anon_hostnames`` +
+# ``scrub_data_field``). Compared case-insensitively.
+_HOST_IDENTITY_KEYS = frozenset({
+    "workstationname",
+    "computername",
+    "computer",
+    "dnshostname",
+    "hostname",
+    "host",
+    "agent_name",
+    "agentname",
+})
+
+# Keys inside raw alert ``data`` whose STRING leaf is a USERNAME / account
+# identity — including Windows Security-event field names (WO-H10). Their leaf
+# value is tokenized with the USER prefix (gated on ``anon_usernames`` +
+# ``scrub_data_field``). Compared case-insensitively.
+_USER_IDENTITY_KEYS = frozenset({
+    "targetusername",
+    "subjectusername",
+    "samaccountname",
+    "accountname",
+    "account_name",
+    "user",
+    "username",
+    "srcuser",
+    "dstuser",
+    "src_user",
+    "dst_user",
+})
+
+# Keys whose STRING leaf is an IP — tokenized (INT-IP) ONLY when the value is an
+# internal address; external/attacker IPs pass through for IOC correlation.
+_IP_IDENTITY_KEYS = frozenset({
+    "srcip", "dstip", "src_ip", "dst_ip", "ip", "agent_ip", "agentip",
+})
+
+# Sentinel / non-identifying leaf values that are never worth tokenizing.
+_SENTINEL_IDENTITY_VALUES = frozenset({
+    "", "-", "n/a", "na", "unknown", "system", "local service",
+    "network service", "anonymous logon",
 })
 
 
@@ -179,9 +270,16 @@ class AlertAnonymizer:
         else:
             self._salt = configured_salt
 
-        # Bidirectional lookup: token → original, original → token
+        # Bidirectional lookup: token → original, original → token.
+        # WO-H32 QA: ONE shared instance is hit by N parallel triage workers,
+        # so the maps need a lock — writers (_tokenize) mutate under it and
+        # iterating readers take a list() snapshot under it, otherwise a
+        # concurrent insert raises "dictionary changed size during iteration"
+        # mid-deanonymization. Thread-safety ONLY: tokens, redaction, and the
+        # text that reaches the LLM are byte-identical to the unlocked code.
         self._to_token: dict[str, str] = {}
         self._to_original: dict[str, str] = {}
+        self._maps_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -248,8 +346,13 @@ class AlertAnonymizer:
             data = alert["data"]
             if known_values:
                 data = self._scrub_dict(data, known_values)
-            # Redact free-text PII in leaf strings, skipping detection keys.
-            data = self._redact_dict_free_text(data)
+            # WO-H10: tokenize nested Windows identity fields
+            # (TargetUserName/SubjectUserName/WorkstationName/…) AND redact
+            # free-text PII in leaf strings, skipping detection keys. This
+            # supersedes the prior PII-only pass so identifiers the free-text
+            # regexes don't recognise (bare usernames/hostnames) are still
+            # tokenized inside ``data``.
+            data = self._anonymize_node(data)
             alert["data"] = data
 
         # -- Correlated events --
@@ -337,7 +440,12 @@ class AlertAnonymizer:
         """Scrub known tokens from free-text fields (FP reasoning, enrichment summary)."""
         if not self.enabled or not text:
             return text
-        for original, token in self._to_token.items():
+        # Snapshot under the lock (WO-H32: a parallel worker may _tokenize
+        # mid-iteration); insertion order — and therefore replacement order
+        # and output — is identical to iterating the live dict.
+        with self._maps_lock:
+            items = list(self._to_token.items())
+        for original, token in items:
             text = text.replace(original, token)
         return text
 
@@ -345,7 +453,10 @@ class AlertAnonymizer:
         """Restore original values in Claude's response text."""
         if not self.enabled or not text:
             return text
-        for token, original in self._to_original.items():
+        # Snapshot under the lock (WO-H32) — see anonymize_fp_text.
+        with self._maps_lock:
+            items = list(self._to_original.items())
+        for token, original in items:
             text = text.replace(token, original)
         return text
 
@@ -355,9 +466,85 @@ class AlertAnonymizer:
             return d
         return json.loads(self.deanonymize_text(json.dumps(d, default=str)))
 
+    def anonymize_generic(self, obj):
+        """Anonymize an ARBITRARY nested structure (dict / list / str).
+
+        Used by paths whose payload does not fit the ``{alert, enrichment,
+        correlated_events}`` shape — notably the threat-hunt agent's aggregated
+        intelligence context, which the previous implementation sent to the LLM
+        with **zero** anonymization (WO-H10 Fix 1).
+
+        Applies the same boundary as ``anonymize_alert_context``'s ``data``
+        scrubbing: tokenizes hostname/username/internal-IP identity leaves
+        (including nested Windows event fields), redacts free-text PII in the
+        remaining string leaves, and preserves detection-relevant keys
+        (command lines / file paths / process-image names) verbatim. Returns a
+        deep copy — the input is not mutated. Restore with ``deanonymize_dict``
+        / ``deanonymize_text``.
+        """
+        if not self.enabled:
+            return obj
+        return self._anonymize_node(
+            json.loads(json.dumps(obj, default=str)))
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _anonymize_node(self, node, key_lower: Optional[str] = None):
+        """Recursively tokenize identity leaves and redact free-text PII.
+
+        Boundary rules (identical guarantees to the alert-context path):
+          * A leaf under a key in ``_DETECTION_EXCLUDE_KEYS`` is preserved
+            verbatim — the structural guarantee that command lines / file paths
+            / process-image names (which by design carry usernames) reach the
+            LLM unchanged for detection.
+          * A leaf under a hostname / username / internal-IP identity key is
+            tokenized (gated on the matching ``anon_*`` toggle).
+          * Every other string leaf goes through free-text PII redaction
+            (gated on ``free_text_pii``).
+        """
+        if isinstance(node, dict):
+            out = {}
+            for k, v in node.items():
+                kl = str(k).lower()
+                if kl in _DETECTION_EXCLUDE_KEYS:
+                    out[k] = v  # detection-relevant subtree — preserve verbatim
+                else:
+                    out[k] = self._anonymize_node(v, kl)
+            return out
+        if isinstance(node, list):
+            return [self._anonymize_node(item, key_lower) for item in node]
+        if isinstance(node, str):
+            return self._anonymize_identity_or_text(key_lower, node)
+        return node
+
+    def _anonymize_identity_or_text(self, key_lower: Optional[str],
+                                    value: str) -> str:
+        """Tokenize a string leaf if its key marks it as an identity, else
+        redact free-text PII. See ``_anonymize_node`` for the boundary rules."""
+        if not value:
+            return value
+        # Already an emitted token (e.g. a value the earlier ``_scrub_dict``
+        # pass in ``anonymize_alert_context`` replaced with USER-/HOST-/INT-IP-):
+        # never re-tokenize it — double-wrapping would break the reversible
+        # ordered de-anonymization.
+        if value in self._to_original:
+            return value
+        if key_lower in _HOST_IDENTITY_KEYS and self.anon_hostnames:
+            if value.strip().lower() not in _SENTINEL_IDENTITY_VALUES:
+                return self._tokenize("HOST", value)
+            return value
+        if key_lower in _USER_IDENTITY_KEYS and self.anon_usernames:
+            if value.strip().lower() not in _SENTINEL_IDENTITY_VALUES:
+                return self._tokenize("USER", value)
+            return value
+        if key_lower in _IP_IDENTITY_KEYS and self.anon_internal_ips:
+            if self._is_internal_ip(value):
+                return self._tokenize("INT-IP", value)
+            return value  # external IP preserved for IOC correlation
+        # Not an identity leaf → free-text PII redaction only.
+        return self._redact_free_text(value)
 
     def _redact_free_text(self, text: str) -> str:
         """Redact semantic PII (email/phone/national-ID) from a free-text string.
@@ -370,12 +557,23 @@ class AlertAnonymizer:
         ORIGINAL text only. Matches are collected with a fixed priority
         (EMAIL → NATIONAL-ID → PHONE), overlapping candidates are dropped in
         priority order, and tokens are substituted in ONE left-to-right
-        rebuild at the end. Because a detector never sees text that already
-        contains an emitted ``PREFIX-<hex>`` token, no token can be
-        re-consumed/double-wrapped by a later detector (e.g. the IN 12-digit
-        Aadhaar pattern eating an all-numeric digest) — which would otherwise
-        break the ordered de-anonymization replace. This immunity holds for
-        ALL detectors by construction, not just Aadhaar.
+        rebuild at the end. Within this call a detector never sees text that
+        already contains a token it emitted, so no token can be
+        re-consumed/double-wrapped by a LATER detector in the SAME call.
+
+        CROSS-PASS immunity (WO-H20): that single-pass argument does NOT cover
+        tokens injected by an EARLIER pass. The detection rule-fix path composes
+        ``anonymize_generic(anonymize_fp_text(xml))``, so this method routinely
+        runs over text that already carries ``PREFIX-<hex>`` tokens from the
+        ``anonymize_fp_text`` pass. If such a token's 12-hex digest happens to be
+        all-decimal with a leading 2-9 (≈1/346 tokens), the IN Aadhaar-12
+        detector would re-match the digest and re-wrap it as ``…-NID-<hex>``,
+        breaking ``deanonymize_text``. To prevent this, we pre-claim the spans of
+        any already-emitted tokens BEFORE the detector loop; the existing
+        ``_overlaps`` machinery then makes every PII detector skip them. These
+        spans are only PROTECTED — never re-tokenized (they are already tokens).
+        Genuine PII in real free text (an actual Aadhaar/SSN/email/phone that is
+        NOT part of a token) is unaffected and still redacted.
         """
         if not self.enabled or not self.free_text_pii or not text:
             return text
@@ -394,6 +592,25 @@ class AlertAnonymizer:
 
         def _overlaps(s: int, e: int) -> bool:
             return any(not (e <= cs or s >= ce) for cs, ce in claimed)
+
+        # WO-H20: pre-claim spans of tokens THIS instance actually emitted in an
+        # earlier anonymize_fp_text / anonymize_generic pass. Seeding them into
+        # ``claimed`` — before any detector runs — makes every PII detector skip
+        # them via ``_overlaps``, so a token's all-decimal digest can never be
+        # re-matched (e.g. by the Aadhaar-12 pattern) and double-wrapped, which
+        # would break the reversible de-anonymization. They are protected only,
+        # not re-tokenized.
+        #
+        # The ``in self._to_original`` gate is load-bearing: because decimal
+        # digits are valid hex, a REAL 12-digit Aadhaar wearing a prefix costume
+        # in the ORIGINAL free text (e.g. ``NID-234567890123``) is token-SHAPED
+        # but was never emitted by this instance, so it is NOT in ``_to_original``
+        # and MUST fall through to normal redaction. Only genuinely-emitted
+        # tokens are immune — that is exactly the cross-pass case (the offending
+        # token came from this same instance's earlier pass).
+        for tok_m in _TOKEN_SPAN_RE.finditer(text):
+            if tok_m.group(0) in self._to_original:
+                claimed.append((tok_m.start(), tok_m.end()))
 
         matches: list[tuple[int, int, str, str]] = []  # (start, end, prefix, value)
         for prefix, regexes in detector_groups:
@@ -458,8 +675,9 @@ class AlertAnonymizer:
         ).hexdigest()[:12]
         token = f"{prefix}-{digest}"
 
-        self._to_token[value] = token
-        self._to_original[token] = value
+        with self._maps_lock:  # WO-H32: guard against snapshotting readers
+            self._to_token[value] = token
+            self._to_original[token] = value
 
         # Persist to Postgres for audit/correlation lookup
         if self.db is not None:

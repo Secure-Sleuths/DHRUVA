@@ -12,13 +12,29 @@
  * Team by default). A real JWT + `GET /api/license/tier-info` take over when
  * present.
  */
+import { Suspense } from "react";
 import { AuthProvider } from "@/lib/auth";
 import { AppShell } from "@/components/shell/AppShell";
 
 export default function DashboardPage() {
   return (
     <AuthProvider>
-      <AppShell />
+      {/*
+        AppShell reads navigation state from the URL via `useSearchParams`
+        (WO-H22). Under Next's static export (`output: export`) any component
+        using `useSearchParams` must sit inside a Suspense boundary, so the page
+        can prerender the fallback and hydrate the real query string on the
+        client. The shell has its own loading placeholders once mounted.
+      */}
+      <Suspense
+        fallback={
+          <div className="flex min-h-screen items-center justify-center bg-bg text-dim">
+            Loading…
+          </div>
+        }
+      >
+        <AppShell />
+      </Suspense>
     </AuthProvider>
   );
 }

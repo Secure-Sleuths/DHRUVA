@@ -646,10 +646,22 @@ class TimeContextEnricher:
 class VulnerabilityContextEnricher:
     """Amplify the risk score with the affected host's vuln + SCA posture.
 
-    For the alert's ``agent_id`` this fetches the host's vulnerabilities and
-    SCA (CIS) check results via the tenant-scoped Wazuh client and emits a
-    bounded ``vuln_context_multiplier`` plus a human-readable
-    ``vuln_context_reason``.
+    For the alert's ``agent_id`` this fetches the host's vulnerabilities from
+    the Wazuh vulnerability STATE index in OpenSearch
+    (``wazuh-states-vulnerabilities-*``) and the host's SCA (CIS) check results
+    from the tenant-scoped Wazuh Manager client, and emits a bounded
+    ``vuln_context_multiplier`` plus a human-readable ``vuln_context_reason``.
+
+    WHY OPENSEARCH FOR VULNS (WO-H11): the Wazuh Manager API endpoint
+    ``GET /vulnerability/{agent}`` was REMOVED in Wazuh 4.8+ — it 404s, so the
+    old ``client.get_agent_vulnerabilities()`` fetch silently returned nothing
+    and the entire vuln-context signal was dead on modern Wazuh. Vuln data now
+    lives one-doc-per-package-CVE in ``wazuh-states-vulnerabilities-<cluster>``
+    with an ECS-nested ``_source`` (``agent.id``, ``vulnerability.id`` = CVE,
+    ``vulnerability.severity`` capitalized, ``package.*``). The parsing helpers
+    ``_severity``/``_cve_id`` already read that nested shape, so only the FETCH
+    SOURCE moved — the scoring/multiplier logic is unchanged. SCA still uses the
+    Manager client (its ``/sca/{agent}`` endpoint is unaffected).
 
     SHARPEN, NEVER MANUFACTURE: because the score is multiplicative the
     multiplier only amplifies an already-present signal — a low-base benign
@@ -657,11 +669,20 @@ class VulnerabilityContextEnricher:
     product is capped so even the most-vulnerable host cannot push a benign
     alert across the escalation/HIGH band on vuln context alone.
 
+    TENANT ISOLATION (security-critical): the Wazuh vuln state index carries no
+    ``client_id``, so — exactly like the alert-read path in
+    ``EnrichmentService.process_batch`` — tenant isolation is enforced by
+    restricting the query's ``agent.id`` to the SET of agents mapped to the
+    caller's tenant (``db.get_tenant_agent_ids``), in addition to the alert's
+    own ``agent_id``. No tenant context / multi-tenant-with-no-registry / a
+    tenant with no agent mapping all fail CLOSED (fetch nothing → multiplier
+    1.0); a wrong tenant's vulns can never reach another tenant's triage.
+
     DEFENSE-IN-DEPTH: vuln context is an additive scoring enhancement, not a
     security control.  Every failure path (no client, missing agent_id, fetch
-    error, and crucially the M2 fail-closed ``TenantConfigUnavailable``)
-    degrades to multiplier 1.0 and is logged — ``enrich`` never raises, so it
-    can never block the triage/enrichment cycle.
+    error, absent index, and crucially the M2 fail-closed
+    ``TenantConfigUnavailable``) degrades to multiplier 1.0 and is logged —
+    ``enrich`` never raises, so it can never block the triage/enrichment cycle.
     """
 
     # Bounded magnitudes. Kept modest so they sharpen rather than manufacture.
@@ -672,9 +693,21 @@ class VulnerabilityContextEnricher:
     DEFAULT_MAX_MULT = 1.8
     # Min number of failed SCA checks before the SCA factor engages.
     DEFAULT_SCA_FAILED_THRESHOLD = 1
+    # Wazuh 4.x vulnerability STATE index (one doc per package-CVE). Wildcard
+    # spans the per-cluster suffix (``wazuh-states-vulnerabilities-<cluster>``).
+    VULN_INDEX = "wazuh-states-vulnerabilities-*"
+    # Size cap on the per-host vuln fetch. A host with more open CVEs than this
+    # is already maximally "critical" for scoring purposes, so the cap is safe.
+    DEFAULT_VULN_FETCH_SIZE = 500
+
+    # WO-H23: cap on the per-host CVE detail list (CVSS/EPSS/KEV). Aligned with
+    # the existing ``top_critical_cves`` cap so the two stay 1:1.
+    TOP_CVE_DETAIL_MAX = 3
 
     def __init__(self, config: dict, tenant_registry=None, wazuh_client=None,
-                 registry_provider=None, wazuh_provider=None):
+                 registry_provider=None, wazuh_provider=None,
+                 opensearch_client=None, opensearch_provider=None,
+                 db=None, db_provider=None):
         cfg = config or {}
         self.enabled = cfg.get("enabled", True)
         self.critical_mult = float(cfg.get("critical_multiplier",
@@ -687,15 +720,29 @@ class VulnerabilityContextEnricher:
                                       self.DEFAULT_MAX_MULT))
         self.sca_failed_threshold = int(cfg.get("sca_failed_threshold",
                                                 self.DEFAULT_SCA_FAILED_THRESHOLD))
+        self.vuln_fetch_size = int(cfg.get("vuln_fetch_size",
+                                           self.DEFAULT_VULN_FETCH_SIZE))
         self.cache_ttl = int(cfg.get("cache_ttl", 300))
         # Direct references (used in tests / single-tenant) ...
         self._tenant_registry = tenant_registry
         self._wazuh = wazuh_client
+        # OpenSearch handle for the vuln STATE-index fetch (WO-H11). This is the
+        # SAME shared indexer client the alert-read path uses; tenant isolation
+        # is by agent.id scoping, not a per-tenant OpenSearch connection.
+        self._opensearch = opensearch_client
         # ... plus optional late-binding providers so the owning service can
         # expose a registry/client that is wired AFTER this enricher is built
         # (main.py sets service._tenant_registry post-construction).
         self._registry_provider = registry_provider
         self._wazuh_provider = wazuh_provider
+        self._opensearch_provider = opensearch_provider
+        # WO-H23: optional platform DB handle for per-CVE EPSS/KEV lookups
+        # against the local ``threat_intel_cve`` table (populated by the CISA
+        # KEV + EPSS collectors). CVE metadata is GLOBAL public reference data
+        # (no tenant column), so this lookup is not tenant-scoped and cannot
+        # leak another tenant's data. Best-effort: absent db → CVSS-only detail.
+        self._db = db
+        self._db_provider = db_provider
         # Short-lived per-agent cache: (tenant_id, agent_id) -> enrichment dict
         self._cache = TTLCache(maxsize=2000, ttl=max(1, self.cache_ttl))
 
@@ -708,6 +755,8 @@ class VulnerabilityContextEnricher:
             "host_top_critical_cves": [],
             "vuln_context_multiplier": 1.0,
             "vuln_context_reason": "",
+            # WO-H23 finding-level detail (display-only): per-CVE CVSS/EPSS/KEV.
+            "host_top_cve_details": [],
         }
 
     def _resolve_client(self):
@@ -749,6 +798,105 @@ class VulnerabilityContextEnricher:
             wazuh = self._wazuh_provider()
         return wazuh, None
 
+    def _resolve_vuln_scope(self, tenant_id):
+        """Resolve ``(opensearch_client, allowed_agent_ids)`` for the vuln fetch.
+
+        The OpenSearch handle is the shared indexer client — the SAME one the
+        alert-read path (``EnrichmentService.process_batch``) uses. The Wazuh
+        vuln STATE index carries no ``client_id``, so tenant isolation is by
+        restricting ``agent.id`` to the tenant's mapped agents:
+
+          * ``tenant_id is None`` (genuine single-tenant, per ``_resolve_client``)
+            → no agent restriction (``allowed_agent_ids=None``).
+          * multi-tenant tenant → restrict to ``db.get_tenant_agent_ids(tenant)``.
+            A ``None`` mapping (no agents configured) or an unresolvable
+            registry/db degrades to an EMPTY allow-set — the fetch then matches
+            nothing (fail closed), never the whole index. This mirrors
+            ``process_batch``'s ``allowed_agents is None → terms: []`` rule.
+
+        Only reached once ``_resolve_client`` has already established a usable,
+        tenant-appropriate context (its ``None`` client short-circuits ``enrich``
+        before this runs), so the tenant gate itself is enforced upstream.
+        """
+        os_client = self._opensearch
+        if os_client is None and self._opensearch_provider is not None:
+            os_client = self._opensearch_provider()
+
+        if tenant_id is None:
+            # Single-tenant: shared OpenSearch, no per-agent restriction.
+            return os_client, None
+
+        registry = self._tenant_registry
+        if registry is None and self._registry_provider is not None:
+            registry = self._registry_provider()
+
+        allowed = None
+        db = getattr(registry, "db", None) if registry is not None else None
+        if db is not None:
+            try:
+                allowed = db.get_tenant_agent_ids(tenant_id)
+            except Exception as e:
+                logger.warning("vuln_context_agent_scope_failed",
+                               tenant_id=tenant_id, error=str(e)[:200])
+                allowed = None
+        # Fail CLOSED: no mapping / unresolvable db → empty scope → fetch
+        # nothing, rather than the whole (cross-tenant) index.
+        if allowed is None:
+            allowed = []
+        return os_client, allowed
+
+    @staticmethod
+    def _is_index_absent(exc: Exception) -> bool:
+        """True if ``exc`` indicates the vuln STATE index does not exist.
+
+        Distinguishes a genuinely-absent index (fresh cluster / vuln detector
+        disabled) — which is a benign "no data" condition — from a real
+        OpenSearch fault. Defensive across opensearch-py versions: checks the
+        HTTP ``status_code`` (404) and the exception text for the OpenSearch
+        ``index_not_found_exception`` marker.
+        """
+        if getattr(exc, "status_code", None) == 404:
+            return True
+        text = str(exc).lower()
+        return "index_not_found" in text or "no such index" in text
+
+    def _fetch_vulns(self, os_client, agent_id, allowed_agent_ids) -> list:
+        """Fetch the host's vuln STATE docs (raw ``_source``) from OpenSearch.
+
+        Query: ``term agent.id == <agent_id>`` (the alert's host), AND — when a
+        tenant scope is supplied — ``terms agent.id in <allowed_agent_ids>`` so
+        a spoofed/foreign ``agent_id`` cannot pull another tenant's vulns. Size
+        bounded by ``vuln_fetch_size``. Returns the raw ``_source`` dicts so the
+        existing ``_severity``/``_cve_id`` parsing consumes them unchanged.
+
+        Fail-safe & self-observable: an absent index logs ``vuln_context_index_absent``
+        and returns ``[]`` (so SCA can still run); any other OpenSearch fault
+        propagates to ``enrich``'s handler (→ multiplier 1.0). "No vulns found"
+        is logged distinctly from "index absent" so the signal can't silently die.
+        """
+        if os_client is None:
+            logger.debug("vuln_context_no_opensearch", agent_id=str(agent_id))
+            return []
+        must = [{"term": {"agent.id": str(agent_id)}}]
+        if allowed_agent_ids is not None:
+            must.append(
+                {"terms": {"agent.id": [str(a) for a in allowed_agent_ids]}})
+        body = {"query": {"bool": {"must": must}}}
+        try:
+            result = os_client.client.search(
+                index=self.VULN_INDEX, body=body, size=self.vuln_fetch_size)
+        except Exception as e:
+            if self._is_index_absent(e):
+                logger.info("vuln_context_index_absent",
+                            index=self.VULN_INDEX, agent_id=str(agent_id))
+                return []
+            raise
+        hits = (result or {}).get("hits", {}).get("hits", [])
+        if not hits:
+            logger.debug("vuln_context_no_vulns_for_host",
+                         agent_id=str(agent_id))
+        return [h.get("_source", {}) for h in hits]
+
     @staticmethod
     def _severity(vuln: dict) -> str:
         """Extract a normalized lowercase severity from a Wazuh vuln item."""
@@ -763,6 +911,106 @@ class VulnerabilityContextEnricher:
         if not cid:
             cid = vuln.get("cve") or vuln.get("id")
         return str(cid or "")
+
+    @staticmethod
+    def _cvss(vuln: dict) -> tuple:
+        """Extract ``(cvss_base, cvss_version)`` from a Wazuh vuln STATE doc.
+
+        Wazuh 4.x nests this under ``vulnerability.score`` (``base`` +
+        ``version``); flatter shapes are tolerated as a fallback. Returns
+        ``(None, None)`` when nothing parseable is present — the case view then
+        shows an honest absent state rather than a fabricated 0.0. WO-H23."""
+        score = (vuln.get("vulnerability", {}) or {}).get("score")
+        base = None
+        version = None
+        if isinstance(score, dict):
+            base = score.get("base")
+            version = score.get("version")
+        if base is None:
+            base = vuln.get("cvss") or vuln.get("cvss_score")
+        try:
+            base = float(base) if base is not None else None
+        except (TypeError, ValueError):
+            base = None
+        return base, (str(version) if version else None)
+
+    def _resolve_db(self):
+        """Resolve the platform DB handle for per-CVE EPSS/KEV lookups (or
+        None). Never raises."""
+        db = self._db
+        if db is None and self._db_provider is not None:
+            try:
+                db = self._db_provider()
+            except Exception:
+                db = None
+        return db
+
+    @staticmethod
+    def _kev_catalog_populated(db) -> bool:
+        """Has the CISA-KEV feed EVER populated the local catalog? (WO-H23)
+
+        On a fresh install / Community box the KEV feed may not have cycled yet,
+        so a CVE's ``in_cisa_kev = 0`` is NOT trustworthy as "not in KEV" — it's
+        UNKNOWN. This distinguishes the two: only when the catalog has at least
+        one KEV entry is a ``0`` flag a genuine known-negative. Fail-safe: no db
+        / query error → ``False`` (treat KEV status as unknown, never a false
+        negative)."""
+        if db is None:
+            return False
+        try:
+            return bool(db.get_kev_cves(limit=1))
+        except Exception as e:
+            logger.debug("vuln_context_kev_catalog_check_failed",
+                         error=str(e)[:200])
+            return False
+
+    def _cve_intel(self, db, cve_id: str, kev_available: bool) -> dict:
+        """EPSS/KEV for a CVE from the local ``threat_intel_cve`` table (WO-H23).
+
+        Fail-safe & NEVER-FABRICATE: no db handle / CVE not in the table / any
+        query error → ``{}`` (the case view shows an honest absent/unknown state,
+        never a guessed score). ``epss`` is included only when the row carries a
+        real value. CVE metadata is global public reference data (no tenant
+        column) — not a tenant leak.
+
+        KEV is TRI-STATE and honest about "unknown":
+          * ``kev = True``  → the CVE is genuinely in CISA KEV.
+          * ``kev = False`` → the KEV catalog IS populated but this CVE is not in
+            it (a real known-negative).
+          * ``kev`` KEY OMITTED → we cannot tell (no CVE row, or the KEV catalog
+            is empty/unpopulated). The UI renders this as "KEV data unavailable",
+            NOT "not in KEV".
+        """
+        if not cve_id or db is None:
+            return {}
+        try:
+            row = db.lookup_cve(cve_id)
+        except Exception as e:
+            logger.debug("vuln_context_cve_intel_failed",
+                         cve=cve_id, error=str(e)[:200])
+            return {}
+        if not isinstance(row, dict):
+            return {}
+        out: dict = {}
+        epss = row.get("epss_score")
+        if epss is not None:
+            try:
+                out["epss"] = float(epss)
+            except (TypeError, ValueError):
+                pass
+        pct = row.get("epss_percentile")
+        if pct is not None:
+            try:
+                out["epss_percentile"] = float(pct)
+            except (TypeError, ValueError):
+                pass
+        if row.get("in_cisa_kev"):
+            out["kev"] = True
+        elif kev_available:
+            # Row exists + the KEV catalog is populated → a genuine not-in-KEV.
+            out["kev"] = False
+        # else: KEV status unknown → omit the key (UI shows "unavailable").
+        return out
 
     def enrich(self, alert: dict) -> dict:
         """Add host vuln/SCA context. Never raises."""
@@ -800,8 +1048,15 @@ class VulnerabilityContextEnricher:
         if cache_key in self._cache:
             return dict(self._cache[cache_key])
 
+        # Resolve the OpenSearch handle + tenant agent-scope for the vuln fetch
+        # (WO-H11). ``client`` (the tenant-scoped Wazuh Manager client) is still
+        # used for the SCA path below. ``tenant_id`` was established by
+        # ``_resolve_client`` above and drives the agent-id isolation scope.
+        os_client, allowed_agent_ids = self._resolve_vuln_scope(tenant_id)
+
         try:
-            result = self._compute(client, agent_id)
+            result = self._compute(os_client, client, agent_id,
+                                   allowed_agent_ids)
         except Exception as e:
             logger.warning("vuln_context_fetch_failed",
                            tenant_id=tenant_id,
@@ -812,35 +1067,64 @@ class VulnerabilityContextEnricher:
         self._cache[cache_key] = dict(result)
         return result
 
-    def _compute(self, client, agent_id) -> dict:
-        """Fetch vulns + SCA and build the bounded multiplier + reason."""
+    def _compute(self, os_client, sca_client, agent_id,
+                 allowed_agent_ids=None) -> dict:
+        """Fetch vulns (OpenSearch) + SCA (Wazuh) and build the multiplier.
+
+        Vulnerabilities come from the Wazuh vuln STATE index in OpenSearch
+        (WO-H11), scoped to ``agent_id`` and the tenant's ``allowed_agent_ids``.
+        SCA still comes from the Wazuh Manager client (``sca_client``) whose
+        ``/sca/{agent}`` endpoint is unaffected by the 4.8 vuln-endpoint removal.
+        """
         enrichment = self._empty()
 
-        vulns = client.get_agent_vulnerabilities(agent_id) or []
+        # WO-H23: resolve the CVE-intel db + whether the KEV catalog is populated
+        # ONCE per host (not per CVE), so the KEV tri-state is honest and cheap.
+        cve_db = self._resolve_db()
+        kev_available = self._kev_catalog_populated(cve_db)
+
+        vulns = self._fetch_vulns(os_client, agent_id, allowed_agent_ids) or []
         critical = 0
         high = 0
         top_critical_cves: list[str] = []
+        top_cve_details: list[dict] = []
         for v in vulns:
             sev = self._severity(v)
             if sev == "critical":
                 critical += 1
                 cid = self._cve_id(v)
-                if cid and cid not in top_critical_cves and len(top_critical_cves) < 3:
+                if (cid and cid not in top_critical_cves
+                        and len(top_critical_cves) < self.TOP_CVE_DETAIL_MAX):
                     top_critical_cves.append(cid)
+                    # WO-H23: attach per-CVE CVSS (from the Wazuh doc) + EPSS/KEV
+                    # (from the local CVE TI table). Missing fields are simply
+                    # absent — never fabricated; KEV is tri-state (see
+                    # _cve_intel: true / false / unknown-omitted).
+                    cvss_base, cvss_version = self._cvss(v)
+                    detail: dict = {"cve": cid, "severity": "critical"}
+                    if cvss_base is not None:
+                        detail["cvss"] = cvss_base
+                    if cvss_version:
+                        detail["cvss_version"] = cvss_version
+                    detail.update(self._cve_intel(cve_db, cid, kev_available))
+                    top_cve_details.append(detail)
             elif sev == "high":
                 high += 1
 
-        # SCA failed checks across all policies on the host.
+        # SCA failed checks across all policies on the host. Still served by the
+        # Wazuh Manager client (``/sca/{agent}`` is unaffected by the 4.8 vuln-
+        # endpoint removal); best-effort — the vuln signal alone still counts.
         failed_sca = 0
         try:
-            policies = client.get_sca_list(agent_id) or []
-            for pol in policies:
-                pol_id = pol.get("policy_id") or pol.get("id")
-                if not pol_id:
-                    continue
-                failed = client.get_sca_checks(
-                    agent_id, pol_id, result_filter="failed") or []
-                failed_sca += len(failed)
+            if sca_client is not None:
+                policies = sca_client.get_sca_list(agent_id) or []
+                for pol in policies:
+                    pol_id = pol.get("policy_id") or pol.get("id")
+                    if not pol_id:
+                        continue
+                    failed = sca_client.get_sca_checks(
+                        agent_id, pol_id, result_filter="failed") or []
+                    failed_sca += len(failed)
         except Exception as e:
             # SCA is best-effort; vuln signal alone still counts.
             logger.debug("vuln_context_sca_partial", agent_id=agent_id,
@@ -873,6 +1157,12 @@ class VulnerabilityContextEnricher:
             "host_top_critical_cves": top_critical_cves,
             "vuln_context_multiplier": mult,
             "vuln_context_reason": " + ".join(reasons) if reasons else "",
+            # WO-H23 finding-level detail (display-only): per-CVE CVSS/EPSS/KEV.
+            # Excluded from the triage/hunt prompts; on the detection-prompt path
+            # it egresses only through anonymize_fp_text (CVE ids/scores carry no
+            # client identifier). See _ti_match_summary in triage_agent for the
+            # full boundary note.
+            "host_top_cve_details": top_cve_details,
         })
         return enrichment
 
@@ -925,6 +1215,25 @@ class HostIntegrityContextEnricher:
     DEFAULT_MAX_MULT = 1.5
     DEFAULT_CACHE_TTL = 300
 
+    # WO-H23 finding-level detail (DISPLAY-ONLY): the specific rootcheck
+    # signatures + recently-changed FIM paths behind the counts. Capped +
+    # truncated so the persisted blob stays bounded. Primary purpose is the
+    # analyst case view (deanonymized-to-the-viewer, like WO-H21's raw event).
+    #
+    # LLM boundary (honest): these keys are NOT in build_triage_prompt's fixed
+    # enrichment allowlist and NOT in build_hunt_prompt's projection, so they
+    # never reach the triage/hunt LLM. They DO, however, land in the persisted
+    # ``enrichment_summary`` blob, which build_detection_prompt serializes whole
+    # (json.dumps → truncated to 300 chars) and passes through
+    # ``anonymize_fp_text`` — so a FIM path / rootcheck signature CAN egress to
+    # the DETECTION LLM, but only after anonymization tokenizes registered
+    # client identifiers. Per _DETECTION_EXCLUDE_KEYS this is the documented
+    # detection posture (file-path/command free-text is verbatim-by-design;
+    # only REGISTERED identifiers are tokenized), unchanged by WO-H23.
+    SIGNATURE_MAX = 8
+    SIGNATURE_TRUNC = 200
+    FIM_PATH_MAX = 12
+
     def __init__(self, config: dict, tenant_registry=None, wazuh_client=None,
                  registry_provider=None, wazuh_provider=None):
         cfg = config or {}
@@ -958,6 +1267,9 @@ class HostIntegrityContextEnricher:
             "host_fim_recent_changes": 0,
             "host_integrity_multiplier": 1.0,
             "host_integrity_reason": "",
+            # WO-H23 finding-level detail (display-only, empty when no signal).
+            "host_rootcheck_signatures": [],
+            "host_fim_changed_paths": [],
         }
 
     def _resolve_client(self):
@@ -1031,6 +1343,20 @@ class HostIntegrityContextEnricher:
             if any(marker in text for marker in cls._SCAN_CONTROL_MARKERS):
                 return True
         return False
+
+    @staticmethod
+    def _finding_signature(item: dict) -> str:
+        """The human-readable signature text of a rootcheck finding (WO-H23).
+
+        Prefers the concise descriptive fields (``title``/``event``/
+        ``description``) over the verbose ``log`` line. Fail-safe to "" when the
+        item carries no recognizable text field. DISPLAY-ONLY — never fed to an
+        LLM."""
+        for field in ("title", "event", "description", "log"):
+            val = item.get(field)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return ""
 
     @classmethod
     def _is_open_finding(cls, item: dict) -> bool:
@@ -1149,8 +1475,17 @@ class HostIntegrityContextEnricher:
 
         # --- Rootcheck (PRIMARY driver) ---
         rootcheck = client.get_agent_rootcheck(agent_id) or []
-        open_findings = sum(1 for item in rootcheck
-                            if isinstance(item, dict) and self._is_open_finding(item))
+        open_findings = 0
+        rootcheck_signatures: list[str] = []
+        for item in rootcheck:
+            if not isinstance(item, dict) or not self._is_open_finding(item):
+                continue
+            open_findings += 1
+            # WO-H23: capture the specific finding signature (display-only).
+            if len(rootcheck_signatures) < self.SIGNATURE_MAX:
+                sig = self._finding_signature(item)
+                if sig:
+                    rootcheck_signatures.append(sig[:self.SIGNATURE_TRUNC])
 
         # --- FIM/syscheck (SECONDARY, thresholded, recency-gated) ---
         # Raw FIM volume must NOT amplify — FIM is noisy. Count only RECENT
@@ -1158,12 +1493,17 @@ class HostIntegrityContextEnricher:
         syscheck = client.get_agent_syscheck(agent_id) or []
         cutoff = datetime.now(timezone.utc) - timedelta(hours=self.fim_recency_hours)
         recent_changes = 0
+        fim_changed_paths: list[str] = []
         for item in syscheck:
             if not isinstance(item, dict):
                 continue
             ts = self._change_time(item)
             if ts is not None and ts >= cutoff:
                 recent_changes += 1
+                # WO-H23: capture the specific changed file path (display-only).
+                path = item.get("file") or item.get("path")
+                if path and len(fim_changed_paths) < self.FIM_PATH_MAX:
+                    fim_changed_paths.append(str(path))
 
         # --- Build the bounded multiplier — multiply engaged factors, then cap ---
         mult = 1.0
@@ -1190,5 +1530,10 @@ class HostIntegrityContextEnricher:
             "host_fim_recent_changes": recent_changes,
             "host_integrity_multiplier": mult,
             "host_integrity_reason": "; ".join(reasons) if reasons else "",
+            # WO-H23 finding-level detail (display-only; excluded from the
+            # triage/hunt prompts, anonymized on the detection-prompt path —
+            # see the SIGNATURE_MAX comment above).
+            "host_rootcheck_signatures": rootcheck_signatures,
+            "host_fim_changed_paths": fim_changed_paths,
         })
         return enrichment

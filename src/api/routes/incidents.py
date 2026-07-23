@@ -159,6 +159,11 @@ async def get_incident_detail(
         alert["anonymized_fields"] = anonymized_fields_for(alert)
     incident["alerts"] = alerts
     incident["timeline"] = _db.get_incident_timeline(incident_id)
+    # WO-H17: expose the CURRENT effective-verdict mix of the member decisions
+    # (human_verdict when set, else AI verdict) so the case view can render
+    # "N alerts: X FP, Y TP, Z open" reflecting human overrides, not a stale
+    # snapshot. Additive to the response; tenant-scoped inside the store.
+    incident["verdict_mix"] = _db.get_incident_verdict_mix(incident_id)
     logger.info("incident_detail_served", incident_id=incident_id,
                 alert_count=len(alerts))
     return incident
@@ -168,10 +173,44 @@ async def get_incident_detail(
 @limiter.limit("30/minute")
 async def assign_incident(
     request: Request, incident_id: str, body: IncidentAssignRequest,
-    user: dict = Depends(require_role("admin", "senior_analyst")),
+    user: dict = Depends(require_role("admin", "senior_analyst", "analyst")),
 ):
-    """Assign an incident to an analyst."""
+    """Assign an incident to an analyst.
+
+    WO-H24: opened to `analyst` for SELF-CLAIM of UNOWNED work ONLY. A plain
+    `analyst` may assign an incident to THEMSELVES (`assigned_to == own
+    username`) AND only when the incident is currently unowned (or already
+    theirs — a harmless re-claim). Assigning to ANY OTHER user, or self-claiming
+    a case already owned by a colleague, stays senior_analyst+ (403 otherwise).
+    admin / senior_analyst / mssp_admin keep full assign/reassign-anyone
+    behavior. Everything else (target-user existence/active checks, SLA
+    first-response, notifications, audit log) is unchanged.
+    """
     _db = get_db()
+    role = user.get("role", "")
+    actor = user.get("sub", "unknown")
+    is_privileged = role in ("mssp_admin", "admin", "senior_analyst")
+    if not is_privileged:
+        # Self-only: a plain `analyst` may only name themselves as the assignee.
+        if body.assigned_to != actor:
+            raise HTTPException(
+                status_code=403,
+                detail="Analysts can only self-claim an incident "
+                       "(assign it to themselves); assigning to another user "
+                       "requires a senior analyst.",
+            )
+        # Unowned-only: an analyst may claim work that is unassigned, or re-claim
+        # one already theirs, but NOT pull a colleague's owned case. Checked
+        # BEFORE any write so a denied claim never partially assigns.
+        incident = _db.get_incident(incident_id)
+        if not incident:
+            raise HTTPException(status_code=404, detail="Incident not found")
+        current_owner = incident.get("assigned_to") or ""
+        if current_owner and current_owner != actor:
+            raise HTTPException(
+                status_code=403,
+                detail="Analysts can only claim unowned incidents",
+            )
     # Verify the target user exists and is active.
     # allow_unscoped=True so MSSP admins / env-seeded admins without a
     # tenant in their JWT can still resolve users (username is globally
@@ -182,7 +221,6 @@ async def assign_incident(
     if not target_user.get("is_active"):
         raise HTTPException(status_code=400, detail=f"User '{body.assigned_to}' is inactive")
     _notifications = get_notifications()
-    actor = user.get("sub", "unknown")
     _db.assign_incident(incident_id, body.assigned_to, actor=actor)
     # Record first response for SLA tracking
     _sla = get_sla_manager()
@@ -489,9 +527,15 @@ async def merge_incidents(
 @limiter.limit("10/minute")
 async def escalate_incident_tier(
     request: Request, incident_id: str,
-    user: dict = Depends(require_role("admin", "senior_analyst")),
+    user: dict = Depends(require_role("admin", "senior_analyst", "analyst")),
 ):
-    """Escalate an incident to a higher tier (L1->L2, L2->L3)."""
+    """Escalate an incident to a higher tier (L1->L2, L2->L3).
+
+    WO-H24: opened to `analyst` so an L1 is a real operator — an analyst who
+    cannot resolve a case can hand it up-tier with context. The L2/L3 tier
+    validation, the SLA escalation record, and the audit log are unchanged;
+    only the role gate widened. Active response is NOT loosened by this.
+    """
     _db = get_db()
     _sla = get_sla_manager()
     incident = _db.get_incident(incident_id)

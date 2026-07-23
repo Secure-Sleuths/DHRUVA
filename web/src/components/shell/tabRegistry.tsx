@@ -4,6 +4,7 @@ import { AdminTab } from "./tabs/AdminTab";
 import { AgentGroupsTab } from "./tabs/AgentGroupsTab";
 import { ClosedLoopTab } from "./tabs/ClosedLoopTab";
 import { DailyReviewTab } from "./tabs/DailyReviewTab";
+import { DecisionCacheTab } from "./tabs/DecisionCacheTab";
 import { DetectionTab } from "./tabs/DetectionTab";
 import { HostIntegrityTab } from "./tabs/HostIntegrityTab";
 import { HuntTab } from "./tabs/HuntTab";
@@ -71,6 +72,7 @@ export const TAB_COMPONENTS: Record<string, ComponentType<TabProps>> = {
   threatintel: ThreatIntelTab, // IoC corpus + feed health + CVE/KEV
   fim: HostIntegrityTab, // FIM / rootcheck / registry + host vulnerabilities
   metrics: MetricsTab, // SOC KPIs (MTTD/MTTA/MTTR/SLA/auto-close)
+  decisioncache: DecisionCacheTab, // WO-H57 persistent verdict cache governance
   admin: AdminTab, // users + license + tenants
   // WO-U9b (batch 2) — READ-ONLY response + workflow surfaces:
   soar: SoarTab, // SOAR playbooks + recent executions (no run/approve)

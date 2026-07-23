@@ -652,6 +652,43 @@ class UpdateAssetRequest(BaseModel):
         return [sanitize_user_text(item.strip(), max_len=100) for item in v[:20]]
 
 
+# WO-H57 — verdicts an admin may set on a cached entry. Kept to BENIGN /
+# non-escalating dispositions: the cache is only ever consulted for
+# dedup-eligible (non-escalate) alerts, so an edit here can never turn into a
+# suppression of an escalate-eligible alert.
+ALLOWED_CACHE_VERDICTS = frozenset({
+    "auto_close", "false_positive", "benign", "needs_investigation",
+    "closed", "resolved",
+})
+
+
+class UpdateDecisionCacheRequest(BaseModel):
+    """Edit a persistent decision-cache entry (WO-H57 Decision Cache tab).
+
+    ``enabled=false`` stops reuse (the next matching alert goes back to the LLM);
+    ``verdict`` / ``reasoning`` let an analyst downgrade or annotate a cached
+    call. Delete is a separate endpoint.
+    """
+    enabled: Optional[bool] = None
+    verdict: Optional[str] = None
+    reasoning: Optional[str] = None
+
+    @field_validator("verdict")
+    @classmethod
+    def validate_verdict(cls, v):
+        if v is not None and v.lower() not in ALLOWED_CACHE_VERDICTS:
+            raise ValueError(
+                f"verdict must be one of {sorted(ALLOWED_CACHE_VERDICTS)}")
+        return v.lower() if v is not None else v
+
+    @field_validator("reasoning")
+    @classmethod
+    def validate_reasoning(cls, v):
+        if v is None:
+            return v
+        return sanitize_user_text(v.strip(), max_len=2000)
+
+
 class CreateIdentityRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=128)
     risk_level: str = "standard"

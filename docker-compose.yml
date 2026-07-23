@@ -36,6 +36,13 @@ services:
     container_name: dhruva-postgres
     restart: unless-stopped
     environment:
+      # NOTE (WO-H12 / RLS): the postgres entrypoint creates POSTGRES_USER as a
+      # SUPERUSER, and superusers BYPASS Row-Level Security. If DHRUVA connects
+      # as this role, the RLS tenant backstop (migration 0006) is silently
+      # inactive. For RLS to take effect on the bundled DB, provision a separate
+      # NON-superuser app role and point DATABASE_URL at it — see
+      # docs/MULTI-TENANT.md §"Row-Level Security". (App-level H8 isolation and
+      # _tenant_filter still apply regardless.)
       POSTGRES_USER: ${POSTGRES_USER:-dhruva}
       # External-DB installs don't need this — the postgres service is
       # parked behind the bundled-db profile. When activating that profile,
@@ -90,10 +97,15 @@ services:
       # Persistent data (baselines, local IOCs, certs)
       - soc-data:/var/lib/ai-soc
     healthcheck:
+      # /api/health returns HTTP 503 when degraded (DB probe fails OR the
+      # alert-loop heartbeat has gone STALE); `curl -sf` fails on 503, so a
+      # wedged instance is restarted. An ABSENT heartbeat (before the first
+      # cycle) does NOT degrade a healthy-DB instance, so start_period only
+      # needs to cover app init, not the first loop tick.
       test: ["CMD-SHELL", "curl -sfk https://localhost:8443/api/health 2>/dev/null || curl -sf http://localhost:8443/api/health"]
       interval: 30s
       timeout: 5s
-      start_period: 15s
+      start_period: 30s
       retries: 3
     logging:
       driver: json-file

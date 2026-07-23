@@ -20,5 +20,9 @@
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
-  "exclude": ["node_modules"]
+  // vitest.config.ts is excluded: it imports @vitejs/plugin-react, whose d.ts
+  // uses syntax newer than the pinned TypeScript can PARSE (skipLibCheck does
+  // not help — parsing still fails). Vitest loads the config itself; the test
+  // files remain fully typechecked via the include above.
+  "exclude": ["node_modules", "vitest.config.ts"]
 }

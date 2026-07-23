@@ -42,6 +42,11 @@ cryptography==46.0.7
 
 # Utilities
 jinja2==3.1.6
+# Optional: PDF export for client-ready reports (WO-H7) needs weasyprint, which
+# pulls in native libs (pango/cairo/gdk-pixbuf). It is NOT a core dependency —
+# HTML/JSON reports always work without it. To enable PDF export install the
+# extra: `pip install -r requirements-pdf.txt` (see that file). If weasyprint is
+# absent or non-functional, the report endpoint returns HTTP 503 for ?format=pdf.
 structlog==25.1.0
 tenacity==9.0.0
 cachetools==5.5.2
@@ -54,6 +59,10 @@ python-telegram-bot==21.10
 
 # Threat Intel
 OTXv2==1.5.12
+# MISP feed (Tier 2, optional). Absent from Community builds — the MISP
+# collector imports pymisp lazily and auto-disables if it is not installed.
+# Uncomment (or `pip install pymisp`) on installs that enable the MISP feed.
+# pymisp==2.5.16
 
 # Testing (dev-only — not loaded in Community/Team/Enterprise builds).
 # testcontainers spins up an ephemeral postgres:16 container per pytest

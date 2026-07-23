@@ -24,6 +24,7 @@ import type {
   AdminLocalIocsResponse,
   AdminTenantsResponse,
   AdminUsersResponse,
+  DecisionCacheResponse,
   TenantAgentsResponse,
 } from "../types";
 
@@ -348,6 +349,69 @@ export function adminAssetsFixture(opts: Opts): AdminAssetsResponse {
 
 export function adminIdentitiesFixture(opts: Opts): AdminIdentitiesResponse {
   return opts.empty ? { identities: [] } : IDENTITIES;
+}
+
+const DECISION_CACHE: DecisionCacheResponse = {
+  entries: [
+    {
+      id: "dc_1",
+      fingerprint: "rule:5710|src_ip:10.0.0.9|...",
+      rule_id: 5710,
+      rule_description: "sshd: authentication success",
+      entity_summary: "host=prod-db-01, user=deploybot",
+      verdict: "false_positive",
+      confidence: 0.94,
+      risk_score: 12,
+      source: "llm_cached",
+      enabled: true,
+      hit_count: 41,
+      tokens_saved_est: 61500,
+      created_at: "2026-07-20T08:14:00Z",
+      created_by: "triage",
+      last_hit_at: "2026-07-22T06:02:00Z",
+      expires_at: "2026-07-27T08:14:00Z",
+    },
+    {
+      id: "dc_2",
+      fingerprint: "rule:5402|agent_id:004|...",
+      rule_id: 5402,
+      rule_description: "Successful sudo to ROOT executed",
+      entity_summary: "agent=004, user=ansible",
+      verdict: "auto_close",
+      confidence: 0.9,
+      risk_score: 8,
+      source: "human_confirmed",
+      enabled: false,
+      hit_count: 12,
+      tokens_saved_est: 18000,
+      created_at: "2026-07-19T11:30:00Z",
+      created_by: "senior.analyst",
+      last_hit_at: "2026-07-21T22:41:00Z",
+      expires_at: null,
+    },
+  ],
+  summary: {
+    total: 2,
+    enabled: 1,
+    disabled: 1,
+    total_hits: 53,
+    tokens_saved: 79500,
+  },
+};
+
+export function decisionCacheFixture(opts: Opts): DecisionCacheResponse {
+  return opts.empty
+    ? {
+        entries: [],
+        summary: {
+          total: 0,
+          enabled: 0,
+          disabled: 0,
+          total_hits: 0,
+          tokens_saved: 0,
+        },
+      }
+    : DECISION_CACHE;
 }
 
 export function adminLocalIocsFixture(opts: Opts): AdminLocalIocsResponse {

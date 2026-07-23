@@ -72,6 +72,7 @@ import {
   statusPresentation,
   type DiffLine,
 } from "@/lib/detection";
+import { formatReasoning } from "@/lib/detectionReasoning";
 import { detectionActionGate, type DetectionActionGate } from "@/lib/rbac";
 import { useAuth } from "@/lib/auth";
 import { cn, focusRing } from "@/lib/ui";
@@ -202,8 +203,10 @@ function FilterChipRow({
 }
 
 export function DetectionTab(_props: TabProps) {
-  const { role } = useAuth();
-  const gate = detectionActionGate(role);
+  const { role, tier } = useAuth();
+  // Mode-aware deploy/rollback authority (WO-H30): pass the install's deployment
+  // mode from tier-info. Absent → detectionActionGate fails closed (mssp_admin).
+  const gate = detectionActionGate(role, tier?.deployment_mode);
   const [section, setSection] = useState<DetectionSection>("proposals");
   // OPTIONAL status filter on the Proposals list. CLIENT-SIDE: the proposals
   // endpoint returns every proposal (no server status param), so this narrows the
@@ -407,7 +410,7 @@ export function DetectionTab(_props: TabProps) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <PageHeading
           title="Detection engineering"
-          sub="AI-proposed Wazuh rule changes, reviewed like code — every proposal shows the diff, the reasoning, and the false-positive impact that triggered it. Approving, deploying, and rolling back close the loop."
+          sub="AI-proposed Wazuh rule changes — every proposal shows the diff, the reasoning, and the false-positive impact that triggered it. Approve, deploy, or roll back."
         />
         {!locked && section === "proposals" && (
           <PollingStatus
@@ -911,7 +914,18 @@ function ConfirmActionDialog({
           <dd className={cn("font-semibold", ct.className)}>{ct.label}</dd>
 
           <dt className="text-dim2">Description</dt>
-          <dd className="text-ink">{p.reasoning || DASH}</dd>
+          {/*
+            WO-H49: the agent's `reasoning` is frequently a large JSON envelope
+            (tp_coverage_risk / changes_made / expected_fp_reduction / …), not a
+            sentence. Dumped raw it became a wall of text that dominated the
+            confirm dialog and pushed the Deploy button out of reach. Bounded
+            and scrollable here so the rest of the confirm — rule id, change
+            type, target file, blast radius — stays readable at a glance, which
+            is what the operator actually needs to make the deploy decision.
+          */}
+          <dd className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words text-ink">
+            {formatReasoning(p.reasoning) || DASH}
+          </dd>
 
           <dt className="text-dim2">Target file</dt>
           <dd className="font-mono text-ink">{p.rule_file || "local_rules.xml"}</dd>

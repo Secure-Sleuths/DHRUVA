@@ -127,7 +127,20 @@ export function Dialog({
         tabIndex={-1}
         onKeyDown={onKeyDown}
         className={cn(
-          "relative w-full rounded-xl border border-line bg-panel p-6 shadow-overlay animate-overlay-in",
+          // WO-H49: bound the height and scroll the overflow.
+          //
+          // The panel was width-constrained only. Any dialog whose content grew
+          // past the viewport simply overflowed it — and because the action row
+          // sits at the BOTTOM, the confirm button became unreachable. That bit
+          // hardest exactly where it matters most: the detection-proposal
+          // Deploy confirm renders the agent's full reasoning plus the complete
+          // rule diff, so an operator could neither read what they were
+          // approving nor reach the button to approve it.
+          //
+          // A safety-critical confirm must never be able to push its own
+          // controls off-screen.
+          "relative flex max-h-[85vh] w-full flex-col overflow-y-auto rounded-xl",
+          "border border-line bg-panel p-6 shadow-overlay animate-overlay-in",
           className,
         )}
         style={{ maxWidth }}

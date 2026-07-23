@@ -43,6 +43,8 @@ import {
   ApiError,
   assignTenantAgents,
   createAdminAsset,
+  discoverAdminAssets,
+  updateAdminAsset,
   createAdminIdentity,
   createAdminLocalIoc,
   createAdminTenant,
@@ -1020,6 +1022,12 @@ export function AssetsSection() {
   const [confirmDel, setConfirmDel] = useState<AdminAsset | null>(null);
   const create = useWrite(reload);
   const del = useWrite(reload);
+  const [editing, setEditing] = useState<AdminAsset | null>(null);  // WO-H51: classify a discovered/existing asset
+  // WO-H51: seed assets from enrolled Wazuh agents. Hand-rolled (not useWrite)
+  // because the result line reports the dynamic new/existing counts, which
+  // useWrite's fixed success message can't carry.
+  const [discovering, setDiscovering] = useState(false);
+  const [discoverMsg, setDiscoverMsg] = useState<WriteResult>(null);
 
   const [hostname, setHostname] = useState("");
   const [tier, setTier] = useState<string>("unknown");
@@ -1056,9 +1064,51 @@ export function AssetsSection() {
 
   const assets = data?.assets ?? [];
 
+  const submitDiscover = async () => {
+    if (!gate.canSubmit || discovering) return;
+    setDiscovering(true);
+    setDiscoverMsg(null);
+    try {
+      const res = await discoverAdminAssets();
+      setDiscoverMsg({
+        ok: true,
+        message:
+          res.new > 0
+            ? `Discovered ${res.discovered} enrolled agent(s): ${res.new} new stub(s) added, ${res.existing} already present. Classify the new ones below.`
+            : `Discovered ${res.discovered} enrolled agent(s) — all already present. Existing tiers/owners were left untouched.`,
+      });
+      reload();
+    } catch (e) {
+      setDiscoverMsg({ ok: false, message: errMessage(e) });
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
   return (
     <Panel className="p-4">
-      <div className="mb-2 text-title text-ink">Assets</div>
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <div className="text-title text-ink">Assets</div>
+        {/* WO-H51: pre-fill the list from the enrolled Wazuh agents so the
+            operator classifies a known list instead of typing hostnames.
+            Never overwrites a tier/owner already set (server-side). */}
+        {gate.visible && (
+          <button
+            type="button"
+            onClick={submitDiscover}
+            disabled={!gate.canSubmit || discovering}
+            className={cn(BTN_NEUTRAL, disabledCls(!gate.canSubmit || discovering), focusRing)}
+            title="Read the enrolled Wazuh agents and pre-fill an asset stub for each (existing classifications are preserved)."
+          >
+            {discovering ? "Discovering…" : "Discover from Wazuh"}
+          </button>
+        )}
+      </div>
+      {discoverMsg && (
+        <div className="mb-3">
+          <ResultLine result={discoverMsg} />
+        </div>
+      )}
       {gate.visible && (
         <div className="mb-3 flex flex-col gap-2 rounded-lg border border-line p-3">
           <div className="text-kbd uppercase tracking-wider text-dim2">Add asset</div>
@@ -1131,9 +1181,16 @@ export function AssetsSection() {
                   <TD mono className="text-right">{a.criticality_multiplier ?? DASH}</TD>
                   <TD className="text-right">
                     {gate.visible && (
-                      <button type="button" onClick={() => setConfirmDel(a)} className={cn(BTN_DANGER, focusRing)}>
-                        Delete
-                      </button>
+                      <div className="flex justify-end gap-2">
+                        {/* WO-H51: classify a discovered/existing asset — sets
+                            tier/owner/env/criticality via the update endpoint. */}
+                        <button type="button" onClick={() => setEditing(a)} className={cn(BTN_NEUTRAL, focusRing)}>
+                          Edit
+                        </button>
+                        <button type="button" onClick={() => setConfirmDel(a)} className={cn(BTN_DANGER, focusRing)}>
+                          Delete
+                        </button>
+                      </div>
                     )}
                   </TD>
                 </TR>
@@ -1156,7 +1213,98 @@ export function AssetsSection() {
         }}
         onCancel={() => setConfirmDel(null)}
       />
+      {editing && (
+        <EditAssetDialog
+          asset={editing}
+          onClose={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null);
+            reload();
+          }}
+        />
+      )}
     </Panel>
+  );
+}
+
+/**
+ * WO-H51: classify a discovered/existing asset. Discover pre-fills stubs with
+ * tier/owner = "unknown"; this is where the operator sets the real values that
+ * feed triage's criticality weighting. Submits the update endpoint.
+ */
+function EditAssetDialog({
+  asset,
+  onClose,
+  onSaved,
+}: {
+  asset: AdminAsset;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [tier, setTier] = useState(asset.tier ?? "unknown");
+  const [owner, setOwner] = useState(asset.owner ?? "");
+  const [environment, setEnvironment] = useState(asset.environment ?? "unknown");
+  const [mult, setMult] = useState(String(asset.criticality_multiplier ?? 1.0));
+  const [tags, setTags] = useState((asset.tags ?? []).join(", "));
+  const [services, setServices] = useState((asset.services ?? []).join(", "));
+  const { submitting, result, run } = useWrite();
+
+  const submit = async () => {
+    const ok = await run(
+      () =>
+        updateAdminAsset(asset.id, {
+          tier,
+          owner: owner.trim() || undefined,
+          environment,
+          criticality_multiplier: Number(mult) || 1.0,
+          tags: csv(tags),
+          services: csv(services),
+        }).then(() => undefined),
+      `Asset “${asset.hostname}” updated.`,
+    );
+    if (ok) onSaved();
+  };
+
+  return (
+    <Dialog open onClose={onClose} title={`Edit ${asset.hostname}`} maxWidth={520}>
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <LabeledField label="Tier">
+          <select value={tier} onChange={(e) => setTier(e.target.value)} className={cn(FIELD_CLS, focusRing)}>
+            {ASSET_TIERS.map((t) => (
+              <option key={t} value={t}>{t.replace(/_/g, " ")}</option>
+            ))}
+          </select>
+        </LabeledField>
+        <LabeledField label="Owner">
+          <input type="text" value={owner} onChange={(e) => setOwner(e.target.value)} className={cn(FIELD_CLS, focusRing)} />
+        </LabeledField>
+        <LabeledField label="Environment">
+          <select value={environment} onChange={(e) => setEnvironment(e.target.value)} className={cn(FIELD_CLS, focusRing)}>
+            {ENVIRONMENTS.map((e2) => (
+              <option key={e2} value={e2}>{e2}</option>
+            ))}
+          </select>
+        </LabeledField>
+        <LabeledField label="Criticality × (0.1–10)">
+          <input type="number" step="0.1" min="0.1" max="10" value={mult} onChange={(e) => setMult(e.target.value)} className={cn(FIELD_CLS, focusRing)} />
+        </LabeledField>
+        <LabeledField label="Tags (comma-sep)">
+          <input type="text" value={tags} onChange={(e) => setTags(e.target.value)} className={cn(FIELD_CLS, focusRing)} />
+        </LabeledField>
+        <LabeledField label="Services (comma-sep)">
+          <input type="text" value={services} onChange={(e) => setServices(e.target.value)} className={cn(FIELD_CLS, focusRing)} />
+        </LabeledField>
+      </div>
+      <div className="mt-3 flex items-center justify-end gap-2">
+        <ResultLine result={result} />
+        <button type="button" onClick={onClose} className={cn(BTN_NEUTRAL, focusRing)}>
+          Cancel
+        </button>
+        <button type="button" onClick={submit} disabled={submitting} className={cn(BTN_PRIMARY, disabledCls(submitting), focusRing)}>
+          {submitting ? "Saving…" : "Save"}
+        </button>
+      </div>
+    </Dialog>
   );
 }
 

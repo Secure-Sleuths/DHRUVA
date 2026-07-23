@@ -40,7 +40,12 @@ import {
   saveIncidentReview,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { incidentActionGate, mergeLicensed } from "@/lib/rbac";
+import {
+  incidentActionGate,
+  incidentAssignGate,
+  mergeLicensed,
+  type IncidentAssignGate,
+} from "@/lib/rbac";
 import { cn, focusRing } from "@/lib/ui";
 import { errMessage, humanStatus } from "./GlassBoxCase";
 import type {
@@ -294,27 +299,48 @@ function StatusPanel({
 
 function AssignPanel({
   detail,
+  gate,
+  selfName,
   onChanged,
 }: {
   detail: IncidentDetail;
+  /** WO-H24: senior+ may assign anyone; analyst may SELF-CLAIM only. */
+  gate: IncidentAssignGate;
+  /** the caller's own username (JWT `sub`); null when unknown (dev-preview). */
+  selfName: string | null;
   onChanged: () => void;
 }) {
   const [who, setWho] = useState("");
   const { submitting, result, run } = useWrite(onChanged);
   const inputId = useId();
   const empty = who.trim().length === 0;
-  const canSubmit = !empty && !submitting;
+  const canSubmit = gate.canAssignAnyone && !empty && !submitting;
+  const alreadyMine = !!selfName && detail.assigned_to === selfName;
+  // WO-H24: an analyst may only claim UNOWNED work. If the case already belongs
+  // to a colleague, the self-claim is disabled (the server 403s regardless).
+  // Senior+ bypass this — they can reassign an owned case via the control below.
+  const ownedByOther =
+    !gate.canAssignAnyone &&
+    !!detail.assigned_to &&
+    detail.assigned_to !== selfName;
+  const selfClaimDisabled = submitting || alreadyMine || ownedByOther;
+
+  const doAssign = (target: string, successMsg: string) =>
+    run(
+      () =>
+        assignIncident(detail.id, { assigned_to: target }).then(() => undefined),
+      successMsg,
+    );
 
   const submit = async () => {
     if (empty) return;
-    const ok = await run(
-      () =>
-        assignIncident(detail.id, { assigned_to: who.trim() }).then(
-          () => undefined,
-        ),
-      `Assigned to ${who.trim()}.`,
-    );
+    const ok = await doAssign(who.trim(), `Assigned to ${who.trim()}.`);
     if (ok) setWho("");
+  };
+
+  const selfClaim = async () => {
+    if (!selfName) return;
+    await doAssign(selfName, `Claimed — assigned to you (${selfName}).`);
   };
 
   return (
@@ -323,30 +349,71 @@ function AssignPanel({
         Currently:{" "}
         <b>{detail.assigned_to ? detail.assigned_to : "Unassigned"}</b>
       </div>
-      <label htmlFor={inputId} className="mt-2 block text-kbd text-dim">
-        Assign to (username)
-      </label>
-      <input
-        id={inputId}
-        type="text"
-        value={who}
-        onChange={(e) => setWho(e.target.value)}
-        placeholder="analyst username"
-        maxLength={100}
-        className={cn(FIELD_CLS, focusRing)}
-      />
-      <div className="mt-2 flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          onClick={submit}
-          disabled={!canSubmit}
-          className={cn(BTN_PRIMARY, disabledCls(!canSubmit), focusRing)}
-        >
-          {submitting ? "Assigning…" : "Assign"}
-        </button>
-        <span className="text-kbd text-dim2">
-          The server verifies the user exists and is active.
-        </span>
+
+      {/* Self-claim — analyst+ (WO-H24). An analyst may ONLY assign to self. */}
+      {gate.canSelfClaim && selfName && (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={selfClaim}
+            disabled={selfClaimDisabled}
+            className={cn(
+              BTN_PRIMARY,
+              disabledCls(selfClaimDisabled),
+              focusRing,
+            )}
+          >
+            {alreadyMine
+              ? "Assigned to you"
+              : submitting
+                ? "Claiming…"
+                : "Claim / assign to me"}
+          </button>
+          {ownedByOther ? (
+            <span className="text-kbd text-dim2">
+              Already owned by <b>{detail.assigned_to}</b> — analysts can only
+              claim unowned incidents. The server enforces this (403).
+            </span>
+          ) : (
+            gate.selfOnlyNote && (
+              <span className="text-kbd text-dim2">{gate.selfOnlyNote}</span>
+            )
+          )}
+        </div>
+      )}
+
+      {/* Arbitrary assign — senior_analyst+ only. */}
+      {gate.canAssignAnyone && (
+        <div className="mt-3">
+          <label htmlFor={inputId} className="block text-kbd text-dim">
+            Assign to another analyst (username)
+          </label>
+          <input
+            id={inputId}
+            type="text"
+            value={who}
+            onChange={(e) => setWho(e.target.value)}
+            placeholder="analyst username"
+            maxLength={100}
+            className={cn(FIELD_CLS, focusRing)}
+          />
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={submit}
+              disabled={!canSubmit}
+              className={cn(BTN_PRIMARY, disabledCls(!canSubmit), focusRing)}
+            >
+              {submitting ? "Assigning…" : "Assign"}
+            </button>
+            <span className="text-kbd text-dim2">
+              The server verifies the user exists and is active.
+            </span>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-2">
         <ResultLine result={result} />
       </div>
     </div>
@@ -942,6 +1009,11 @@ export function IncidentActions({
     review: incidentActionGate(role, "review", isOwner),
   } as const;
 
+  // WO-H24: the assign control is asymmetric — senior+ may assign anyone, an
+  // analyst may only self-claim. `incidentActionGate("assign")` above still
+  // decides visibility (analyst+); this decides WHICH control to render.
+  const assignGate = incidentAssignGate(role);
+
   const anyVisible = Object.values(gate).some((g) => g.visible);
   const licensedMerge = mergeLicensed(tier);
 
@@ -979,8 +1051,16 @@ export function IncidentActions({
           )}
 
           {gate.assign.visible && (
-            <Section title="Assign" hint="senior analyst+">
-              <AssignPanel detail={detail} onChanged={onChanged} />
+            <Section
+              title="Assign"
+              hint={assignGate.canAssignAnyone ? "assign anyone" : "self-claim"}
+            >
+              <AssignPanel
+                detail={detail}
+                gate={assignGate}
+                selfName={sub}
+                onChanged={onChanged}
+              />
             </Section>
           )}
 
@@ -1005,7 +1085,7 @@ export function IncidentActions({
           )}
 
           {gate.escalate.visible && (
-            <Section title="Escalate tier" hint="senior analyst+">
+            <Section title="Escalate tier" hint="analyst+ · audited">
               <EscalatePanel detail={detail} onChanged={onChanged} />
             </Section>
           )}
@@ -1042,12 +1122,6 @@ export function IncidentActions({
         </div>
       )}
 
-      <div className="mt-2 border-t border-line pt-2 text-kbd text-dim2">
-        🔒 Active response stays human-approved — containment is proposed through
-        the gated copilot, never triggered from a case. Case writes here are
-        audit-logged; the server re-checks role, ownership and reason on every
-        one.
-      </div>
     </Panel>
   );
 }

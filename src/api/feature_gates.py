@@ -291,14 +291,27 @@ async def require_multi_tenant():
 
 # -- Helper: get license summary for dashboard ---------------------------------
 
+def _deployment_mode() -> str:
+    """Resolve the deployment mode string for the SPA (WO-H30). Reuses the single
+    source of truth (src/database/store.is_multi_tenant); fails closed to
+    "multi_tenant" (the strictest deploy posture) if it cannot be resolved."""
+    try:
+        from src.database.store import is_multi_tenant
+        return "multi_tenant" if is_multi_tenant() else "single_tenant"
+    except Exception:
+        return "multi_tenant"
+
+
 def get_license_tier_info() -> dict:
     """Returns tier info for the dashboard UI to show/hide tabs and features."""
     lic = get_license_info()
     if lic is None:
-        return {"tier": "unknown", "tabs": [], "features": []}
+        return {"tier": "unknown", "tabs": [], "features": [],
+                "deployment_mode": _deployment_mode()}
 
     return {
         "tier": lic.tier,
+        "deployment_mode": _deployment_mode(),
         "tier_display": lic.tier.replace("_", " ").title(),
         "is_free": lic.is_free_tier,
         "tabs": lic.allowed_tabs,

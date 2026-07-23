@@ -244,7 +244,7 @@ export function MetricsTab(_props: TabProps) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <PageHeading
           title="SOC metrics"
-          sub="Detection & response performance, automation rates, and the noisiest rules — every figure expands to its basis. Read-only."
+          sub="Detection & response performance, automation rates, and the noisiest rules — every figure expands to its basis."
         />
         {!locked && (
           <PollingStatus

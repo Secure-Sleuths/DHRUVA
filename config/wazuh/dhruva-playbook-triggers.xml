@@ -1,0 +1,346 @@
+<!--
+  ============================================================================
+  DHRUVA Playbook Trigger Rules
+  ============================================================================
+
+  PURPOSE
+    DHRUVA's Triage Agent selects an investigation playbook by matching an
+    alert's rule GROUPS against each playbook's `trigger_rule_groups`
+    (see src/agents/triage_agent.py :: select_playbook).
+
+    Stock Wazuh has no `ransomware` or `credential_access` rule group — it
+    expresses those behaviours through <mitre> tags, which select_playbook()
+    does not read. Without this file, these two playbooks never fire:
+        config/guidance/playbooks/ransomware.yaml
+        config/guidance/playbooks/credential_dumping.yaml
+
+    These rules tag the relevant behaviours into those groups so the playbooks
+    route correctly.
+
+  INSTALL
+    Copy to the Wazuh manager and restart:
+        /var/ossec/etc/rules/dhruva-playbook-triggers.xml
+        chown wazuh:wazuh, chmod 660
+        /var/ossec/bin/wazuh-control restart
+
+    DO NOT paste these into `ai-soc-tuned.xml`. That file is owned and
+    rewritten by DHRUVA's Detection Agent (bulk_deploy_approved), which would
+    overwrite anything added by hand.
+
+  RULE ID RANGE
+    120000-120199 is RESERVED for DHRUVA playbook triggers.
+    (Detection Agent proposals use 100000+; SETUP-GUIDE examples use 110000+.)
+
+  VALIDATION STATUS — PARTIALLY VERIFIED (2026-07-20, wazuh-server v4.14.5)
+
+    ✅ VERIFIED on a live manager:
+       - The ruleset COMPILES with this file installed. `wazuh-logtest -v`
+         loaded the full ruleset with zero errors or warnings for 12xxxx.
+         => installing this file will NOT break the manager on restart.
+       - All four <if_sid> parents exist at exactly the levels assumed:
+             61603  Sysmon Event 1  (process creation)      level 0
+             61612  Sysmon Event 10 (ProcessAccess)         level 0
+             550    syscheck: integrity checksum changed    level 7
+             554    syscheck: file added to the system      level 5
+       - Full parent chain for the Sysmon rules is:
+             60000 (decoded_as windows_eventchannel, providerName present)
+           -> 60004 (channel = Microsoft-Windows-Sysmon/Operational)
+           -> 61600 (severityValue = INFORMATION)
+           -> 61603 (eventID = 1)  -> our rules
+       - Stock rule 92900 confirmed present at level 12, matching
+         targetImage=lsass.exe + grantedAccess (0x1010|0x40). This is exactly
+         the shadowing hazard rule 120020's level-13 comment describes.
+       - Rule ID range 120000-120199 is unused by the stock ruleset.
+
+    ❌ STILL UNVERIFIED — rule MATCHING was not exercised:
+       Synthetic events could not be driven through the rule chain. Wazuh's
+       compiled `windows_eventchannel` and `syscheck` decoders are selected by
+       the event's arrival path from remoted; `wazuh-logtest` fed JSON on stdin
+       always decodes as `json` (tried locations EventChannel / WinEvtLog /
+       syscheck / none), so rule 60000's `decoded_as windows_eventchannel`
+       precondition never gates in and no rule is reached.
+
+       The validation manager also has NO Windows agents (all four agents are
+       Linux), so no genuine Sysmon telemetry exists there to replay.
+
+    => TO FINISH VALIDATION: install on a manager with a real Windows agent
+       running Sysmon, generate the behaviour (e.g. `vssadmin delete shadows`
+       in a lab VM), and confirm the alert carries rule 120000 and the
+       `ransomware` group. Until then, treat MATCHING as unproven — compile
+       safety and parent correctness are established, detection is not.
+
+    Sysmon rules require Sysmon installed on endpoints AND the
+    Microsoft-Windows-Sysmon/Operational channel ingested (see SETUP-GUIDE).
+    Without Sysmon, the credential_access rules below will not fire and the
+    playbook must fall back to EDR telemetry.
+
+  FALSE POSITIVES — TUNE THESE BEFORE GOING LIVE
+    120010 / 120030 are level-0 exclusion rules, wired as CHILDREN of the
+    detections they suppress (via <if_sid> on the detection rule IDs). They are
+    shipped with placeholder vendor patterns and suppress nothing useful until
+    you populate them with the backup and EDR products you actually run.
+
+    Why children and not siblings: analysisd inserts sibling rules in
+    DESCENDING level order (rules_list.c:_OS_AddRule) and returns the first
+    match, so a level-0 sibling is always appended last and is never reached
+    once a level-12 detection matches. As a child it is evaluated before the
+    parent alerts, and analysisd breaks on a level-0 match.
+
+    120008 (mass FIM change) ships at level 10 deliberately — it is the most
+    FP-prone rule here. Scope it to directories that matter before raising it.
+  ============================================================================
+-->
+
+<!-- ======================= RANSOMWARE (T1486 / T1490) ======================= -->
+<group name="ransomware,">
+
+  <rule id="120000" level="12">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)vssadmin(\.exe)?\s+.*delete\s+shadows</field>
+    <description>Ransomware indicator: shadow copy deletion via vssadmin — $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1490</id>
+    </mitre>
+  </rule>
+
+  <!-- Covers both the wmic form and the PowerShell WMI/CIM equivalents, which
+       the wmic-only pattern missed entirely. -->
+  <rule id="120001" level="12">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)(wmic(\.exe)?\s+.*shadowcopy\s+delete|win32_shadowcopy.*\|\s*remove-(wmi|cim)object|remove-(wmi|cim)object.*win32_shadowcopy)</field>
+    <description>Ransomware indicator: shadow copy deletion via wmic/PowerShell WMI — $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1490</id>
+    </mitre>
+  </rule>
+
+  <rule id="120002" level="12">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)bcdedit(\.exe)?\s+.*(recoveryenabled\s+no|bootstatuspolicy\s+ignoreallfailures)</field>
+    <description>Ransomware indicator: Windows recovery disabled via bcdedit — $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1490</id>
+    </mitre>
+  </rule>
+
+  <rule id="120003" level="12">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)wbadmin(\.exe)?\s+delete\s+(catalog|systemstatebackup|backup)</field>
+    <description>Ransomware indicator: backup catalog deletion via wbadmin — $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1490</id>
+    </mitre>
+  </rule>
+
+  <rule id="120004" level="12">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)(cipher(\.exe)?\s+/w|fsutil\s+usn\s+deletejournal)</field>
+    <description>Ransomware indicator: anti-forensic wipe / USN journal deletion — $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1490</id>
+      <id>T1070</id>
+    </mitre>
+  </rule>
+
+  <!-- Ransom note dropped. Matches common note filenames across vendors.
+       TUNING NOTE: this will also fire on any ordinary readme.txt created in a
+       monitored path (common in dev/build directories). Acceptable at level 10;
+       exclude noisy build paths from FIM rather than weakening the pattern. -->
+  <rule id="120005" level="10">
+    <if_sid>554</if_sid>
+    <field name="file" type="pcre2">(?i)(readme|how[_\-\s]?to[_\-\s]?decrypt|decrypt[_\-\s]?instruction|recover[_\-\s]?files|your[_\-\s]?files|restore[_\-\s]?files|_readme)\.(txt|html|hta)$</field>
+    <description>Ransomware indicator: probable ransom note created — $(file)</description>
+    <mitre>
+      <id>T1486</id>
+    </mitre>
+  </rule>
+
+  <!-- Known ransomware extension appended to a file. -->
+  <rule id="120006" level="12">
+    <if_sid>554</if_sid>
+    <field name="file" type="pcre2">(?i)\.(locked|encrypted|ransomed|crypt|crypted|enc|wncry|wcry|locky|cerber|zepto|osiris|djvu|conti|lockbit|blackcat|akira|basta)$</field>
+    <description>Ransomware indicator: file with known ransomware extension created — $(file)</description>
+    <mitre>
+      <id>T1486</id>
+    </mitre>
+  </rule>
+
+  <!-- Mass encryption: many extension-renamed files on one agent, fast.
+       This is the highest-confidence signal — a single renamed file is noise,
+       hundreds in a minute is an active encryption run.
+
+       CORRELATION KEY: <same_location /> — NOT <same_source_ip />.
+       Sysmon and syscheck events are host-local and carry no decoded srcip.
+       analysisd's Search_LastSids() skips any candidate where srcip is NULL
+       on either side, so same_source_ip silently prevents the counter from
+       EVER incrementing. Do not "fix" this with <same_agent /> either — that
+       option is deprecated, parses without error, and sets nothing.
+       `location` is always populated and is per-agent.
+
+       FREQUENCY SEMANTICS: frequency="20" fires on the 20th event, as the
+       description says. analysisd subtracts 2 internally and fires on the
+       frequency+1-th prior event; the two cancel. This is correct — do not
+       "correct" it for an off-by-one. -->
+  <rule id="120007" level="14" frequency="20" timeframe="60">
+    <if_matched_sid>120006</if_matched_sid>
+    <same_location />
+    <description>RANSOMWARE ACTIVE: mass file encryption detected — 20+ files with ransomware extensions in 60s</description>
+    <mitre>
+      <id>T1486</id>
+    </mitre>
+  </rule>
+
+  <!-- Mass FIM churn: catches encryption where the extension is randomised
+       (many families do this) and 120006 therefore cannot match.
+
+       ⚠ TUNE BEFORE RELYING ON THIS. 100 integrity changes in 60s is routine
+       on a file server during a patch window, a backup restore, an rsync, or
+       an AV signature drop. Deliberately shipped at level 10 (not 12) so a FP
+       does not land as `high` severity and burn an LLM triage call on every
+       maintenance window. Scope it to the directories that actually matter
+       for your environment, then raise the level once it is quiet. -->
+  <rule id="120008" level="10" frequency="100" timeframe="60">
+    <if_matched_sid>550</if_matched_sid>
+    <same_location />
+    <description>Ransomware indicator: mass file modification — 100+ integrity changes in 60s (TUNE: see rule comment)</description>
+    <mitre>
+      <id>T1486</id>
+    </mitre>
+  </rule>
+
+  <!-- ── Exclusion: approved backup tooling ────────────────────────────────
+       MUST be a CHILD of the detections it suppresses, not a sibling.
+       analysisd inserts sibling rules in DESCENDING level order, so a level-0
+       sibling is always appended last and is never reached once a level-12
+       detection matches. As a child it is evaluated before the parent alerts,
+       and analysisd stops on a level-0 match (`if (rule->level == 0) break;`).
+
+       Matches parentImage, NOT image: rules 120000-120004 fire on the LOLBin
+       being launched (image = vssadmin.exe / wmic.exe), so the backup product
+       is the PARENT process. Matching `image` here could never work.
+
+       POPULATE THIS with the backup products you actually run before enabling
+       the ransomware rules, and scope as tightly as you can. -->
+  <rule id="120010" level="0">
+    <if_sid>120000,120001,120002,120003,120004</if_sid>
+    <field name="win.eventdata.parentImage" type="pcre2">(?i)\\(veeam|acronis|commvault|backupexec)\\</field>
+    <description>DHRUVA: approved backup tooling — excluded from ransomware triggers</description>
+  </rule>
+
+</group>
+
+
+<!-- ================= CREDENTIAL ACCESS (T1003 family) ================= -->
+<group name="credential_access,">
+
+  <!-- LSASS handle request with a dump-capable access mask.
+       0x1010 = PROCESS_VM_READ|QUERY_INFO, 0x1410 / 0x143a are classic
+       Mimikatz/ProcDump masks, 0x1fffff = PROCESS_ALL_ACCESS.
+
+       LEVEL 13 IS DELIBERATE — DO NOT LOWER IT TO 12.
+       Stock rule 92900 (0945-sysmon_id_10.xml) attaches to the SAME sibling
+       chain under 61612 via if_group=sysmon_event_10, is level 12, and matches
+       targetImage=lsass.exe with grantedAccess 0x1010|0x40. analysisd inserts
+       siblings in descending level order and returns the FIRST match, and
+       ruleset/rules/ loads before etc/rules/ — so at equal level, 92900 wins.
+       92900's groups do not include credential_access, so select_playbook()
+       would not route and this playbook would miss the single most common
+       Mimikatz signature (0x1010). Level 13 sorts us ahead of it.
+
+       KNOWN COVERAGE GAP: the mask list below is an enumeration, not a
+       bitmask test. Real dump masks vary (0x1418, 0x101010, 0x1f1fff, and
+       Sysmon's hex casing differs across versions). (?i) handles casing but
+       not the variance. Accepted for now; revisit with logtest data. -->
+  <rule id="120020" level="13">
+    <if_sid>61612</if_sid>
+    <field name="win.eventdata.targetImage" type="pcre2">(?i)\\lsass\.exe$</field>
+    <field name="win.eventdata.grantedAccess" type="pcre2">(?i)^0x(1010|1410|143a|1438|1f0fff|1fffff)$</field>
+    <description>Credential dumping: LSASS memory access with dump-capable mask $(win.eventdata.grantedAccess) by $(win.eventdata.sourceImage)</description>
+    <mitre>
+      <id>T1003.001</id>
+    </mitre>
+  </rule>
+
+  <!-- ── Exclusion: approved security tooling ──────────────────────────────
+       CHILD of 120020, not a sibling — see the equivalent note on 120010.
+       A level-0 sibling is sorted last and never reached; as a child it is
+       evaluated before the parent alerts.
+
+       POPULATE THIS with your actual EDR/AV before enabling. Scope by full
+       path where you can, not just executable name — an attacker who drops
+       `MsMpEng.exe` into a temp directory would otherwise be excluded. -->
+  <rule id="120030" level="0">
+    <if_sid>120020</if_sid>
+    <field name="win.eventdata.sourceImage" type="pcre2">(?i)\\(MsMpEng|CSFalconService|SentinelAgent|xagt|cb)\.exe$</field>
+    <description>DHRUVA: approved security tooling accessing LSASS — excluded</description>
+  </rule>
+
+  <rule id="120021" level="13">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)(sekurlsa::|lsadump::|kerberos::|crypto::|privilege::debug|mimikatz)</field>
+    <description>Credential dumping: Mimikatz command syntax observed — $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1003.001</id>
+      <id>T1003.006</id>
+    </mitre>
+  </rule>
+
+  <rule id="120022" level="12">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)procdump.*(-ma|/ma).*lsass</field>
+    <description>Credential dumping: ProcDump targeting LSASS — $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1003.001</id>
+    </mitre>
+  </rule>
+
+  <!-- comsvcs.dll MiniDump: signed-LOLBin LSASS dump, no attacker binary. -->
+  <rule id="120023" level="13">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)comsvcs\.dll.*MiniDump</field>
+    <description>Credential dumping: LSASS dump via comsvcs.dll LOLBin — $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1003.001</id>
+    </mitre>
+  </rule>
+
+  <rule id="120024" level="12">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)reg(\.exe)?\s+save\s+.*(hklm\\sam|hklm\\security|hklm\\system)</field>
+    <description>Credential dumping: registry hive export (SAM/SECURITY/SYSTEM) — $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1003.002</id>
+    </mitre>
+  </rule>
+
+  <rule id="120025" level="13">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)(ntdsutil|ntds\.dit|create\s+full\s+.*ifm)</field>
+    <description>Credential dumping: NTDS.dit / domain database extraction — $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1003.003</id>
+    </mitre>
+  </rule>
+
+  <rule id="120026" level="12">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)(vaultcmd|lazagne|secretsdump|pypykatz|nanodump|dumpert)</field>
+    <description>Credential dumping: known credential-theft tool invoked — $(win.eventdata.commandLine)</description>
+    <mitre>
+      <id>T1003</id>
+      <id>T1555</id>
+    </mitre>
+  </rule>
+
+  <!-- Dump artefact written to disk. Catches the output stage even when the
+       dumping technique itself was missed. -->
+  <rule id="120027" level="12">
+    <if_sid>554</if_sid>
+    <field name="file" type="pcre2">(?i)(lsass.*\.dmp|\.dit$|SAM\.(hiv|save)$|SECURITY\.(hiv|save)$)</field>
+    <description>Credential dumping: credential dump artefact written to disk — $(file)</description>
+    <mitre>
+      <id>T1003</id>
+    </mitre>
+  </rule>
+
+</group>

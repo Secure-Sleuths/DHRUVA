@@ -64,6 +64,16 @@ interface OverviewState {
   loading: boolean;
 }
 
+/**
+ * WO-H47 follow-up: which campaigns the map is showing.
+ *
+ * The map defaults to ACTIVE — showing everything is what let 99 closed
+ * campaigns crowd out 2 of the 3 live ones. But contained campaigns are still
+ * real history, so this toggle keeps them one click away rather than deleting
+ * them from the UI.
+ */
+type CampaignScope = "active" | "contained";
+
 export function OverviewTab({ onNavigate }: TabProps) {
   const [state, setState] = useState<OverviewState>({
     summary: null,
@@ -74,9 +84,10 @@ export function OverviewTab({ onNavigate }: TabProps) {
   const [secondsAgo, setSecondsAgo] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
   const [nodeDetail, setNodeDetail] = useState<KillChainNodeRef | null>(null);
+  const [scope, setScope] = useState<CampaignScope>("active");
   const abortRef = useRef<AbortController | null>(null);
 
-  const load = useCallback(async (manual: boolean) => {
+  const load = useCallback(async (manual: boolean, s: CampaignScope) => {
     abortRef.current?.abort();
     const ac = new AbortController();
     abortRef.current = ac;
@@ -86,7 +97,7 @@ export function OverviewTab({ onNavigate }: TabProps) {
       // views of the same tenant state.
       const [summary, campaignsRes] = await Promise.all([
         getOverviewSummary(ac.signal),
-        getCampaigns(ac.signal),
+        getCampaigns(ac.signal, s),
       ]);
       if (ac.signal.aborted) return;
       setState({
@@ -121,15 +132,16 @@ export function OverviewTab({ onNavigate }: TabProps) {
     }
   }, []);
 
-  // Initial fetch + auto-poll.
+  // Initial fetch + auto-poll. Re-runs when the campaign scope toggles, so
+  // switching to "contained" refetches instead of filtering a stale list.
   useEffect(() => {
-    load(false);
-    const poll = setInterval(() => load(false), POLL_MS);
+    load(false, scope);
+    const poll = setInterval(() => load(false, scope), POLL_MS);
     return () => {
       clearInterval(poll);
       abortRef.current?.abort();
     };
-  }, [load]);
+  }, [load, scope]);
 
   // "refreshed Ns ago" ticker.
   useEffect(() => {
@@ -158,7 +170,7 @@ export function OverviewTab({ onNavigate }: TabProps) {
           className="mt-1"
           secondsAgo={secondsAgo}
           refreshing={refreshing}
-          onRefresh={() => load(true)}
+          onRefresh={() => load(true, scope)}
         />
       </div>
 
@@ -169,12 +181,19 @@ export function OverviewTab({ onNavigate }: TabProps) {
           variant="error"
           title="Couldn't load the overview"
           description={error}
-          action={<Chip onClick={() => load(true)}>Retry</Chip>}
+          action={<Chip onClick={() => load(true, scope)}>Retry</Chip>}
         />
       ) : (
         <>
           {summary && <KpiStrip summary={summary} />}
-          <CampaignMap campaigns={campaigns ?? []} onOpen={openCampaign} onNode={setNodeDetail} />
+          <CampaignMap
+            campaigns={campaigns ?? []}
+            scope={scope}
+            onScopeChange={setScope}
+            containedCount={summary?.active_campaigns?.contained ?? null}
+            onOpen={openCampaign}
+            onNode={setNodeDetail}
+          />
         </>
       )}
 
@@ -212,14 +231,18 @@ function KpiStrip({ summary }: { summary: OverviewSummary }) {
       <Tile
         label="Active campaigns"
         value={ac.value}
+        // WO-H48: severity tracks the ACTIVE count. This keyed off the all-time
+        // total before, so the tile sat permanently critical-red once any
+        // campaign had ever been recorded — no matter how quiet the estate was.
         valueSeverity={ac.value > 0 ? "crit" : undefined}
-        sub={`${ac.advancing} advancing · ${ac.contained} contained`}
+        sub={`${ac.contained} contained · ${ac.total ?? ac.value + ac.contained} tracked all-time`}
         math={
           <>
             Groups alerts by <span className="font-mono">attack_chain_id</span>{" "}
-            (M5 correlation). {ac.value} tracked campaign
-            {ac.value === 1 ? "" : "s"} — {ac.advancing} advancing (any member
-            open/investigating) · {ac.contained} contained.
+            (M5 correlation). {ac.value} active (any member open/investigating)
+            {" · "}
+            {ac.contained} contained
+            {ac.total != null ? ` · ${ac.total} tracked all-time` : ""}.
           </>
         }
       />
@@ -331,18 +354,64 @@ function KpiStrip({ summary }: { summary: OverviewSummary }) {
 
 function CampaignMap({
   campaigns,
+  scope,
+  onScopeChange,
+  containedCount,
   onOpen,
   onNode,
 }: {
   campaigns: ApiCampaign[];
+  scope: CampaignScope;
+  onScopeChange: (s: CampaignScope) => void;
+  containedCount: number | null;
   onOpen: (c: Campaign) => void;
   onNode: (ref: KillChainNodeRef) => void;
 }) {
+  const showingActive = scope === "active";
   return (
     <Panel className="px-3.5 pb-2 pt-3.5">
-      {/* header: title + severity/projection legend */}
+      {/* header: title + scope toggle + severity/projection legend */}
       <div className="mb-1 flex flex-wrap items-center justify-between gap-2">
-        <b className="text-title">Campaign map</b>
+        <div className="flex flex-wrap items-center gap-2">
+          <b className="text-title">Campaign map</b>
+          {/*
+            WO-H47 follow-up: the map deliberately shows ACTIVE campaigns only
+            — an unfiltered map let closed history crowd out the live ones. This
+            keeps that history one click away instead of deleting it from the
+            UI, and names the count so "where did the rest go?" is answered on
+            the surface rather than being a mystery.
+          */}
+          {/*
+            Selection is carried by `variant` (the design system's own prop) —
+            Chip does NOT forward aria-pressed, so relying on it would leave the
+            toggle with no visible OR accessible selected state. aria-label
+            spells the state out for screen readers.
+          */}
+          <Chip
+            variant={showingActive ? "violet" : "default"}
+            aria-label={
+              showingActive
+                ? "Showing active campaigns (selected)"
+                : "Show active campaigns"
+            }
+            onClick={() => onScopeChange("active")}
+          >
+            Active
+          </Chip>
+          <Chip
+            variant={!showingActive ? "violet" : "default"}
+            aria-label={
+              !showingActive
+                ? "Showing contained campaigns (selected)"
+                : "Show contained campaigns"
+            }
+            onClick={() => onScopeChange("contained")}
+          >
+            {containedCount === null
+              ? "Contained"
+              : `Contained (${containedCount})`}
+          </Chip>
+        </div>
         <KillChainLegend />
       </div>
 
@@ -356,8 +425,14 @@ function CampaignMap({
       {campaigns.length === 0 ? (
         <StatusState
           variant="empty"
-          title="No active campaigns"
-          description="The correlation engine hasn't linked any incidents into an attack chain right now."
+          title={
+            showingActive ? "No active campaigns" : "No contained campaigns"
+          }
+          description={
+            showingActive
+              ? "No attack chain currently has an open or investigating incident. Contained campaigns are still available above."
+              : "No attack chain has been fully contained yet."
+          }
         />
       ) : (
         campaigns.map((c) => {

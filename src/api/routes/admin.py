@@ -14,7 +14,7 @@ from src.api.models import (
     CreateUserRequest, UpdateUserRequest, CreateTenantRequest,
     CreateAssetRequest, UpdateAssetRequest,
     CreateIdentityRequest, UpdateIdentityRequest,
-    CreateLocalIOCRequest,
+    CreateLocalIOCRequest, UpdateDecisionCacheRequest,
 )
 from src.database.store import PlatformUser
 
@@ -34,17 +34,44 @@ def _recompute_multi_tenant_mode(db):
         registry = get_tenant_registry()
         if registry:
             active = registry.get_active_tenant_ids()
-            set_multi_tenant_mode(len(active) > 1)
+            is_mt = len(active) > 1
+            set_multi_tenant_mode(is_mt)
             logger.info("multi_tenant_mode_recomputed",
                         active_tenants=len(active),
-                        multi_tenant=len(active) > 1)
+                        multi_tenant=is_mt)
         else:
             # Fallback: count directly from DB
             tenants = db.get_all_tenants()
             active = [t for t in tenants if t.get("active")]
-            set_multi_tenant_mode(len(active) > 1)
+            is_mt = len(active) > 1
+            set_multi_tenant_mode(is_mt)
+        # N3 (re-audit): the startup RLS boot gate (WO-H12-followup) does NOT cover
+        # this runtime flip. When multi-tenant mode turns on, verify RLS is actually
+        # in effect; if not, alarm loudly + mark the backstop degraded (surfaced via
+        # /api/health) instead of silently entering MT mode without the DB backstop.
+        # We do NOT SystemExit here (would kill a live server) and keep MT mode on so
+        # the app-layer isolation engages regardless.
+        _recompute_rls_backstop_state(db, is_mt)
     except Exception as e:
         logger.warning("multi_tenant_mode_recompute_failed", error=str(e))
+
+
+def _recompute_rls_backstop_state(db, is_mt: bool):
+    """Set/clear the RLS-backstop-degraded flag for the current tenant mode."""
+    from src.database.store import set_rls_backstop_degraded
+    if not is_mt:
+        set_rls_backstop_degraded(False)
+        return
+    try:
+        active_ok, reason = db.verify_rls_active()
+    except Exception as e:
+        active_ok, reason = False, f"could not verify RLS: {e}"
+    if active_ok:
+        set_rls_backstop_degraded(False)
+    else:
+        logger.error("rls_backstop_inactive_at_runtime_multi_tenant_flip",
+                     reason=reason)
+        set_rls_backstop_degraded(True)
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +653,65 @@ async def list_assets(request: Request, user: dict = Depends(require_role("admin
     return {"assets": assets}
 
 
+@router.post("/api/admin/settings/assets/discover")
+@limiter.limit("6/minute")
+async def discover_assets(
+    request: Request, user: dict = Depends(require_role("admin")),
+):
+    """WO-H51: seed asset context from the enrolled Wazuh agents.
+
+    Reads the Wazuh Manager agent inventory (which DHRUVA already pulls and
+    surfaces at /api/agents) and pre-fills an asset stub per host, so the
+    operator classifies a KNOWN LIST instead of hand-transcribing hostnames —
+    the friction that left asset context empty and every alert `asset_tier:
+    unknown`.
+
+    Safe by construction: it NEVER overwrites a tier/owner an analyst already
+    set (see store.upsert_discovered_asset), and it never wipes the existing
+    asset list if the Wazuh pull fails or returns nothing.
+    """
+    from src.api.routes.agents import _get_wazuh_for_user
+
+    _db = get_db()
+    try:
+        wazuh = _get_wazuh_for_user(user)
+        agents = wazuh.get_all_agents() or []
+    except Exception as e:  # noqa: BLE001
+        logger.warning("asset_discover_wazuh_unavailable", error=str(e))
+        raise HTTPException(
+            502, "Could not reach the Wazuh manager to list agents. The "
+                 "existing asset list is unchanged.")
+
+    if not agents:
+        # Fail SAFE: a healthy manager with zero agents (or a silent empty
+        # response) must not be treated as "clear the list" — we only ever
+        # add/refresh, never delete, so this is already non-destructive.
+        return {"status": "ok", "discovered": 0, "new": 0, "existing": 0}
+
+    new = existing = 0
+    for a in agents:
+        hostname = a.get("name") or a.get("hostname")
+        if not hostname or hostname == "000":  # 000 is the manager itself
+            continue
+        os_name = (a.get("os") or {}).get("name") if isinstance(a.get("os"), dict) else None
+        inserted = _db.upsert_discovered_asset(
+            hostname=hostname, ip=a.get("ip"), os_name=os_name)
+        new += 1 if inserted else 0
+        existing += 0 if inserted else 1
+
+    # The AssetEnricher reloads assets from the DB on its own cycle (and via the
+    # settings-panel reload path), so newly-seeded rows take effect without a
+    # restart. No direct enricher handle here by design — the route only writes.
+
+    actor = user.get("sub", "unknown")
+    _db.log_audit(actor, "asset_discover", "asset", "-",
+                  details={"discovered": new + existing, "new": new},
+                  ip_address=request.client.host if request.client else "")
+    logger.info("assets_discovered", new=new, existing=existing, actor=actor)
+    return {"status": "ok", "discovered": new + existing,
+            "new": new, "existing": existing}
+
+
 @router.post("/api/admin/settings/assets")
 @limiter.limit("30/minute")
 async def create_asset(
@@ -672,6 +758,83 @@ async def delete_asset(
     _db.log_audit(actor, "asset_delete", "asset", asset_id,
                   ip_address=request.client.host if request.client else "")
     return {"status": "deleted"}
+
+
+# ---------------------------------------------------------------------------
+# Decision cache (WO-H57) — view / disable / edit / delete the persistent
+# verdict cache. Senior-analyst-and-above (mssp_admin superuser bypasses).
+# Every mutation is audit-logged; every read/write is tenant-scoped by the DAO.
+# ---------------------------------------------------------------------------
+
+@router.get("/api/admin/decision-cache")
+@limiter.limit("30/minute")
+async def list_decision_cache(
+    request: Request,
+    include_disabled: bool = True,
+    limit: int = Query(500, ge=1, le=2000),
+    user: dict = Depends(require_role("senior_analyst", "admin")),
+):
+    """List cached verdicts + a savings summary for the Decision Cache tab."""
+    _db = get_db()
+    entries = _db.decision_cache_list(
+        limit=limit, include_disabled=include_disabled)
+    summary = _db.decision_cache_summary()
+    return {"entries": entries, "summary": summary}
+
+
+@router.patch("/api/admin/decision-cache/{cache_id}")
+@limiter.limit("30/minute")
+async def update_decision_cache(
+    request: Request, cache_id: str,
+    body: UpdateDecisionCacheRequest,
+    user: dict = Depends(require_role("senior_analyst", "admin")),
+):
+    """Disable (stop reuse), or edit the verdict/reasoning of a cached entry."""
+    _db = get_db()
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(400, "No fields to update")
+    ok = _db.decision_cache_update(cache_id, **updates)
+    if not ok:
+        raise HTTPException(404, "Cache entry not found or nothing to update")
+    actor = user.get("sub", "unknown")
+    _db.log_audit(actor, "decision_cache_update", "decision_cache", cache_id,
+                  details={"fields": list(updates.keys())},
+                  ip_address=request.client.host if request.client else "")
+    return {"status": "updated"}
+
+
+@router.delete("/api/admin/decision-cache/{cache_id}")
+@limiter.limit("30/minute")
+async def delete_decision_cache(
+    request: Request, cache_id: str,
+    user: dict = Depends(require_role("senior_analyst", "admin")),
+):
+    """Remove a cached entry — the next matching alert goes back to the LLM."""
+    _db = get_db()
+    _db.decision_cache_delete(cache_id)
+    actor = user.get("sub", "unknown")
+    _db.log_audit(actor, "decision_cache_delete", "decision_cache", cache_id,
+                  ip_address=request.client.host if request.client else "")
+    return {"status": "deleted"}
+
+
+@router.post("/api/admin/decision-cache/purge")
+@limiter.limit("6/minute")
+async def purge_decision_cache(
+    request: Request,
+    scope: str = Query("expired", pattern="^(expired|all)$"),
+    user: dict = Depends(require_role("senior_analyst", "admin")),
+):
+    """Bulk cleanup: drop expired entries (default) or clear the whole cache."""
+    _db = get_db()
+    removed = (_db.decision_cache_clear() if scope == "all"
+               else _db.decision_cache_purge_expired())
+    actor = user.get("sub", "unknown")
+    _db.log_audit(actor, "decision_cache_purge", "decision_cache", scope,
+                  details={"scope": scope, "removed": removed},
+                  ip_address=request.client.host if request.client else "")
+    return {"status": "purged", "scope": scope, "removed": removed}
 
 
 # -- Identities -----------------------------------------------------------
@@ -831,23 +994,27 @@ async def count_triage_failures(
     """
     _db = get_db()
     conn = _db._get_conn()
-    cur = conn.execute(
-        "SELECT COUNT(*) AS cnt FROM agent_decisions "
-        "WHERE reasoning LIKE %s OR reasoning LIKE %s",
-        (f"%{_TRIAGE_FAILURE_MARKERS[0]}%",
-         f"%{_TRIAGE_FAILURE_MARKERS[1]}%"),
-    )
-    count = cur.fetchone()["cnt"]
+    # Admin diagnostic: this deliberately scans agent_decisions across ALL
+    # tenants (the v4.8.4 corruption was tenant-agnostic). Declare the intent
+    # explicitly so the WO-H8 tenant backstop allows the unscoped read.
+    with _db.cross_tenant():
+        cur = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM agent_decisions "
+            "WHERE reasoning LIKE %s OR reasoning LIKE %s",
+            (f"%{_TRIAGE_FAILURE_MARKERS[0]}%",
+             f"%{_TRIAGE_FAILURE_MARKERS[1]}%"),
+        )
+        count = cur.fetchone()["cnt"]
 
-    sample_cur = conn.execute(
-        "SELECT id, alert_id, rule_id, created_at, client_id "
-        "FROM agent_decisions "
-        "WHERE reasoning LIKE %s OR reasoning LIKE %s "
-        "ORDER BY created_at DESC LIMIT 10",
-        (f"%{_TRIAGE_FAILURE_MARKERS[0]}%",
-         f"%{_TRIAGE_FAILURE_MARKERS[1]}%"),
-    )
-    sample = [dict(row) for row in sample_cur.fetchall()]
+        sample_cur = conn.execute(
+            "SELECT id, alert_id, rule_id, created_at, client_id "
+            "FROM agent_decisions "
+            "WHERE reasoning LIKE %s OR reasoning LIKE %s "
+            "ORDER BY created_at DESC LIMIT 10",
+            (f"%{_TRIAGE_FAILURE_MARKERS[0]}%",
+             f"%{_TRIAGE_FAILURE_MARKERS[1]}%"),
+        )
+        sample = [dict(row) for row in sample_cur.fetchall()]
 
     return {
         "affected_count": count,
@@ -872,15 +1039,18 @@ async def clear_triage_failures(
     """
     _db = get_db()
     conn = _db._get_conn()
-    cur = conn.execute(
-        "UPDATE agent_decisions SET reasoning = %s "
-        "WHERE reasoning LIKE %s OR reasoning LIKE %s",
-        (_REMEDIATED_REASONING,
-         f"%{_TRIAGE_FAILURE_MARKERS[0]}%",
-         f"%{_TRIAGE_FAILURE_MARKERS[1]}%"),
-    )
-    updated = cur.rowcount
-    conn.commit()
+    # Admin repair across ALL tenants (tenant-agnostic v4.8.4 corruption) —
+    # declared explicitly so the WO-H8 tenant backstop allows the unscoped write.
+    with _db.cross_tenant():
+        cur = conn.execute(
+            "UPDATE agent_decisions SET reasoning = %s "
+            "WHERE reasoning LIKE %s OR reasoning LIKE %s",
+            (_REMEDIATED_REASONING,
+             f"%{_TRIAGE_FAILURE_MARKERS[0]}%",
+             f"%{_TRIAGE_FAILURE_MARKERS[1]}%"),
+        )
+        updated = cur.rowcount
+        conn.commit()
 
     actor = user.get("sub", "unknown")
     _db.log_audit(actor, "triage_failures_cleared", "system",

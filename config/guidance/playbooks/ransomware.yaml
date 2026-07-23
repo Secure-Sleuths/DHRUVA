@@ -1,0 +1,154 @@
+# =============================================================================
+# Investigation Playbook: Ransomware Triage
+# Rule Groups: syscheck, sysmon, command_monitoring, windows, rootcheck
+# MITRE: T1486 (Data Encrypted for Impact), T1490 (Inhibit System Recovery),
+#        T1489 (Service Stop), T1021 (Remote Services / lateral movement),
+#        T1567/T1048 (Exfiltration — double extortion)
+# Methodology reference: socworkflows.com "Ransomware Triage Analyser"
+#   (facts/checklist mined and rewritten into DHRUVA schema; prose not copied)
+# =============================================================================
+
+name: "Ransomware Triage & Blast-Radius Investigation"
+
+# DEPLOYMENT DEPENDENCY:
+#   "ransomware" is NOT a stock Wazuh group. It is created by DHRUVA's shipped
+#   rules (120000-120008) in
+#     config/wazuh/dhruva-playbook-triggers.xml
+#   which must be installed to /var/ossec/etc/rules/ on the manager. Without
+#   that file this playbook NEVER FIRES.
+#
+# SELECTION WARNING: select_playbook() is first-match-wins over an unsorted
+# glob. "syscheck"/"rootcheck"/"command_monitoring" are already owned by
+# malware_detection — listing them here would make routing between the two
+# non-deterministic, so a dedicated group is used instead.
+trigger_rule_groups:
+  - "ransomware"
+
+# NOTE: tune these to the client's ruleset — IDs vary by Wazuh install.
+# 550/554 deliberately OMITTED: they are generic syscheck IDs that would pull
+# every FIM alert into ransomware triage.
+trigger_rule_ids: []
+
+investigation_steps:
+  - step: 1
+    name: "Confirm encryption behavior on the affected host"
+    query_template: |
+      SELECT agent_name, agent_ip, rule_description, data_file, data_command,
+             data_srcuser,
+             COUNT(*) as file_events,
+             MIN(timestamp) as first_seen, MAX(timestamp) as last_seen
+      FROM {enriched_alerts_index}
+      WHERE agent_id = '{alert_agent_id}'
+        AND rule_group IN ('syscheck', 'sysmon', 'command_monitoring')
+        AND timestamp >= '{alert_timestamp}' - INTERVAL 1 HOUR
+      GROUP BY agent_name, agent_ip, rule_description, data_file, data_command,
+               data_srcuser
+      ORDER BY first_seen ASC
+    assess: |
+      - Mass file modification/creation — hundreds of files in seconds/minutes?
+      - Uniform new file extension (.locked, .encrypted, .ransomed, or random)?
+      - Ransom-note files created (README/HOW_TO_DECRYPT/*.txt/*.hta) across dirs?
+      - Which process/user context is performing the writes?
+      - If evidence is thin: state "Ransomware not confirmed on current evidence"
+        and drop to NEEDS_INVESTIGATION rather than over-calling.
+
+  - step: 2
+    name: "Detect recovery inhibition & defense evasion (T1490/T1489)"
+    query_template: |
+      SELECT timestamp, agent_name, data_command, data_srcuser, rule_description
+      FROM {enriched_alerts_index}
+      WHERE agent_id = '{alert_agent_id}'
+        AND rule_group IN ('sysmon', 'command_monitoring', 'windows')
+        AND timestamp BETWEEN '{alert_timestamp}' - INTERVAL 2 HOURS
+            AND '{alert_timestamp}' + INTERVAL 1 HOUR
+      ORDER BY timestamp ASC
+    assess: |
+      - Shadow-copy deletion? (vssadmin delete shadows, wmic shadowcopy delete,
+        bcdedit /set recoveryenabled no, wbadmin delete catalog)
+      - Backup services / security tooling stopped or disabled (T1489)?
+      - Event log clearing (Security 1102 / System 104) around the encryption window?
+      - Recovery inhibition + mass encryption together is a strong TRUE_POSITIVE.
+
+  - step: 3
+    name: "Establish patient zero and the infection timeline"
+    query_template: |
+      SELECT timestamp, agent_name, agent_ip, rule_description, data_command,
+             data_srcuser, rule_group
+      FROM {enriched_alerts_index}
+      WHERE agent_id = '{alert_agent_id}'
+        AND timestamp >= '{alert_timestamp}' - INTERVAL 24 HOURS
+      ORDER BY timestamp ASC
+    assess: |
+      - What is the earliest suspicious indicator on this host (initial access,
+        dropper, credential access)?
+      - If patient zero is uncertain, identify the earliest affected host.
+      - Which account(s) executed the encryptor and any pre-encryption tooling?
+
+  - step: 4
+    name: "Assess blast radius & lateral spread"
+    query_template: |
+      SELECT DISTINCT agent_name, agent_ip, rule_description, data_file,
+             data_srcuser, timestamp
+      FROM {enriched_alerts_index}
+      WHERE agent_id != '{alert_agent_id}'
+        AND rule_group IN ('syscheck', 'sysmon', 'windows', 'command_monitoring')
+        AND timestamp >= '{alert_timestamp}' - INTERVAL 24 HOURS
+        AND ( data_file LIKE '%{suspicious_filename}%'
+              OR rule_description LIKE '%encrypt%'
+              OR rule_description LIKE '%ransom%' )
+      ORDER BY timestamp ASC
+    assess: |
+      - How many hosts show the same extension/ransom-note/encryptor pattern?
+      - Are file servers or network shares involved (fan-out risk)?
+      - Any DOMAIN CONTROLLER or domain-admin account activity in the chain?
+        -> flag as CRITICAL SEVERITY; DA involvement means enterprise-wide risk.
+      - Which hosts need immediate network isolation, and which backups are at risk?
+
+  - step: 5
+    name: "Check for pre-encryption exfiltration (double extortion)"
+    query_template: |
+      SELECT timestamp, srcip, dstip, dstport, protocol,
+             data_bytes_sent, data_bytes_received, rule_description
+      FROM {enriched_alerts_index}
+      WHERE agent_id = '{alert_agent_id}'
+        AND rule_group IN ('firewall', 'network_connection', 'ids')
+        AND timestamp >= '{alert_timestamp}' - INTERVAL 48 HOURS
+      ORDER BY data_bytes_sent DESC
+    assess: |
+      - Large outbound transfers before encryption (single flows > ~500MB)?
+      - Connections to cloud storage / paste sites / unknown external IPs?
+      - Exfil-then-encrypt strongly raises business & notification impact.
+
+verdict_criteria:
+  true_positive:
+    - "Mass file modification with uniform new extension + ransom notes"
+    - "Encryption behavior combined with shadow-copy/backup deletion (T1490)"
+    - "Encryptor spread to multiple hosts or file shares via a shared account"
+    - "Domain-admin or domain-controller involvement in the infection chain"
+    - "Pre-encryption bulk exfiltration (double extortion) confirmed"
+
+  false_positive:
+    - "Bulk file operation by backup/sync software (Veeam, OneDrive, rsync)"
+    - "Legitimate full-disk-encryption rollout (BitLocker/organization policy)"
+    - "Developer/build process mass-writing artifacts in a dev/test environment"
+    - "Approved data-migration or archival job touching many files at once"
+
+  needs_investigation:
+    - "Mass file modification without extension change or ransom note"
+    - "Shadow-copy deletion alone, with no encryption behavior observed"
+    - "Single-host encryption-like activity that matches no known backup job"
+
+recommended_actions:
+  if_true_positive:
+    - "ISOLATE (15 min): network-isolate every host showing encryption/spread"
+    - "CONTAIN: disable/lock the account(s) executing the encryptor; block C2"
+    - "PROTECT BACKUPS: verify and air-gap backups before they are targeted"
+    - "PRESERVE: forensic image + memory capture on patient zero before reimage"
+    - "IDENTIFY: determine ransomware family and check for public decryptors"
+    - "NOTIFY: escalate to client IR; flag Legal/Compliance, cyber-insurance, and (per client policy) law-enforcement notification requirements"
+    - "HUNT: sweep all monitored hosts for the same extension/note/hash IOCs"
+
+  if_false_positive:
+    - "Tag alert with FP reason plus the owning backup/sync/build job"
+    - "If recurring, propose tuning scoped to the process + path + account, never a blanket mass-file-change exclusion — that would blind ransomware detection"
+    - "Record the legitimate bulk-file pattern in the baseline"

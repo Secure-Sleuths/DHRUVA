@@ -6,6 +6,7 @@ patterns, usage tracking, and cost calculation.
 """
 
 import json
+import threading
 import time
 import structlog
 from datetime import datetime, timezone
@@ -66,11 +67,33 @@ class ProviderUsageTracker:
     def track_usage(self, provider: str, model: str, request_type: str,
                    input_length: int, output_length: int, latency: float,
                    success: bool, error_type: Optional[str] = None,
-                   cost_usd: Optional[float] = None):
-        """Record usage metrics to dedicated llm_usage_metrics table."""
+                   cost_usd: Optional[float] = None,
+                   real_usage: Optional[dict] = None):
+        """Record usage metrics to dedicated llm_usage_metrics table.
+
+        WO-H50: when ``real_usage`` is supplied (the provider reported actual
+        token counts — API SDK usage or CLI --output-format json), record those
+        exact numbers and mark the row ``estimated=False``. Otherwise fall back
+        to the ``chars//4`` estimate and mark it ``estimated=True`` so a real
+        count and a guess are never silently mixed in reporting.
+        """
         try:
             import uuid
             from datetime import datetime, timezone
+
+            if real_usage and real_usage.get("input_tokens") is not None:
+                tokens_input = int(real_usage["input_tokens"])
+                tokens_output = int(real_usage.get("output_tokens") or 0)
+                estimated = False
+                cost = (real_usage.get("cost_usd")
+                        if real_usage.get("cost_usd") is not None
+                        else self._estimate_cost(provider, model, input_length, output_length))
+            else:
+                tokens_input = self._estimate_tokens(input_length)
+                tokens_output = self._estimate_tokens(output_length)
+                estimated = True
+                cost = cost_usd if cost_usd is not None else \
+                    self._estimate_cost(provider, model, input_length, output_length)
 
             usage_record = {
                 "id": str(uuid.uuid4()),
@@ -78,9 +101,10 @@ class ProviderUsageTracker:
                 "provider": provider,
                 "model": model,
                 "request_type": request_type,
-                "tokens_input": self._estimate_tokens(input_length),
-                "tokens_output": self._estimate_tokens(output_length),
-                "cost_usd": cost_usd or self._estimate_cost(provider, model, input_length, output_length),
+                "tokens_input": tokens_input,
+                "tokens_output": tokens_output,
+                "estimated": estimated,
+                "cost_usd": cost,
                 "latency_ms": int(latency * 1000),
                 "success": success,
                 "error_type": error_type,
@@ -94,8 +118,8 @@ class ProviderUsageTracker:
                 INSERT INTO llm_usage_metrics (
                     id, tenant_id, provider, model, request_type,
                     tokens_input, tokens_output, cost_usd, latency_ms,
-                    success, error_type, created_at, client_id
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    success, error_type, created_at, client_id, estimated
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 usage_record["id"],
                 usage_record["tenant_id"],
@@ -109,7 +133,8 @@ class ProviderUsageTracker:
                 usage_record["success"],
                 usage_record["error_type"],
                 usage_record["created_at"],
-                usage_record["client_id"]
+                usage_record["client_id"],
+                usage_record["estimated"],
             ))
             conn.commit()
 
@@ -167,8 +192,23 @@ class MultiProviderLLMBackend:
 
         # Parse configuration
         self.primary_provider = llm_config.get("primary_provider") or llm_config.get("provider", "anthropic")
-        self.fallback_providers = llm_config.get("fallback_providers", [])
         self.provider_configs = llm_config.get("providers", {})
+
+        # ── BR-N4 (RATIFIED 2026-07-02): one provider per tenant, NO failover ──
+        # A tenant's data — even anonymized — must NEVER reach a second provider,
+        # including on primary failure. Any configured fallback chain is kept
+        # visible for audit (``configured_fallbacks``) but is NEVER called: the
+        # effective fallback list is forced empty, so on primary failure the call
+        # raises and the pipeline fails safe (triage escalates), rather than
+        # spilling to a backup provider. See docs/ROADMAP.md BR-N4 / docs/BRD.md.
+        self.configured_fallbacks = llm_config.get("fallback_providers", [])
+        self.fallback_providers: List[str] = []
+        if self.configured_fallbacks:
+            logger.warning("llm_failover_disabled_br_n4",
+                           tenant_id=tenant_id,
+                           primary=self.primary_provider,
+                           ignored_fallbacks=self.configured_fallbacks,
+                           reason="one-provider-per-tenant; no cross-provider failover")
 
         # Backward compatibility with old config format
         if not self.provider_configs and llm_config.get("api_key"):
@@ -180,15 +220,46 @@ class MultiProviderLLMBackend:
         self.providers: Dict[str, BaseLLMProvider] = {}
         self.circuit_breakers: Dict[str, CircuitBreaker] = {}
 
-        # Global rate limiting
+        # Global rate limiting. WO-H32: thread-safe cooldown + a semaphore
+        # capping in-flight calls, mirroring LLMBackend — N parallel triage
+        # workers share this per-tenant backend. One-provider-per-tenant
+        # (BR-N4) is untouched; this only shapes call pacing/concurrency.
         rate_cfg = llm_config.get("rate_limit", {})
         self.cooldown_seconds = rate_cfg.get("cooldown_seconds", 1)
         self._last_call_time = 0
+        self._rate_lock = threading.Lock()
+        self.max_concurrent_calls = max(
+            1, int(rate_cfg.get("max_concurrent_calls", 4)))
+        self._call_sem = threading.BoundedSemaphore(self.max_concurrent_calls)
+        # WO-H37: per-tenant CLI clamp. The single-tenant worker clamp in
+        # main.py cannot see per-tenant backends (they are created lazily by
+        # the tenant registry), so a CLI-mode tenant here would still spawn
+        # concurrent `claude` subprocesses. Providers resolve their mode at
+        # first use, so the semaphore is CHOSEN per call (``_sem_for``): a
+        # CLI-resolved anthropic provider serializes on this dedicated
+        # 1-permit semaphore; API-mode providers keep the configured cap.
+        self._cli_sem = threading.BoundedSemaphore(1)
+        self._cli_clamp_logged = False
 
         logger.info("multi_provider_backend_initialized",
                    tenant_id=tenant_id,
                    primary=self.primary_provider,
                    fallbacks=self.fallback_providers)
+
+    def _sem_for(self, provider) -> "threading.BoundedSemaphore":
+        """WO-H37: pick the in-flight cap for this call. CLI mode spawns a
+        whole `claude` subprocess per call — serialize those (1 permit)
+        regardless of ``max_concurrent_calls``; everything else uses the
+        configured semaphore."""
+        if getattr(provider, "sub_mode", "") == "cli":
+            if not self._cli_clamp_logged:
+                self._cli_clamp_logged = True
+                logger.info("llm_cli_concurrency_clamped",
+                            tenant_id=self.tenant_id,
+                            configured=self.max_concurrent_calls,
+                            effective=1)
+            return self._cli_sem
+        return self._call_sem
 
     def _get_or_create_provider(self, provider_name: str) -> Optional[BaseLLMProvider]:
         """Get or create a provider instance with circuit breaker."""
@@ -224,15 +295,43 @@ class MultiProviderLLMBackend:
             return None
 
     def _rate_limit(self):
-        """Enforce cooldown between calls."""
-        elapsed = time.time() - self._last_call_time
-        if elapsed < self.cooldown_seconds:
-            time.sleep(self.cooldown_seconds - elapsed)
-        self._last_call_time = time.time()
+        """Enforce cooldown between calls — thread-safe (WO-H32).
+
+        Callers reserve spaced start slots under a lock and sleep outside it,
+        so N parallel workers serialize call STARTS at the configured pace
+        (the old unlocked check let them all pass at once). ``0`` disables
+        pacing (full parallelism up to the semaphore cap)."""
+        if self.cooldown_seconds <= 0:
+            return
+        with self._rate_lock:
+            now = time.time()
+            slot = max(now, self._last_call_time + self.cooldown_seconds)
+            self._last_call_time = slot
+        wait = slot - now
+        if wait > 0:
+            time.sleep(wait)
 
     def get_primary_provider(self) -> str:
         """Get the primary provider name."""
         return self.primary_provider
+
+    def describe_model(self) -> str:
+        """Resolved concrete ``provider/model`` id of the backend that runs a
+        call (WO-H29 finding NEW-3).
+
+        BR-N4 pins exactly one provider per tenant (``primary_provider``), so the
+        resolved id is deterministic. Reads the model from an already-initialized
+        provider when available, else from the configured provider block, so this
+        does NOT instantiate a provider (no CLI subprocess) just to describe it.
+        Falls back to the provider name alone if no model string is resolvable.
+        """
+        provider = self.primary_provider or "unknown"
+        prov = self.providers.get(self.primary_provider)
+        model = getattr(prov, "model", "") if prov is not None else ""
+        if not model:
+            model = (self.provider_configs.get(self.primary_provider, {})
+                     or {}).get("model", "") or ""
+        return f"{provider}/{model}" if model else provider
 
     def call(self, system_prompt: str, user_message: str, request_type: str = "triage") -> dict:
         """
@@ -248,8 +347,11 @@ class MultiProviderLLMBackend:
         """
         self._rate_limit()
 
-        # Try primary provider first
-        providers_to_try = [self.primary_provider] + self.fallback_providers
+        # BR-N4: exactly ONE provider per tenant — no cross-provider failover.
+        # ``self.fallback_providers`` is forced empty in __init__; we also list
+        # only the primary explicitly here as defense-in-depth so the call path
+        # can never spill a tenant's data to a second provider.
+        providers_to_try = [self.primary_provider]
 
         for provider_name in providers_to_try:
             circuit_breaker = self.circuit_breakers.get(provider_name)
@@ -264,7 +366,10 @@ class MultiProviderLLMBackend:
 
             start_time = time.time()
             try:
-                raw_text = provider.call_text(system_prompt, user_message)
+                # WO-H32: transport-level concurrency cap; content untouched.
+                # WO-H37: CLI-resolved providers serialize (see _sem_for).
+                with self._sem_for(provider):
+                    raw_text = provider.call_text(system_prompt, user_message)
                 response = self._parse_json_response(raw_text)
                 latency = time.time() - start_time
 
@@ -328,7 +433,8 @@ class MultiProviderLLMBackend:
         # For simplicity, let's implement a direct version
 
         self._rate_limit()
-        providers_to_try = [self.primary_provider] + self.fallback_providers
+        # BR-N4: one provider per tenant — no cross-provider failover.
+        providers_to_try = [self.primary_provider]
 
         for provider_name in providers_to_try:
             circuit_breaker = self.circuit_breakers.get(provider_name)
@@ -341,7 +447,8 @@ class MultiProviderLLMBackend:
 
             start_time = time.time()
             try:
-                raw_text = provider.call_text(system_prompt, user_message)
+                with self._sem_for(provider):  # WO-H32/H37: concurrency cap
+                    raw_text = provider.call_text(system_prompt, user_message)
                 latency = time.time() - start_time
 
                 if circuit_breaker:
@@ -397,7 +504,12 @@ class MultiProviderLLMBackend:
         return {
             "tenant_id": self.tenant_id,
             "primary_provider": self.primary_provider,
+            # BR-N4: failover is disabled — the effective fallback list is always
+            # empty. Any configured-but-ignored fallbacks are surfaced separately
+            # for audit/visibility only; they are never called.
             "fallback_providers": self.fallback_providers,
+            "failover_enabled": False,
+            "configured_fallbacks_ignored": self.configured_fallbacks,
             "provider_status": provider_status
         }
 

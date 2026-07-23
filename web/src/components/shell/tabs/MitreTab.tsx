@@ -288,7 +288,7 @@ function AttackCoverageView(_props: TabProps) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <PageHeading
           title="MITRE ATT&CK coverage"
-          sub="Detection coverage overlaid with the tactics your live campaigns are actually exercising — derived from real decisions, never fabricated."
+          sub="Detection coverage overlaid with the tactics your live campaigns are actually exercising — derived from real decisions."
         />
         {!locked && (
           <PollingStatus
@@ -1247,7 +1247,7 @@ function ComplianceView() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <PageHeading
           title="Compliance frameworks"
-          sub="Per-framework control coverage — which compliance controls your detections actually cover, computed from real decisions over the last 30 days. Read-only."
+          sub="Per-framework control coverage — which compliance controls your detections actually cover, computed from real decisions over the last 30 days."
         />
         {roleAllowed && !locked && (
           <PollingStatus

@@ -200,7 +200,7 @@ export function ClosedLoopTab(_props: TabProps) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <PageHeading
           title="Closed loop"
-          sub="The compounding intelligence surface — the false-positive patterns the loop mined, and how well each deployed tuning worked."
+          sub="The false-positive patterns the loop mined, and how well each deployed tuning worked."
         />
         <div className="mt-1 flex items-center gap-2">
           {!locked && gate.canRunCycle && patterns && (

@@ -56,6 +56,12 @@ export interface LicenseTierInfo {
   active_response_actions?: string[];
   days_remaining?: number | null;
   upgrade_url?: string;
+  /**
+   * Deployment mode (WO-H30) — "single_tenant" | "multi_tenant". Drives the
+   * mode-aware detection deploy/rollback authority in `detectionActionGate`.
+   * ABSENT/unknown → treated as multi-tenant (fail closed → mssp_admin only).
+   */
+  deployment_mode?: string;
 }
 
 // ---- Triage decisions (WO-B1 contract) --------------------------------------
@@ -93,6 +99,14 @@ export interface TriageDecision {
   escalated?: boolean;
   human_verdict?: TriageVerdict | string | null;
   /**
+   * WO-H46-c: true when the LLM was unreachable and triage FAILED CLOSED — the
+   * alert was escalated WITHOUT being analyzed. Such a row carries
+   * `verdict: 'needs_investigation'` + `escalated: true` + `confidence: 0`,
+   * i.e. it is indistinguishable from a real escalation on the wire without
+   * this flag. NEVER present it as a considered verdict: the AI did not run.
+   */
+  llm_failed?: boolean;
+  /**
    * The following ride the SAME `SELECT * FROM agent_decisions` row the queue
    * serves (`triage.py::get_triage_decisions`), so they are present on the wire
    * even though the queue table doesn't render them — the decision glass-box
@@ -117,12 +131,30 @@ export interface TriageDecision {
    * mutating a verdict.
    */
   grounding?: string | null;
+  /**
+   * WO-H25 alert-level claim — who is working this decision. Rides the same
+   * `SELECT *` row (nullable 0007 columns). DEFENSIVE: absent/null on older
+   * backends and unclaimed rows → render "unclaimed", never crash.
+   */
+  claimed_by?: string | null;
+  /** ISO timestamp of the claim; null/absent when unclaimed. */
+  claimed_at?: string | null;
 }
 
 /** `GET /api/triage/decisions` envelope. */
 export interface TriageDecisionsResponse {
   decisions: TriageDecision[];
   total: number;
+  /** WO-H33 pagination echo: the offset this page started at. */
+  offset?: number;
+  /** WO-H33 pagination echo: the requested page size. */
+  limit?: number;
+  /**
+   * WO-H33: true when another page exists past this one (computed server-side
+   * from the SQL window, before the anomaly post-filter). Absent on older
+   * servers → treat as false.
+   */
+  has_more?: boolean;
 }
 
 /**
@@ -156,6 +188,11 @@ export interface RuleStats {
 export interface PendingReviewResponse {
   pending: TriageDecision[];
   count: number;
+  /** WO-H37 pagination echo (additive; absent on older servers). */
+  offset?: number;
+  limit?: number;
+  /** True when another page of pending decisions exists past this one. */
+  has_more?: boolean;
 }
 
 /**
@@ -263,6 +300,11 @@ export interface RiskBreakdown {
   anomaly_boost?: number;
   vuln_context_multiplier?: number;
   vuln_context_reason?: string;
+  /** M6b host-integrity (FIM/rootcheck) factor — recorded since the M6b rollout */
+  host_integrity_multiplier?: number;
+  host_integrity_reason?: string;
+  host_rootcheck_findings?: number;
+  host_fim_recent_changes?: number;
   raw_score?: number;
   clamped_score?: number;
   [key: string]: number | string | undefined;
@@ -328,6 +370,13 @@ export interface IncidentAlert {
   human_override?: string | null;
   /** the human's recorded verdict, if one exists (gates the B10 override rule) */
   human_verdict?: TriageVerdict | string | null;
+  /**
+   * WO-H46-c: true when the LLM was unreachable and triage FAILED CLOSED — the
+   * alert was escalated WITHOUT being analyzed. Rides the same
+   * `SELECT * FROM agent_decisions` row. Render via `decisionPresentation()`
+   * so it never displays as a considered verdict.
+   */
+  llm_failed?: boolean;
   created_at?: string;
   /** WO-B4 — attached to every member alert on the detail */
   glass_box?: GlassBox;
@@ -340,6 +389,10 @@ export interface IncidentAlert {
    * verdict.
    */
   grounding?: string | null;
+  /** WO-H25 alert-level claim — same nullable columns as `TriageDecision`
+   * (a member alert IS an agent_decisions row). Absent → unclaimed. */
+  claimed_by?: string | null;
+  claimed_at?: string | null;
 }
 
 /** One incident-timeline entry (append-only audit of the case). */
@@ -524,7 +577,20 @@ export interface OverviewCampaignRef {
 }
 
 export interface OverviewSummary {
-  active_campaigns: { value: number; advancing: number; contained: number };
+  /**
+   * WO-H48: `value` is the count of campaigns ACTIVE right now — it previously
+   * held the all-time total, so a tile labelled "Active campaigns" read 934
+   * while 3 were active, and Daily Review told a non-technical reader that 934
+   * attacks were "in progress". `total` carries the all-time figure for the
+   * expand-to-math detail; `advancing` equals `value` and is kept for
+   * compatibility.
+   */
+  active_campaigns: {
+    value: number;
+    advancing: number;
+    contained: number;
+    total?: number;
+  };
   estate_dwell_worst: {
     value_seconds: number | null;
     value: string | null;
@@ -1049,11 +1115,14 @@ export interface VulnRemediationResponse {
  * dispatches an async package-update command via Wazuh active response.
  * `status:"pending"` means the AR command was ACCEPTED — NOT that the update has
  * landed; confirm with `/verify`. `status:"failed"` means the dispatch itself
- * failed (nothing in force). `version_before` is the package version captured
- * pre-update, fed back into the verify call. Read defensively.
+ * failed (nothing in force). `status:"not_applied"` (WO-H36) means Wazuh
+ * accepted the call but dispatched it to NO agent (total_affected_items=0 — e.g.
+ * the remediation AR capability isn't registered on the agent), so nothing was
+ * upgraded — distinct from pending. `version_before` is the package version
+ * captured pre-update, fed back into the verify call. Read defensively.
  */
 export interface RemediationExecuteResult {
-  status: "pending" | "failed";
+  status: "pending" | "failed" | "not_applied" | string;
   agent_id: string;
   package: string;
   pkg_manager: string;
@@ -1066,13 +1135,27 @@ export interface RemediationExecuteResult {
  * `GET /api/vulnerabilities/verify` result (WO-U15 EXECUTE half,
  * `response.py::verify_remediation`). The "did the update land" follow-up check.
  * `status` is one of: `not_found` (package absent), `updated` (version changed —
- * carries version_before/after), `unchanged` (same version, vuln still present),
- * `possibly_updated` (version same but vuln no longer indexed — rescan pending).
- * Every field beyond `status`/`message` is best-effort and read defensively; the
- * union keeps `string` so an unexpected server status never breaks the render.
+ * carries version_before/after), `not_upgraded` (WO-H36/H41: version KNOWN and
+ * UNCHANGED with no successful dispatch, OR a dispatch older than the scan
+ * interval — the upgrade did not take effect), `pending_inventory_refresh`
+ * (WO-H41: version unchanged AND a dispatch happened within the last
+ * syscollector scan interval — UNKNOWN: the inventory may not have refreshed
+ * yet, or the upgrade did not apply; re-verify after the next scan — this is
+ * NOT a claim that the upgrade applied), `unchanged` (same version, vuln still
+ * present), `possibly_updated` (version same but vuln no longer indexed —
+ * rescan pending). Every field beyond `status`/`message` is best-effort and
+ * read defensively; the union keeps `string` so an unexpected server status
+ * never breaks the render.
  */
 export interface RemediationVerifyResult {
-  status: "not_found" | "updated" | "unchanged" | "possibly_updated" | string;
+  status:
+    | "not_found"
+    | "updated"
+    | "not_upgraded"
+    | "pending_inventory_refresh"
+    | "unchanged"
+    | "possibly_updated"
+    | string;
   message: string;
   version_before?: string | null;
   version_after?: string | null;
@@ -1673,6 +1756,7 @@ export type ArStatus =
   | "executed"
   | "pending_approval"
   | "denied"
+  | "not_applied"
   | "reversed"
   | "expired"
   | string;
@@ -1976,12 +2060,18 @@ export interface ApproveResponseActionResult {
   id: string | null;
   proposal_id: string;
   action: string;
-  /** "executed" (dispatched) | "failed" (dispatch failed) */
+  /**
+   * "executed" (dispatched) | "failed" (dispatch failed) | "not_applied"
+   * (Wazuh accepted the command but total_affected_items=0 — no dispatchable
+   * agent target, nothing took effect).
+   */
   status: string;
   /** "ok" | "degraded" (action ran, audit-row write failed) */
   audit?: string;
   success?: boolean;
   error?: string;
+  /** Human-readable detail for the not_applied outcome. */
+  message?: string;
 }
 
 /**
@@ -2159,6 +2249,42 @@ export interface AdminAsset {
 }
 export interface AdminAssetsResponse {
   assets: AdminAsset[];
+}
+
+// ---- Decision cache (WO-H57) -----------------------------------------------
+export interface DecisionCacheEntry {
+  id: string;
+  fingerprint: string;
+  rule_id: number | null;
+  rule_description: string | null;
+  entity_summary: string | null;
+  verdict: string;
+  confidence: number;
+  risk_score: number;
+  source: string; // llm_cached | human_confirmed | seed_noise
+  enabled: boolean;
+  hit_count: number;
+  tokens_saved_est: number;
+  created_at: string | null;
+  created_by: string | null;
+  last_hit_at: string | null;
+  expires_at: string | null;
+}
+export interface DecisionCacheSummary {
+  total: number;
+  enabled: number;
+  disabled: number;
+  total_hits: number;
+  tokens_saved: number;
+}
+export interface DecisionCacheResponse {
+  entries: DecisionCacheEntry[];
+  summary: DecisionCacheSummary;
+}
+export interface UpdateDecisionCacheBody {
+  enabled?: boolean;
+  verdict?: string;
+  reasoning?: string;
 }
 export interface CreateAssetBody {
   hostname: string;
@@ -2847,4 +2973,61 @@ export interface FrameworkCoverage {
   covered_controls: number;
   coverage_pct: number;
   controls: FrameworkControlCoverage[];
+}
+
+// ===== WO-H21 — complete-context case view (read-only display contracts) =====
+// Shapes confirmed against src/api/routes/triage.py::get_decision_raw_alert /
+// get_decision_playbook. Both endpoints are strictly display reads on the
+// human (deanonymized) side of the case — they never touch the LLM path.
+
+/**
+ * `GET /api/triage/decisions/{id}/raw-alert` — the raw underlying Wazuh event
+ * behind a decision (rule / agent / `data` / `full_log` / decoder / location),
+ * fetched from the enriched-alert index with the derived `enrichment` blob
+ * dropped server-side. `found: false` is an HONEST degraded state (no alert id
+ * on an old row, OpenSearch absent on the deployment, event rotated out) — the
+ * case renders `reason` as an empty state, never an error page.
+ */
+export interface RawAlertResponse {
+  found: boolean;
+  /** the event document as ingested — rendered as-is, never reshaped */
+  alert: Record<string, unknown> | null;
+  reason: string | null;
+}
+
+/** One investigation step of a matched playbook (guidance YAML, read-only). */
+export interface PlaybookStep {
+  step?: number | string | null;
+  name: string;
+  assess: string;
+  /** the analyst-facing correlation query template ("" when none) */
+  query_template: string;
+}
+
+/**
+ * The matched playbook's CONTENT — investigation steps, verdict criteria and
+ * escalation criteria (= the playbook's `needs_investigation` conditions).
+ * Malformed guidance YAML degrades to empty sections server-side.
+ */
+export interface CasePlaybook {
+  key: string;
+  name: string;
+  trigger_rule_groups: string[];
+  trigger_rule_ids: Array<string | number>;
+  investigation_steps: PlaybookStep[];
+  verdict_criteria: Record<string, string[]>;
+  escalation_criteria: string[];
+  recommended_actions: Record<string, string[]>;
+}
+
+/**
+ * `GET /api/triage/decisions/{id}/playbook` — `matched: false` covers every
+ * honest no-playbook state (none recorded, the generic no-match guidance,
+ * guidance unavailable in this build, playbook renamed/removed since the
+ * decision); `reason` says which. Never a 5xx.
+ */
+export interface DecisionPlaybookResponse {
+  matched: boolean;
+  playbook: CasePlaybook | null;
+  reason: string | null;
 }

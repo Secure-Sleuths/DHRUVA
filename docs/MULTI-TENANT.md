@@ -298,6 +298,145 @@ If you need to migrate manually:
 
 ---
 
+## Row-Level Security (RLS) — the DB-layer tenant backstop (WO-H12)
+
+Tenant isolation is enforced in **three** layers, defense-in-depth:
+
+1. **App DAO discipline** — every query appends `_tenant_filter()` (`AND
+   client_id = %s`); fail-closed when no tenant context is set.
+2. **WO-H8 app query guard** (`_GuardedConnection`) — intercepts every
+   `conn.execute()` and *raises* (fail-loud) if a SELECT/UPDATE/DELETE touches a
+   tenant table with no tenant predicate. It is a regex heuristic, so it cannot
+   catch a query filtered only on a *shared* id (`rule_id`, `technique_id`, …).
+3. **WO-H12 Postgres RLS** (migration `0006`) — the database engine itself
+   returns only the session tenant's rows, even for a raw
+   `SELECT * FROM incidents` with no filter. This closes the class layer 2
+   cannot.
+
+**How it works.** Migration `0006` enables `ROW LEVEL SECURITY` + `FORCE` on
+every table in `SOCDatabase.TENANT_SCOPED_TABLES` and installs a
+`tenant_isolation` policy:
+
+```sql
+USING      (client_id = current_setting('app.tenant_id', true)
+            OR current_setting('app.tenant_id', true) = '__CROSS_TENANT__')
+WITH CHECK (client_id = current_setting('app.tenant_id', true)
+            OR current_setting('app.tenant_id', true) = '__CROSS_TENANT__')
+```
+
+On every pooled-connection checkout, `store.py` runs
+`SELECT set_config('app.tenant_id', <value>, false)` — the tenant id, or
+`__CROSS_TENANT__` for an audited bypass (`db.cross_tenant()`), or `''` when no
+tenant context is set (→ RLS matches nothing → fail-closed). Re-applying on
+every checkout is what stops a pooled connection leaking one tenant's GUC to the
+next request.
+
+**FK-scoped child tables (migration `0008`, WO-H29).** `incident_alerts` and
+`incident_timeline` (`SOCDatabase.FK_SCOPED_TABLES`) carry no direct `client_id`
+— they belong to a tenant transitively through their `incident_id` FK. `0006`
+deliberately skipped them; `0008` closes that gap with a **subquery** policy
+scoped by membership in the RLS-scoped parent:
+
+```sql
+USING      (incident_id IN (SELECT id FROM incidents))
+WITH CHECK (incident_id IN (SELECT id FROM incidents))
+```
+
+The inner `SELECT id FROM incidents` is itself governed by the `0006` policy, so
+it composes automatically with the same `app.tenant_id` GUC / `__CROSS_TENANT__`
+sentinel (tenant id → only that tenant's child rows; sentinel → all; unset → none
+→ fail-closed). Same NON-superuser / NON-BYPASSRLS role requirement applies — no
+new role requirement is introduced.
+
+### ⚠️ CRITICAL: DHRUVA must connect as a NON-superuser, NON-BYPASSRLS role
+
+**PostgreSQL superusers and roles with `BYPASSRLS` skip RLS entirely — even with
+`FORCE`.** If DHRUVA connects as such a role, migration `0006` applies cleanly
+but has **zero runtime effect** and layer 3 is silently absent.
+
+> **Enforced at boot (WO-H12-followup): this is no longer just documented.** In
+> **multi-tenant mode** DHRUVA runs a startup RLS-active assertion
+> (`SOCDatabase.verify_rls_active()`): it checks the live role is not
+> `rolsuper`/`rolbypassrls` and that `FORCE` RLS is enabled on the scoped tables,
+> and **refuses to start** (fail-loud `SystemExit`, like the default-creds/weak-JWT
+> gates) if RLS cannot take effect — with the exact fix in the message. So the
+> `bundled-db` superuser path can no longer *silently* ship with the backstop off;
+> it fails loud until you provision the non-superuser role below. (Single-tenant
+> mode skips the gate — RLS is not the isolation boundary there.)
+
+| Deployment path | Connects as | RLS effective? |
+|---|---|---|
+| `deploy.sh` (interactive install) | `CREATE USER dhruva` → NOSUPERUSER/NOBYPASSRLS, owns the DB | ✅ Yes (FORCE covers the owner) |
+| `docker compose --profile bundled-db` | `POSTGRES_USER=dhruva` — created by the postgres entrypoint as a **SUPERUSER** | ❌ **No — bypassed** |
+| External/managed Postgres | whatever `DATABASE_URL` names | Depends — must be non-superuser |
+
+**Verify at runtime** (both must be `f`):
+
+```bash
+psql "$DATABASE_URL" -c \
+  "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user;"
+```
+
+If your role is a superuser (bundled-db or a managed instance that only gives
+you a superuser), provision a dedicated non-superuser app role and point
+`DATABASE_URL` at it:
+
+```sql
+-- Run once as a superuser, against the DHRUVA database.
+CREATE ROLE dhruva_app LOGIN PASSWORD '<strong-password>'
+    NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+
+GRANT CONNECT ON DATABASE dhruva TO dhruva_app;
+GRANT USAGE ON SCHEMA public TO dhruva_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA public TO dhruva_app;
+GRANT USAGE, SELECT                  ON ALL SEQUENCES IN SCHEMA public TO dhruva_app;
+-- So future Alembic-created tables are reachable too:
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO dhruva_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO dhruva_app;
+```
+
+Then set `DATABASE_URL=postgresql://dhruva_app:<password>@host:5432/dhruva`.
+Run **migrations** (`alembic upgrade head`) as the table **owner/superuser**, but
+run the **application** as `dhruva_app`.
+
+> Do not "fix" a superuser deployment by weakening the policy — RLS cannot be
+> made to apply to a superuser. The only correct answer is a non-superuser role.
+
+### Rehearsing the migration on a copy (operator pre-flight)
+
+RLS changes DB access semantics, so rehearse on a throwaway clone before
+production:
+
+```bash
+# 1. Snapshot production schema+data into a scratch database.
+createdb dhruva_rehearsal
+pg_dump "$DATABASE_URL" | psql "postgresql://.../dhruva_rehearsal"
+
+# 2. Apply the migration against the clone.
+DATABASE_URL="postgresql://.../dhruva_rehearsal" alembic upgrade 0006
+
+# 3. Prove RLS with a NON-superuser role (as above), NOT a superuser:
+psql "postgresql://dhruva_app:...@host/dhruva_rehearsal" <<'SQL'
+  SELECT set_config('app.tenant_id', 'SOME_REAL_TENANT_ID', false);
+  SELECT count(*), count(DISTINCT client_id) FROM incidents;  -- 1 distinct tenant
+  SELECT set_config('app.tenant_id', '', false);
+  SELECT count(*) FROM incidents;                             -- 0 rows (fail-closed)
+  SELECT set_config('app.tenant_id', '__CROSS_TENANT__', false);
+  SELECT count(DISTINCT client_id) FROM incidents;            -- all tenants
+SQL
+
+# 4. Confirm reversibility, then drop the clone.
+DATABASE_URL="postgresql://.../dhruva_rehearsal" alembic downgrade 0005
+dropdb dhruva_rehearsal
+```
+
+To render the exact SQL without touching a database:
+`alembic upgrade 0005:0006 --sql` (and `alembic downgrade 0006:0005 --sql`).
+
+---
+
 ## Troubleshooting
 
 ### Common Issues

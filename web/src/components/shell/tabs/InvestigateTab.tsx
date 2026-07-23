@@ -96,7 +96,7 @@ export function InvestigateTab(_props: TabProps) {
       <div className="flex min-w-0 flex-1 flex-col">
         <PageHeading
           title="Investigate"
-          sub="The copilot is the hero — ask in natural language; it runs queries and cites every result. This canvas holds the evidence it pulls in; click any citation for its grounded source."
+          sub="Ask in natural language; the copilot runs queries and cites every result. This canvas holds the evidence it pulls in — click any citation for its source."
         />
 
         {mode === "locked" ? (
@@ -105,12 +105,6 @@ export function InvestigateTab(_props: TabProps) {
           <EvidenceCanvas result={lastResult} error={canvasError} busy={busy} />
         )}
 
-        <div className="mt-2 text-kbd text-dim2">
-          🔒 Answer-level grounding — every answer cites the sources that informed
-          it; per-claim citations are a marked fast-follow, never fabricated here.
-          Active response stays human-approved: the copilot can only{" "}
-          <b>propose</b> a containment (queued for approval), never execute one.
-        </div>
       </div>
 
       {/* ===== copilot rail (hero, right) ===== */}

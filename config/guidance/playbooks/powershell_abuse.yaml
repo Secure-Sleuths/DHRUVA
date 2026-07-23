@@ -1,0 +1,153 @@
+# =============================================================================
+# Investigation Playbook: Suspicious PowerShell Execution
+# Rule Groups: sysmon, windows, command_monitoring, powershell
+# MITRE: T1059.001 (PowerShell), T1027 (Obfuscation), T1105 (Ingress Tool Transfer),
+#        T1562.001 (Impair Defenses), T1053 (Scheduled Task), T1071 (C2)
+# Methodology reference: socworkflows.com "Suspicious PowerShell Investigation"
+#   (facts/checklist mined and rewritten into DHRUVA schema; prose not copied)
+# =============================================================================
+
+name: "Suspicious PowerShell Investigation"
+
+# SELECTION WARNING: see credential_dumping.yaml. select_playbook() is
+# first-match-wins over an unsorted glob, so broad groups ("sysmon", "windows",
+# "command_monitoring") would steal alerts from ransomware / malware_detection.
+# Triggers here stay narrow to PowerShell-specific telemetry.
+trigger_rule_groups:
+  - "powershell"
+
+# NOTE: script-block logging (EID 4104) must be ENABLED on the client's endpoints.
+# If absent, note it as an enrichment gap rather than assuming benign.
+#
+# trigger_rule_ids intentionally EMPTY: 91801/91802 were previously listed here
+# but both are level="0" PARENT rules in 0915-win-powershell_rules.xml, used for
+# if_sid inheritance. Level-0 rules emit no alert, never reach OpenSearch, and so
+# can never match in select_playbook(). The "powershell" group above is real
+# (Wazuh 4.3+) and is what actually routes alerts here.
+trigger_rule_ids: []
+
+investigation_steps:
+  - step: 1
+    name: "Decode and de-obfuscate the command"
+    query_template: |
+      SELECT timestamp, agent_name, agent_ip, data_command, data_srcuser,
+             data_file, rule_description
+      FROM {enriched_alerts_index}
+      WHERE agent_id = '{alert_agent_id}'
+        AND rule_group IN ('sysmon', 'windows', 'command_monitoring', 'powershell')
+        AND timestamp BETWEEN '{alert_timestamp}' - INTERVAL 15 MINUTES
+            AND '{alert_timestamp}' + INTERVAL 15 MINUTES
+      ORDER BY timestamp ASC
+    assess: |
+      - Encoding present? (-EncodedCommand / -enc / -e, Base64, hex, gzip+Base64)
+        Decode it and report the PLAINTEXT command in your reasoning.
+      - Obfuscation markers: string concatenation, backticks, char arrays,
+        -join / -replace chains, format-string operators, random casing.
+      - Execution-policy bypass: -ExecutionPolicy Bypass / -ep bypass / -nop.
+      - Hidden execution: -WindowStyle Hidden / -w hidden / -NonInteractive.
+      - Download cradles: IEX, Invoke-Expression, Invoke-WebRequest, DownloadString,
+        DownloadFile, Net.WebClient, Start-BitsTransfer, curl/wget aliases.
+      - Defense tampering: Set-MpPreference, Add-MpPreference -ExclusionPath,
+        Disable-WindowsOptionalFeature, AMSI bypass strings, ETW patching.
+
+  - step: 2
+    name: "Determine intent and map to MITRE"
+    assess: |
+      - State the command's purpose in PLAIN ENGLISH first, then map it:
+        * Download & execute payload      -> T1105 + T1059.001
+        * Credential access               -> T1003 (see credential_dumping playbook)
+        * Lateral movement                -> T1021 (WinRM, Invoke-Command, WMI)
+        * Persistence                     -> T1053 (task) / T1547 (run key)
+        * Defense evasion                 -> T1562.001
+        * Reconnaissance                  -> T1087 / T1082 / T1018
+        * C2 beaconing                    -> T1071
+      - Cite the exact command substring that supports each mapping. Do not map a
+        technique you cannot quote evidence for.
+      - Assign a confidence level per mapping.
+
+  - step: 3
+    name: "Examine process lineage and what the script touched"
+    query_template: |
+      SELECT timestamp, agent_name, rule_description, data_command,
+             data_file, data_srcuser, rule_group
+      FROM {enriched_alerts_index}
+      WHERE agent_id = '{alert_agent_id}'
+        AND timestamp BETWEEN '{alert_timestamp}' - INTERVAL 1 HOUR
+            AND '{alert_timestamp}' + INTERVAL 4 HOURS
+        AND rule_group IN ('sysmon', 'windows', 'syscheck', 'command_monitoring')
+      ORDER BY timestamp ASC
+      LIMIT 200
+    assess: |
+      - PARENT process: what launched PowerShell? A document handler
+        (winword.exe, excel.exe, outlook.exe) is a strong malicious indicator.
+      - CHILD processes spawned by PowerShell (cmd, rundll32, regsvr32, mshta).
+      - Files created or modified after execution (droppers, staged payloads).
+      - Persistence created: scheduled task (EID 4698), service (7045), run key.
+      - Did the user context change (privilege escalation)?
+
+  - step: 4
+    name: "Check network activity and C2 indicators"
+    query_template: |
+      SELECT timestamp, srcip, dstip, dstport, protocol,
+             data_bytes_sent, data_bytes_received, rule_description
+      FROM {enriched_alerts_index}
+      WHERE agent_id = '{alert_agent_id}'
+        AND rule_group IN ('firewall', 'network_connection', 'ids')
+        AND timestamp >= '{alert_timestamp}' - INTERVAL 30 MINUTES
+        AND timestamp <= '{alert_timestamp}' + INTERVAL 6 HOURS
+      ORDER BY timestamp ASC
+    assess: |
+      - Outbound connections to the URLs/IPs found in the decoded command?
+      - Beaconing pattern (regular interval, consistent small payload)?
+      - Any TI hits on the contacted domains/IPs?
+      - Large outbound transfers (exfiltration)?
+
+  - step: 5
+    name: "Hunt the same pattern across the estate"
+    query_template: |
+      SELECT DISTINCT agent_name, agent_ip, data_command, data_srcuser,
+             MIN(timestamp) as first_seen
+      FROM {enriched_alerts_index}
+      WHERE agent_id != '{alert_agent_id}'
+        AND rule_group IN ('sysmon', 'windows', 'powershell', 'command_monitoring')
+        AND timestamp >= '{alert_timestamp}' - INTERVAL 7 DAYS
+      GROUP BY agent_name, agent_ip, data_command, data_srcuser
+      ORDER BY first_seen ASC
+      LIMIT 100
+    assess: |
+      - Same decoded command or download URL on other hosts (campaign)?
+      - Same parent-process pattern elsewhere (shared initial-access vector)?
+
+verdict_criteria:
+  true_positive:
+    - "Encoded/obfuscated command that decodes to a download-and-execute cradle"
+    - "PowerShell spawned by a document handler (Office, Outlook, PDF reader)"
+    - "AV/AMSI/ETW tampering or Defender exclusion added by the script"
+    - "Decoded command contacts TI-flagged or newly registered infrastructure"
+    - "Execution followed by persistence creation or lateral movement"
+
+  false_positive:
+    - "Configuration management tooling (SCCM, Ansible, Intune, DSC, Chocolatey)"
+    - "Vendor installer or software-update script using encoded arguments"
+    - "Administrator running a known internal maintenance script from a jump box"
+    - "Monitoring/inventory agent invoking PowerShell on a fixed schedule"
+
+  needs_investigation:
+    - "Encoded command that decodes to something benign but from an unusual parent"
+    - "Script-block logging disabled — command line visible but content unknown"
+    - "Known admin tooling but executed outside the change window or by a new account"
+
+recommended_actions:
+  if_true_positive:
+    - "ISOLATE: network-isolate the host if download/execute or C2 is confirmed"
+    - "BLOCK: block the contacted domains/IPs at firewall and DNS"
+    - "PRESERVE: capture the full decoded script block and process tree as evidence"
+    - "REMOVE: remediate any persistence created (task, service, run key)"
+    - "RESET: reset credentials for the executing user if credential access indicated"
+    - "HUNT: sweep the estate for the same decoded command or download URL"
+    - "NOTIFY: escalate to client IR"
+
+  if_false_positive:
+    - "Tag alert with FP reason plus the owning tool/team for the feedback loop"
+    - "If recurring, propose tuning scoped to script path + signing cert + account (never a blanket 'encoded command' exclusion — that blinds the detection)"
+    - "Record the legitimate pattern in the baseline"

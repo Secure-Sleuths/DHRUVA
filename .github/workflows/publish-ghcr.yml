@@ -1,0 +1,114 @@
+name: Publish Community image (GHCR)
+
+# ============================================================================
+# Publishes the DHRUVA Community container image to GHCR.
+#
+# SECURITY POSTURE — this workflow is hardened against the known GitHub Actions
+# supply-chain vectors, because a poisoned image on a SOC product is the worst
+# possible outcome:
+#
+#  1. TRUSTED TRIGGER ONLY. Runs on a version-tag push (or a manual dispatch by
+#     a maintainer). Tags/dispatch require write access, so the source being
+#     built is always trusted. There is NO pull_request / pull_request_target
+#     trigger, so untrusted fork code can never run with packages:write (the
+#     "pwn request" class of attack).
+#  2. LEAST PRIVILEGE. permissions default to none; the job opts into only
+#     contents:read, packages:write, and id-token/attestations:write for
+#     provenance. The GITHUB_TOKEN is ephemeral — it dies with the run, so
+#     there is no long-lived package-write credential to leak (unlike a PAT).
+#  3. PINNED ACTIONS. Every action is pinned to a full commit SHA, not a
+#     mutable @v tag. Mutable tags are the primary vector — cf. the
+#     tj-actions/changed-files compromise (Mar 2025), where tag-pinned users
+#     were hit and SHA-pinned users were not.
+#  4. GITHUB-HOSTED RUNNER. No self-hosted runner, so no build ever runs on
+#     your own infrastructure.
+#  5. VERIFIABLE PROVENANCE. Emits SLSA build provenance + SBOM and a signed
+#     attestation, so anyone can cryptographically verify the image was built
+#     by THIS workflow from THIS commit:
+#        gh attestation verify oci://ghcr.io/secure-sleuths/dhruva:community \
+#          --repo Secure-Sleuths/DHRUVA
+#  6. NO PAID SOURCE PRESENT. This repo is the stripped Community edition, so
+#     the image is Community by construction — it physically cannot ship paid
+#     modules.
+#
+# Residual risk this workflow does NOT eliminate: an UPSTREAM dependency or base
+# image compromise (a poisoned pip/npm package, or python:3.13-slim itself).
+# That is inherent to any build; it is mitigated by pinned deps
+# (requirements.txt, package-lock.json) and a pinned/digest base image, and is
+# the reason the provenance attestation matters — it proves the build inputs.
+# ============================================================================
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: ghcr-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read       # checkout
+      packages: write      # push to GHCR
+      id-token: write      # keyless (OIDC) provenance attestation
+      attestations: write  # store the attestation
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Resolve version
+        id: ver
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # Untrusted context (REF_NAME) is read via env, never interpolated
+          # into this shell — avoids script injection.
+          if [ "$EVENT" = "push" ]; then
+            v="${REF_NAME#v}"
+          else
+            v="$(cat VERSION)"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=community
+            type=semver,pattern={{version}},suffix=-community,value=${{ steps.ver.outputs.version }}
+
+      - name: Build and push (Community tier)
+        id: build
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_TIER=community
+            DHRUVA_VERSION=${{ steps.ver.outputs.version }}
+          provenance: true
+          sbom: true
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1.4.4
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

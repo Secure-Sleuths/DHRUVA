@@ -1,9 +1,30 @@
-# DHRUVA 5.0.0 — Community Edition
+# DHRUVA 5.1.0 — Community Edition
 
 AI-augmented security operations layer for Wazuh SIEM. This package ships
 plaintext Python source; deploy via either the bash installer or Docker.
 
 Community edition — no license key required. Paid modules (Detection Agent, Hunt Agent, SOAR, ticketing, reporting, governance) are stripped from this build.
+
+## Quickest start — Docker (no clone, no build)
+
+The Community image is published to GHCR and is publicly pullable:
+
+```bash
+# run against your existing Postgres (set DATABASE_URL) —
+docker run -d --name dhruva -p 8443:8443 --env-file .env \
+  ghcr.io/secure-sleuths/dhruva:community
+
+# or bring up DHRUVA + a bundled Postgres:
+docker compose --profile bundled-db up -d
+```
+
+Verify the image's origin (SLSA provenance, signed by the publish workflow):
+
+```bash
+gh attestation verify oci://ghcr.io/secure-sleuths/dhruva:community --repo Secure-Sleuths/DHRUVA
+```
+
+Prefer to install from source instead? Continue below.
 
 ---
 

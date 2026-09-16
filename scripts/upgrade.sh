@@ -81,7 +81,7 @@ fi
 # Get current version. Use `|| true` so a missing `version:` line in a
 # thin operator overlay doesn't trip `set -euo pipefail` — pipefail
 # propagates grep's exit=1 (no match) through the pipeline and aborts
-# the whole upgrade. Reported by a client install 2026-05-13.
+# the whole upgrade. Reported by a client install, 2026-05-13.
 CURRENT_VERSION="unknown"
 if [[ -f "${INSTALL_DIR}/config/config.yaml" ]]; then
     PARSED=$(grep 'version:' "${INSTALL_DIR}/config/config.yaml" 2>/dev/null | head -1 | sed 's/.*"\(.*\)".*/\1/' || true)
@@ -114,8 +114,17 @@ echo ""
 echo -e "${GREEN}${BOLD}[STEP 2/6]${NC} ${BOLD}Backing up data${NC}"
 echo -e "${GREEN}$(printf '%.0s─' {1..50})${NC}"
 
+# WO-S2: this archive contains .env verbatim — JWT_SECRET,
+# TENANT_ENCRYPTION_KEY, ANONYMIZATION_SALT, DATABASE_URL and every
+# integration credential. install.sh deliberately restricts .env to 0640, but
+# the default umask would drop that restriction in the copy and leave a
+# permanent, predictably-named, world-readable secret archive that survives
+# any later hardening of .env itself. Restrict the directory and the file.
 mkdir -p "${BACKUP_DIR}"
+chmod 700 "${BACKUP_DIR}"
 BACKUP_FILE="${BACKUP_DIR}/pre-upgrade_${CURRENT_VERSION}_${TIMESTAMP}.tar.gz"
+(umask 077 && : > "${BACKUP_FILE}")
+chmod 600 "${BACKUP_FILE}"
 
 # Backup database
 #
@@ -177,8 +186,16 @@ echo ""
 echo -e "${GREEN}${BOLD}[STEP 4/6]${NC} ${BOLD}Upgrading code (preserving your data)${NC}"
 echo -e "${GREEN}$(printf '%.0s─' {1..50})${NC}"
 
-# Replace code directories
-for dir in src scripts; do
+# Replace code directories.
+#
+# `deploy/` carries the Wazuh active-response assets the operator installs onto
+# agents (the CVE-remediation package-upgrade script + its ossec.conf snippet).
+# It was missing from this list, so the assets shipped in every tarball but an
+# UPGRADE never delivered them — an existing install kept whatever version of
+# the AR script it was first installed with. That mattered for WO-H68, where
+# the fix to that script is the entire work item. Fresh installs were fine;
+# upgrades silently were not.
+for dir in src scripts deploy; do
     if [[ -d "${NEW_DIR}/${dir}" ]]; then
         rm -rf "${INSTALL_DIR}/${dir}"
         cp -r "${NEW_DIR}/${dir}" "${INSTALL_DIR}/${dir}"
@@ -186,8 +203,21 @@ for dir in src scripts; do
     fi
 done
 
-# Replace single code files
-for file in main.py main.pyc requirements.txt Dockerfile docker-compose.yml .dockerignore .env.template; do
+# Replace single code files.
+#
+# `VERSION` is the version single-source-of-truth that `src/__version__.py`
+# reads at import. It ships in every tarball but was never copied here, so an
+# upgraded install kept the VERSION file it was FIRST installed with — one
+# install reported `version=4.9.1` in every log line, API response
+# and dashboard while running 5.2.0 code, across three releases. Step 5 rewrites
+# the version in config.yaml, so the two sources disagreed silently.
+#
+# `alembic.ini` points at the migration scripts; `docker-entrypoint.sh` and
+# `deploy.sh` are code that changes alongside the Dockerfile and scripts/ that
+# were already replaced here.
+for file in VERSION alembic.ini deploy.sh docker-entrypoint.sh \
+            main.py main.pyc requirements.txt Dockerfile docker-compose.yml \
+            .dockerignore .env.template; do
     if [[ -f "${NEW_DIR}/${file}" ]]; then
         cp "${NEW_DIR}/${file}" "${INSTALL_DIR}/${file}"
         ok "Replaced ${file}"
@@ -334,18 +364,24 @@ echo -e "  ${CYAN}New version:${NC}       ${NEW_VERSION}"
 echo -e "  ${CYAN}Backup:${NC}            ${BACKUP_FILE}"
 echo ""
 echo -e "  ${CYAN}Your data is intact:${NC}"
-echo -e "    Database:      ${DATA_DIR}/ai-soc.db"
-echo -e "    Assets:        ${DATA_DIR}/assets.yaml"
-echo -e "    Identities:    ${DATA_DIR}/identities.yaml"
+echo -e "    Database:      Postgres — unchanged by this upgrade (see DATABASE_URL in .env)"
+echo -e "    Assets/IDs:    stored in Postgres (v4.9.0+ retired the on-disk YAML state)"
 echo -e "    Config:        ${INSTALL_DIR}/config/config.yaml"
+echo -e "    Guidance:      ${INSTALL_DIR}/config/guidance/"
 echo -e "    Credentials:   ${INSTALL_DIR}/.env"
 echo -e "    License:       ${INSTALL_DIR}/license.key"
 echo ""
 echo -e "  ${CYAN}Check logs:${NC}        sudo journalctl -u ${SERVICE_NAME} -f"
 echo -e "  ${CYAN}Dashboard:${NC}         http://localhost:8443"
 echo ""
-echo -e "  ${YELLOW}If anything goes wrong:${NC}"
+echo -e "  ${YELLOW}If anything goes wrong (rollback):${NC}"
 echo -e "    1. Stop:    sudo systemctl stop ${SERVICE_NAME}"
-echo -e "    2. Restore: cp ${DATA_DIR}/ai-soc.db.pre-upgrade-${TIMESTAMP} ${DATA_DIR}/ai-soc.db"
-echo -e "    3. Start:   sudo systemctl start ${SERVICE_NAME}"
+echo -e "    2. Restore the database from the pre-upgrade pg_dump you took before"
+echo -e "       upgrading. This script backs up config/env/license only, NOT Postgres:"
+echo -e "         pg_restore --clean --if-exists -d \"\$DATABASE_URL\" <your-pre-upgrade>.dump"
+echo -e "    3. Redeploy the PREVIOUS release code (re-run upgrade.sh with the old"
+echo -e "       package, or point Docker at the previous image tag), then restore your"
+echo -e "       config/env/license from:"
+echo -e "         ${BACKUP_FILE}"
+echo -e "    4. Start:   sudo systemctl start ${SERVICE_NAME}"
 echo ""

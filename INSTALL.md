@@ -1,4 +1,4 @@
-# DHRUVA 5.1.0 — Community Edition
+# DHRUVA 5.3.0 — Community Edition
 
 AI-augmented security operations layer for Wazuh SIEM. This package ships
 plaintext Python source; deploy via either the bash installer or Docker.

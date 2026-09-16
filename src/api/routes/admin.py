@@ -1,25 +1,33 @@
 """Admin, user management, audit log, and workspace routes."""
 
+import contextlib
 import uuid
 import structlog
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from src.api.auth import verify_jwt, require_admin, require_role, hash_password
+from src.api.auth import (
+    verify_jwt, require_admin, require_role, hash_password,
+    verify_password, revoke_token, require_cross_tenant_authority,
+)
 from src.api.dependencies import get_db, get_config, get_license_info, get_enrichment, limiter
 from src.api.feature_gates import require_user_quota, require_multi_tenant, get_license_tier_info
-from src.database.tenant_crypto import encrypt_config, decrypt_config
+from src.database.tenant_crypto import (encrypt_config, decrypt_config,
+                                         TenantCryptoError)
 from src.api.models import (
     CreateUserRequest, UpdateUserRequest, CreateTenantRequest,
     CreateAssetRequest, UpdateAssetRequest,
     CreateIdentityRequest, UpdateIdentityRequest,
     CreateLocalIOCRequest, UpdateDecisionCacheRequest,
+    ChangePasswordRequest, password_policy_error,
 )
 from src.database.store import PlatformUser
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
+_bearer = HTTPBearer()
 
 
 def _recompute_multi_tenant_mode(db):
@@ -120,6 +128,57 @@ def _validate_role_assignment(actor_role: str, target_role: str):
             ))
 
 
+# Rank for comparing the ACTOR against the TARGET of an account mutation.
+# Distinct from _ASSIGNABLE_ROLES, which answers "what may this actor grant?" —
+# a different question from "whose account may this actor take over?".
+_ROLE_RANK = {
+    "read_only": 0, "analyst": 1, "senior_analyst": 2,
+    "admin": 3, "mssp_admin": 4,
+}
+
+
+def _validate_target_privilege(actor: dict, target: dict, fields: dict):
+    """Refuse a mutation whose TARGET ranks at or above the actor (WO-S13).
+
+    ``update_user`` previously authorised only the NEW role value, via
+    ``_validate_role_assignment`` — and that check is skipped entirely when
+    ``body.role`` is None. It never looked at the target's CURRENT privilege
+    before writing ``password_hash``, ``salt`` or ``is_active``.
+
+    ``mssp_admin`` is a cross-tenant superuser that passes every
+    ``require_role`` check, and ``ALLOWED_ROLES`` deliberately makes it
+    unassignable through the API. But when ``SOC_ADMIN_ROLE=mssp_admin``,
+    ``main.py`` binds that superuser to the FIRST tenant's ``client_id`` — so it
+    shows up in that tenant's ``GET /api/admin/users``, and a plain ``admin``
+    could POST ``{"password": "..."}`` at its id and log in as the provider
+    superuser. Setting ``is_active=0`` on a peer is a lockout of the same kind.
+
+    Self-edits are always permitted: changing your own password or display name
+    must not require outranking yourself.
+    """
+    actor_role = actor.get("role", "")
+    if actor_role == "mssp_admin":
+        return  # the superuser may manage anyone
+
+    if actor.get("sub") and actor.get("sub") == target.get("username"):
+        return  # self-edit
+
+    target_role = target.get("role", "") or ""
+    actor_rank = _ROLE_RANK.get(actor_role, -1)
+    target_rank = _ROLE_RANK.get(target_role, len(_ROLE_RANK))  # unknown = highest
+
+    if target_rank >= actor_rank:
+        # Do NOT reveal the target's role — that would turn this into a probe
+        # for which accounts are privileged.
+        logger.warning("privileged_account_mutation_denied",
+                       actor=actor.get("sub"), actor_role=actor_role,
+                       target_role=target_role,
+                       fields=sorted(fields.keys()))
+        raise HTTPException(
+            status_code=403,
+            detail="Cannot modify an account with equal or higher privilege")
+
+
 @router.post("/api/admin/users")
 @limiter.limit("10/minute")
 async def create_user(
@@ -177,6 +236,10 @@ async def update_user(
         fields["salt"] = salt
     if not fields:
         raise HTTPException(status_code=400, detail="No fields to update")
+    # WO-S13: authorize against the TARGET's current privilege, not just the
+    # new role value. Runs after `fields` is built so the audit log records
+    # exactly what was attempted, and before any write.
+    _validate_target_privilege(user, target, fields)
     _db.update_user(user_id, fields)
     actor = user.get("sub", "unknown")
     _db.log_audit(actor, "user_update", "user", user_id,
@@ -213,6 +276,83 @@ async def get_my_audit_log(
     username = user.get("sub", "")
     entries = _db.get_audit_log(actor=username, limit=limit)
     return {"entries": entries, "total": len(entries)}
+
+
+# ---------------------------------------------------------------------------
+# Self-service password change (WO-H58)
+# ---------------------------------------------------------------------------
+
+@router.post("/api/my/password")
+@limiter.limit("5/minute")
+async def change_my_password(
+    request: Request,
+    body: ChangePasswordRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer),
+    user: dict = Depends(verify_jwt),
+):
+    """Change the CALLER's own password (any authenticated role).
+
+    Requires the current password even with a valid token: a stolen/idle token
+    alone must not be enough to lock out the real owner. On success the
+    presenting token is revoked so the change forces re-login.
+    """
+    _db = get_db()
+    username = user.get("sub", "")
+    client_ip = request.client.host if request.client else ""
+
+    # Generic error for both "user not found" and "wrong current password" so
+    # the response can't be used to probe which usernames exist.
+    invalid_current = HTTPException(
+        status_code=400, detail="Current password is incorrect")
+
+    # Resolve the caller from the JWT sub. allow_unscoped mirrors the login
+    # flow (env-seeded admins may carry no tenant in their token).
+    record = _db.get_user_by_username(username, allow_unscoped=True)
+    if not record or not record.get("is_active"):
+        logger.warning("self_password_change_no_user", actor=username, ip=client_ip)
+        raise invalid_current
+
+    if not verify_password(body.current_password,
+                           record["password_hash"], record["salt"]):
+        logger.warning("self_password_change_bad_current",
+                       actor=username, ip=client_ip)
+        raise invalid_current
+
+    # New-password policy (400, not Pydantic 422). Full complexity policy is
+    # shared with admin user management via password_policy_error.
+    policy_err = password_policy_error(body.new_password)
+    if policy_err:
+        raise HTTPException(status_code=400, detail=policy_err)
+    if body.new_password == body.current_password:
+        raise HTTPException(
+            status_code=400,
+            detail="New password must be different from the current password")
+
+    # Re-hash and persist for the CALLER ONLY.
+    pw_hash, salt = hash_password(body.new_password)
+    # Scope the write consistently with the read. The caller was resolved with
+    # allow_unscoped=True to support env-seeded/bootstrap admins whose JWT carries
+    # no client_id; those requests have NO tenant context, so the tenant-scoped
+    # write path (_tenant_filter/_tenant_value) would raise TenantContextRequired
+    # and 500 — silently breaking self-service for bootstrap admins. When the
+    # caller HAS a tenant, the middleware already set it (keeps correct per-tenant
+    # audit attribution); when they don't, use the cross_tenant bypass. record["id"]
+    # targets this exact authenticated user by primary key, so no cross-tenant leak.
+    write_scope = (contextlib.nullcontext() if record.get("client_id")
+                   else _db.cross_tenant())
+    with write_scope:
+        _db.update_user(record["id"], {"password_hash": pw_hash, "salt": salt})
+        _db.log_audit(username, "self_password_change", "user", record["id"],
+                      ip_address=client_ip)
+
+    # Force re-login: revoke the token that made this request.
+    revoke_token(credentials.credentials)
+
+    logger.info("self_password_changed", actor=username, ip=client_ip)
+    return {
+        "status": "password_changed",
+        "detail": "Password updated. Please sign in again with your new password.",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +483,24 @@ async def list_tenants(
     # Strip encrypted config, return metadata only
     result = []
     for t in tenants:
-        decrypted = decrypt_config(t.get("config_encrypted", ""))
+        # WO-S10: pass tenant_id. decrypt_config tries the per-tenant derived
+        # key FIRST and falls back to the global master, so this reads both
+        # legacy global-key rows and rows written with the derived key. Without
+        # it, a single tenant whose row was re-encrypted under the derived key
+        # (which PUT /api/response/auto-policy does) was permanently
+        # undecryptable here — and since this loop had no exception handling,
+        # ONE such row 500'd tenant listing for the ENTIRE estate.
+        try:
+            decrypted = decrypt_config(t.get("config_encrypted", ""),
+                                       tenant_id=t["id"])
+            config_readable = True
+        except TenantCryptoError as e:
+            # Degrade THIS row, not the whole endpoint. An operator must still
+            # be able to list and manage every other tenant.
+            logger.error("tenant_config_undecryptable",
+                         tenant_id=t["id"], error=str(e))
+            decrypted = {}
+            config_readable = False
         result.append({
             "id": t["id"],
             "name": t["name"],
@@ -356,6 +513,9 @@ async def list_tenants(
             "has_wazuh": "wazuh" in decrypted,
             "has_claude": "claude" in decrypted,
             "has_notifications": "notifications" in decrypted,
+            # False means the row could not be decrypted — an empty config and
+            # an unreadable one are different states and must not look alike.
+            "config_readable": config_readable,
         })
     return {"tenants": result}
 
@@ -373,7 +533,10 @@ async def get_tenant(
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    decrypted = decrypt_config(tenant.get("config_encrypted", ""))
+    # WO-S10: tenant-scoped key (falls back to the global master for legacy
+    # rows). Without it a derived-key row 500s this endpoint permanently.
+    decrypted = decrypt_config(tenant.get("config_encrypted", ""),
+                               tenant_id=tenant_id)
     # Mask secrets in the response (show first 4 chars only)
     masked = _mask_secrets(decrypted)
     return {
@@ -411,7 +574,9 @@ async def create_tenant(
             "id": tenant_id,
             "name": name,
             "slug": slug,
-            "config_encrypted": encrypt_config(config),
+            # WO-S10: single key-scope contract — every writer of this column
+            # passes tenant_id, so readers can always resolve it.
+            "config_encrypted": encrypt_config(config, tenant_id=tenant_id),
             "active": 1,
             "created_at": now,
             "updated_at": now,
@@ -471,9 +636,12 @@ async def update_tenant(
         updates["active"] = int(bool(body["active"]))
     if "config" in body:
         # Merge new config into existing (don't overwrite fields not provided)
-        existing_config = decrypt_config(tenant.get("config_encrypted", ""))
+        # WO-S10: read and write with the same tenant-scoped key.
+        existing_config = decrypt_config(tenant.get("config_encrypted", ""),
+                                         tenant_id=tenant_id)
         existing_config.update(body["config"])
-        updates["config_encrypted"] = encrypt_config(existing_config)
+        updates["config_encrypted"] = encrypt_config(existing_config,
+                                                     tenant_id=tenant_id)
 
     if updates:
         from psycopg import errors as _pg_errors
@@ -987,16 +1155,23 @@ _REMEDIATED_REASONING = (
 @limiter.limit("10/minute")
 async def count_triage_failures(
     request: Request,
-    user: dict = Depends(require_role("admin")),
+    user: dict = Depends(require_cross_tenant_authority()),
 ):
     """Count agent_decisions rows whose reasoning matches the v4.8.4
     LLM-backend failure marker. Read-only — does not modify any rows.
+
+    WO-S5: mssp_admin, NOT admin. This query runs inside ``cross_tenant()``,
+    which disables both the app-layer tenant guard and the Postgres RLS
+    backstop — so under ``require_role("admin")`` a per-tenant CUSTOMER
+    administrator could read every other tenant's decision rows. Matches the
+    gating on every other cross-tenant surface (``list_tenants``,
+    ``llm_usage``).
     """
     _db = get_db()
     conn = _db._get_conn()
-    # Admin diagnostic: this deliberately scans agent_decisions across ALL
-    # tenants (the v4.8.4 corruption was tenant-agnostic). Declare the intent
-    # explicitly so the WO-H8 tenant backstop allows the unscoped read.
+    # Provider-level diagnostic: this deliberately scans agent_decisions across
+    # ALL tenants (the v4.8.4 corruption was tenant-agnostic). Declare the
+    # intent explicitly so the WO-H8 tenant backstop allows the unscoped read.
     with _db.cross_tenant():
         cur = conn.execute(
             "SELECT COUNT(*) AS cnt FROM agent_decisions "
@@ -1031,17 +1206,37 @@ async def count_triage_failures(
 @limiter.limit("2/minute")
 async def clear_triage_failures(
     request: Request,
-    user: dict = Depends(require_role("admin")),
+    user: dict = Depends(require_cross_tenant_authority()),
 ):
     """Replace the v4.8.4 failure marker in agent_decisions.reasoning with
     a clear remediation note. Idempotent — re-running has no effect on
     rows already cleared.
+
+    WO-S5: mssp_admin, NOT admin. This UPDATE runs inside ``cross_tenant()``
+    with no ``client_id`` predicate, so under ``require_role("admin")`` a
+    per-tenant CUSTOMER administrator could overwrite the recorded AI reasoning
+    — the forensic record behind each triage verdict, unrecoverable per the
+    note below — on every OTHER tenant's rows.
     """
     _db = get_db()
     conn = _db._get_conn()
-    # Admin repair across ALL tenants (tenant-agnostic v4.8.4 corruption) —
-    # declared explicitly so the WO-H8 tenant backstop allows the unscoped write.
+    # Provider-level repair across ALL tenants (tenant-agnostic v4.8.4
+    # corruption) — declared explicitly so the WO-H8 tenant backstop allows the
+    # unscoped write.
     with _db.cross_tenant():
+        # Capture which tenants are actually touched BEFORE the write, so the
+        # audit record names the blast radius rather than just a row count.
+        affected_cur = conn.execute(
+            "SELECT DISTINCT client_id FROM agent_decisions "
+            "WHERE reasoning LIKE %s OR reasoning LIKE %s",
+            (f"%{_TRIAGE_FAILURE_MARKERS[0]}%",
+             f"%{_TRIAGE_FAILURE_MARKERS[1]}%"),
+        )
+        affected_tenants = sorted(
+            str(r["client_id"]) for r in affected_cur.fetchall()
+            if r["client_id"] is not None
+        )
+
         cur = conn.execute(
             "UPDATE agent_decisions SET reasoning = %s "
             "WHERE reasoning LIKE %s OR reasoning LIKE %s",
@@ -1055,8 +1250,12 @@ async def clear_triage_failures(
     actor = user.get("sub", "unknown")
     _db.log_audit(actor, "triage_failures_cleared", "system",
                   "agent_decisions",
-                  details={"rows_updated": updated},
+                  details={"rows_updated": updated,
+                           "affected_tenants": affected_tenants},
                   ip_address=request.client.host if request.client else "")
+    logger.warning("triage_failures_cleared",
+                   actor=actor, rows_updated=updated,
+                   affected_tenants=affected_tenants)
 
     return {"rows_updated": updated, "remediation_text": _REMEDIATED_REASONING}
 

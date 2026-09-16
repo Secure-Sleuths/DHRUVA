@@ -49,6 +49,10 @@ import {
 } from "@/lib/api";
 import { SEVERITY, riskSeverity, severityLabel } from "@/lib/severity";
 import { decisionPresentation } from "@/lib/triage";
+import {
+  decisionRiskBreakdown,
+  scorePresentation,
+} from "@/lib/incident";
 import { cn, focusRing } from "@/lib/ui";
 import {
   GlassBoxAlertCard,
@@ -411,7 +415,14 @@ export function TriageTab({ navParam }: TabProps) {
                 <TH>Rule</TH>
                 <TH>AI verdict</TH>
                 <TH>Confidence</TH>
-                <TH>Risk</TH>
+                {/* WO-H97 QA (D7): not "Risk". Under the bounded scorer this
+                    column is the RULE's track record — how often a human has
+                    confirmed the rule fired correctly — which is why a crawler
+                    getting thirty 404s reads 99. The row's severity glyph is
+                    still derived from the score (a queue is sorted by
+                    something), on the same ladder the backend now uses; the
+                    authoritative severity is on the incident. */}
+                <TH>Rule score</TH>
                 <TH>Claimed</TH>
                 <TH className="w-16" aria-label="Open" />
               </TR>
@@ -555,6 +566,7 @@ function TriageRow({
   onOpen: () => void;
 }) {
   const sev = riskSeverity(d.risk_score);
+  const score = scorePresentation(d.risk_score, decisionRiskBreakdown(d));
   const verdict = decisionPresentation({
     verdict: String(d.verdict),
     llm_failed: d.llm_failed,
@@ -590,8 +602,13 @@ function TriageRow({
       <TD>
         <ConfidenceBar value={d.confidence} width={72} />
       </TD>
-      <TD mono className={cn("font-bold", SEVERITY[sev].textClass)}>
-        {d.risk_score}
+      <TD
+        mono
+        className={cn("font-bold", score.tinted ? SEVERITY[sev].textClass
+                                                : "text-ink")}
+        title={score.caption}
+      >
+        {score.figure}
       </TD>
       {/* WO-H25 ownership — who is working this alert. Defensive: absent
           `claimed_by` (older backend / unclaimed) renders a quiet dash. */}
@@ -745,6 +762,10 @@ function DecisionCaseView({
         rule_mitre_tactics: row.tactic_ids,
       }),
     human_verdict: row.human_verdict ?? null,
+    // WO-H85 — the CURRENT reviewer's reason rides the same `SELECT *` row.
+    // `review_history` is deliberately left undefined here: the queue row does
+    // not carry it, so the card fetches the append-only history by id.
+    review_reason: row.review_reason ?? null,
     created_at: row.created_at,
     glass_box: glassBox ?? undefined,
     anonymized_fields: row.anonymized_fields,

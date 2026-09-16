@@ -1,31 +1,43 @@
 # SOC Shift Schedule — defines analyst shifts for handoff and routing.
-# Times are in UTC. Adjust for your timezone.
+# Times are UTC. Whole hours (14) and "HH:MM" (18:30) are both valid — a SOC on
+# a half-hour UTC offset (India +5:30, Iran +3:30, Nepal +5:45) needs the
+# "HH:MM" form to describe itself at all.
+#
+# EDIT THIS FROM THE UI: Admin -> Shift schedule (admin-only, PUT
+# /api/admin/shifts/schedule). The editor picks analysts from platform_users,
+# converts your local times to UTC, and refuses a schedule with a gap, an
+# overlap, an unstaffed shift, or a name that is not an active user. Saving
+# rewrites this file and regenerates its comments.
+#
+# WHY THE DEFAULT IS EMPTY: analyst names here drive real routing —
+# get_least_loaded_analyst() AUTO-ASSIGNS incidents to whoever this file says
+# is on duty. A shipped rota can only name people who do not exist on your
+# install, so the honest default is "no shifts configured" (the platform then
+# reports exactly that) rather than four phantom shifts staffed by nobody.
+#
+# Example of a valid three-shift rota (every day tiled exactly once, analysts
+# must be real active usernames on your install):
+#
+# shifts:
+#   - name: "Morning"
+#     start_utc: "02:30"    # 08:00 Asia/Kolkata
+#     end_utc: "10:30"      # 16:00 Asia/Kolkata
+#     days: []              # empty == every day
+#     analysts: ["alice"]
+#     on_call_primary: "alice"
+#
+#   - name: "Afternoon"
+#     start_utc: "10:30"    # 16:00 Asia/Kolkata
+#     end_utc: "18:30"      # 00:00 Asia/Kolkata
+#     days: []
+#     analysts: ["bob"]
+#     on_call_primary: "bob"
+#
+#   - name: "Night"
+#     start_utc: "18:30"    # 00:00 Asia/Kolkata
+#     end_utc: "02:30"      # 08:00 Asia/Kolkata — overnight, matched on the
+#     days: []              #   days it STARTS
+#     analysts: ["carol"]
+#     on_call_primary: "carol"
 
-shifts:
-  - name: "Morning Shift"
-    start_utc: 6
-    end_utc: 14
-    days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
-    analysts: []
-    on_call_primary: ""
-
-  - name: "Afternoon Shift"
-    start_utc: 14
-    end_utc: 22
-    days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
-    analysts: []
-    on_call_primary: ""
-
-  - name: "Night Shift"
-    start_utc: 22
-    end_utc: 6
-    days: ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-    analysts: []
-    on_call_primary: ""
-
-  - name: "Weekend Day"
-    start_utc: 8
-    end_utc: 20
-    days: ["saturday", "sunday"]
-    analysts: []
-    on_call_primary: ""
+shifts: []

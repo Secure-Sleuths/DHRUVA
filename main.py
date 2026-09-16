@@ -56,6 +56,13 @@ from src.mitre.coverage import MITRECoverageAnalyzer
 from src.knowledge_base.service import KnowledgeBaseService
 from src.database.tenant_registry import (
     TenantServiceRegistry, TenantConfigUnavailable)
+# Module level on purpose: importing these INSIDE _seed_default_tenant made
+# them function-locals for the whole function, so any failure raised before the
+# import line hit `except TenantCryptoError` with the name unbound. The
+# resulting UnboundLocalError is raised while EVALUATING the except clause, so
+# the sibling `except Exception` cannot catch it and the platform fails to
+# boot. Not paid-stripped, so a plain top-level import is safe.
+from src.database.tenant_crypto import encrypt_config, TenantCryptoError
 from src.guidance.loader import GuidanceLoader
 from src.api.server import app, init_api
 
@@ -155,6 +162,38 @@ class AISocPlatform:
         self.db = SOCDatabase(db_cfg.get("dsn"),
                               pool_size=db_cfg.get("pool_size"))
         logger.info("database_ready")
+
+        # WO-H78: bound the API threadpool, then verify the connection pool
+        # covers every thread that can hold a connection.
+        #
+        # `_get_conn` caches a pooled connection per thread and never returns
+        # it, so saturation is arithmetic rather than load — more DB-touching
+        # threads than pool slots means guaranteed exhaustion. Starlette runs
+        # sync routes on anyio's threadpool, which defaults to 40 and is by far
+        # the largest term; capping it makes the budget knowable instead of
+        # "however many requests happened to arrive at once".
+        # The cap itself CANNOT be applied here. anyio creates its default
+        # thread limiter lazily per event loop, so asking for it before uvicorn
+        # starts one raises — which is exactly what this code used to do, and
+        # it then budgeted against the value it had failed to set. The cap now
+        # lives in the API lifespan (src/api/app.py), which runs on the loop and
+        # still lands before the first request, so nothing can have filled the
+        # threadpool in between.
+        #
+        # This check stays because it runs before the scheduler does, and it
+        # catches a grossly undersized pool at boot rather than at 3am. The
+        # lifespan re-runs it with whatever count actually took effect.
+        api_threads = int((self.config.get("api") or {})
+                          .get("threadpool_size", 24))
+        self.db.assert_pool_covers_threads(
+            api_threadpool=api_threads,
+            triage_workers=int(((self.config.get("agents") or {})
+                                .get("triage") or {}).get("max_workers", 4)),
+            # APScheduler runs jobs concurrently, so count its worker ceiling
+            # rather than assuming only one job runs at a time.
+            scheduler_workers=int((self.config.get("scheduler") or {})
+                                  .get("max_workers", 10)),
+        )
 
         # Seed admin user from env if DB has no users (backward compat)
         # Runs before tenant context exists — use cross_tenant bypass
@@ -590,18 +629,115 @@ class AISocPlatform:
                 f"Build may be corrupted — contact SecureSleuths."
             )
 
-    def _warn_unresolved_env_vars(self, obj, path=""):
-        """Log warnings for any ${VAR} patterns that were not resolved."""
+    # WO-S8: config keys whose unresolved "${VAR}" placeholder would be used as
+    # the live authentication secret on an UNAUTHENTICATED route. Only these
+    # abort startup.
+    #
+    # NARROWED after QA (2026-08-03). The first version of this list also held
+    # api_key / password / jwt_secret / hash_salt / secret_key / encryption_key
+    # and matched on the last path segment alone. That aborted startup on 23
+    # keys in the SHIPPED config/config.yaml — including `llm.anthropic.api_key`
+    # (deliberately unset in Claude-Max CLI mode), `llm.openai.api_key` and
+    # `llm.groq.api_key` (unset whenever they are not the chosen provider, per
+    # the one-provider-per-client rule), every optional threat-intel feed key,
+    # and the documentation-only `multi_tenant_llm_example` block. It would have
+    # prevented every existing deployment from restarting after upgrade.
+    #
+    # The narrow rule is the correct one because the fail-hard is only load
+    # bearing where NOTHING ELSE checks: the two unauthenticated webhook routes,
+    # whose placeholder is a constant published in this repository's own
+    # config.yaml. Everywhere else a consumer already fails closed at point of
+    # use — `src/secret_guard.py` for webhooks, `anthropic_provider._init_api`
+    # for LLM keys, `AlertAnonymizer.__init__` for hash_salt in multi-tenant
+    # mode — so those stay warnings and let the owning component decide.
+    _SECURITY_CRITICAL_CONFIG_KEYS = frozenset([
+        "webhook_secret", "hmac_secret",
+    ])
+
+    # Documentation-only config sections: present to show operators the shape of
+    # a multi-tenant block, never read by any code path. Placeholders here are
+    # expected and must never be fatal.
+    _DOC_ONLY_CONFIG_PREFIXES = ("multi_tenant_llm_example",)
+
+    def _collect_unresolved_env_vars(self, obj, path="", found=None):
+        """Return [(path, placeholder)] for every unresolved ${VAR} in config."""
+        if found is None:
+            found = []
         if isinstance(obj, str):
             if obj.startswith("${") and obj.endswith("}"):
-                logger.warning("unresolved_env_var", path=path, var=obj)
+                found.append((path, obj))
         elif isinstance(obj, dict):
             for k, v in obj.items():
-                self._warn_unresolved_env_vars(
-                    v, f"{path}.{k}" if path else k)
+                self._collect_unresolved_env_vars(
+                    v, f"{path}.{k}" if path else k, found)
         elif isinstance(obj, list):
             for i, v in enumerate(obj):
-                self._warn_unresolved_env_vars(v, f"{path}[{i}]")
+                self._collect_unresolved_env_vars(v, f"{path}[{i}]", found)
+        return found
+
+    @staticmethod
+    def _section_is_enabled(config: dict, var_path: str) -> bool:
+        """True unless an ancestor section of ``var_path`` is explicitly disabled.
+
+        WO-S8 (narrowed after QA). A placeholder secret under a feature that is
+        turned off cannot be used to authenticate anything, so it must not
+        prevent startup — `ticketing.enabled: false` is the shipped default, and
+        the stock config carries `${JIRA_WEBHOOK_SECRET}` under it.
+
+        Walks the ancestors from the top down and returns False on the first
+        one carrying ``enabled: false``. Fails OPEN (True) when it cannot tell,
+        so an unrecognised shape still gets the strict treatment.
+        """
+        parts = [p.split("[")[0] for p in var_path.split(".")]
+        node = config
+        for part in parts[:-1]:
+            if not isinstance(node, dict):
+                return True
+            node = node.get(part)
+            if isinstance(node, dict) and node.get("enabled") is False:
+                return False
+        return True
+
+    def _warn_unresolved_env_vars(self, obj, path=""):
+        """Warn on unresolved ${VAR}; FAIL HARD when one is used as a secret.
+
+        WO-S8. Previously every unresolved placeholder was a warning, including
+        the webhook HMAC secrets that authenticate the platform's only two
+        unauthenticated routes. A warning in a startup log is not a control:
+        the platform came up, served traffic, and accepted forged webhooks.
+        """
+        unresolved = self._collect_unresolved_env_vars(obj, path)
+        fatal = []
+        for var_path, placeholder in unresolved:
+            last = var_path.rsplit(".", 1)[-1].split("[")[0].lower()
+            if (last in self._SECURITY_CRITICAL_CONFIG_KEYS
+                    and not var_path.startswith(self._DOC_ONLY_CONFIG_PREFIXES)
+                    and self._section_is_enabled(obj, var_path)):
+                fatal.append((var_path, placeholder))
+            else:
+                logger.warning("unresolved_env_var", path=var_path,
+                               var=placeholder)
+
+        if not fatal:
+            return
+
+        for var_path, placeholder in fatal:
+            logger.critical(
+                "unresolved_security_critical_env_var",
+                path=var_path, var=placeholder,
+                detail="This value is used as a SECRET. The referenced "
+                       "environment variable is not set, so the literal "
+                       "placeholder — a publicly-known constant — would be "
+                       "used as the live secret.",
+                remediation="Set the environment variable, or remove the key "
+                            "from config. Generate a secret with: python3 -c "
+                            "'import secrets; print(secrets.token_urlsafe(32))'")
+        raise SystemExit(
+            "FATAL: unresolved ${VAR} placeholder in security-critical config: "
+            + ", ".join(f"{p} ({v})" for p, v in fatal)
+            + ". Refusing to start — the placeholder would be used as the live "
+              "secret. Set the referenced environment variables, or remove "
+              "those keys from config.")
 
     def _resolve_env_vars(self, obj):
         """Recursively resolve ${ENV_VAR} patterns."""
@@ -751,7 +887,9 @@ class AISocPlatform:
         current config.yaml and license client_id.
         """
         # Tenant seeding runs before any tenant context exists — bypass fail-closed filter
-        from src.database.store import _tenant_ctx, _CROSS_TENANT
+        from src.database.store import (
+            _tenant_ctx, _CROSS_TENANT, TenantRecordUnavailable,
+            TenantListUnavailable)
         _ctx_token = _tenant_ctx.set(_CROSS_TENANT)
         try:
             if self.db.tenant_exists():
@@ -759,21 +897,66 @@ class AISocPlatform:
                 # so agents (triage, detection, etc.) tag new rows correctly.
                 # Use license client_id to find the right tenant (not first alphabetically)
                 license_client_id = getattr(self._license_info, "client_id", None)
+                tenant_id = None
+                lookup_failed = False
                 if license_client_id:
-                    tenant = self.db.get_tenant(license_client_id)
+                    # WO-H91: {} means "no such tenant" — fall through to the
+                    # active list, which is the long-standing behaviour. The
+                    # exception means "we could not find out", which is NOT
+                    # absence and must not fall through: the licensed tenant
+                    # may well be sitting right there in the active list, and
+                    # picking active[0] instead would adopt a DIFFERENT
+                    # tenant's id for the whole of startup — set_tenant() for
+                    # every cycle, and backfill_null_client_ids stamping every
+                    # unclaimed row across 15 tables with the wrong client_id.
+                    try:
+                        tenant = self.db.get_tenant(license_client_id)
+                    except TenantRecordUnavailable as e:
+                        logger.error(
+                            "seed_tenant_license_lookup_failed",
+                            error=str(e)[:200],
+                            detail="could not establish whether the licensed "
+                                   "tenant exists. NOT falling back to the "
+                                   "first active tenant — that would adopt "
+                                   "another tenant's id.")
+                        tenant = {}
+                        lookup_failed = True
                     if tenant:
-                        tenant_id = tenant["id"]
-                    else:
-                        tenant_id = self.db.get_active_tenants()[0]["id"]
-                else:
-                    tenant_id = self.db.get_active_tenants()[0]["id"]
+                        tenant_id = tenant.get("id")
+                if not tenant_id and not lookup_failed:
+                    # WO-H91: this was `get_active_tenants()[0]["id"]` on both
+                    # branches, with no length check — an empty list (every
+                    # tenant deactivated) raised IndexError and killed startup.
+                    # The read itself failing now raises rather than arriving
+                    # here as an empty list (TenantListUnavailable), so "no
+                    # active tenants" means exactly that.
+                    try:
+                        active = self.db.get_active_tenants()
+                    except TenantListUnavailable as e:
+                        logger.error("seed_tenant_active_list_unavailable",
+                                     error=str(e)[:200])
+                        active = []
+                    if active:
+                        tenant_id = active[0].get("id")
+                if not tenant_id:
+                    # Do not invent a tenant and do not backfill rows against a
+                    # guessed id — backfill_null_client_ids stamps every
+                    # unclaimed row with whatever it is given. Carry on without
+                    # tenant context and say so; the platform starts, and the
+                    # per-tenant paths fail closed on their own.
+                    logger.error(
+                        "seed_tenant_context_unresolved",
+                        has_license_client_id=bool(license_client_id),
+                        licensed_tenant_lookup_failed=lookup_failed,
+                        detail="tenant_exists() is true but no active tenant "
+                               "could be resolved. client_id stays unset and "
+                               "no NULL-client_id backfill was run.")
+                    return
                 self.config["client_id"] = tenant_id
                 # Backfill any rows that still have NULL client_id
                 # (happens when migration 7 ran before tenant was seeded)
                 self.db.backfill_null_client_ids(tenant_id)
                 return
-
-            from src.database.tenant_crypto import encrypt_config
 
             # Build tenant config from existing flat config
             tenant_config = {}
@@ -806,7 +989,10 @@ class AISocPlatform:
                 "id": tenant_id,
                 "name": tenant_name,
                 "slug": slug,
-                "config_encrypted": encrypt_config(tenant_config),
+                # WO-S10: tenant-scoped key, matching every other writer of
+                # this column (admin routes, response.py auto-policy).
+                "config_encrypted": encrypt_config(tenant_config,
+                                                   tenant_id=tenant_id),
                 "active": 1,
                 "created_at": now,
                 "updated_at": now,
@@ -824,6 +1010,18 @@ class AISocPlatform:
                          tenant_id=tenant_id,
                          tenant_name=tenant_name)
 
+        except TenantCryptoError as e:
+            # WO-H75: seeding is a WRITE, so it fails closed when there is no
+            # durable TENANT_ENCRYPTION_KEY. Previously it wrote the row under
+            # a process-local key, which nothing could decrypt on the next
+            # boot. Boot continues (unchanged behaviour) but says exactly what
+            # to fix — without a tenant row the platform has no client_id.
+            logger.error(
+                "default_tenant_seed_blocked_no_master_key",
+                error=str(e),
+                remediation="Set TENANT_ENCRYPTION_KEY in .env (deploy.sh "
+                            "generates it) and restart to seed the default "
+                            "tenant.")
         except Exception as e:
             logger.warning("default_tenant_seed_failed", error=str(e))
         finally:
@@ -1097,8 +1295,13 @@ class AISocPlatform:
             def _retention_prune():
                 try:
                     with self.db.cross_tenant():
+                        # Operator config layered over the shipped defaults,
+                        # so a table added in a later release is not silently
+                        # keep-forever on an install whose config predates it.
+                        # An explicit 0 still means keep forever.
                         results = self.db.prune_expired_rows(
-                            ret_cfg.get("days", {}) or {},
+                            SOCDatabase.resolve_retention_days(
+                                ret_cfg.get("days")),
                             batch_size=int(ret_cfg.get("batch_size", 10000)))
                     logger.info("retention_prune_cycle_completed",
                                 deleted={t: n for t, n in results.items() if n})
@@ -1322,11 +1525,27 @@ class AISocPlatform:
         self.scheduler.start()
 
     def _get_active_tenant_ids(self) -> list[str]:
-        """Get all active tenant IDs for per-tenant scheduled jobs."""
+        """Get all active tenant IDs for per-tenant scheduled jobs.
+
+        WO-H91 (QA D2): ``get_active_tenants`` now raises
+        ``TenantListUnavailable`` instead of returning ``[]`` when the read
+        fails. The fallback below is UNCHANGED — it narrows this cycle to the
+        configured default tenant, which is the safe side — but the failure is
+        no longer swallowed without a word.
+        """
+        from src.database.store import TenantListUnavailable
         try:
             with self.db.cross_tenant():
                 tenants = self.db.get_active_tenants()
             return [t["id"] for t in tenants]
+        except TenantListUnavailable as e:
+            logger.error("active_tenant_list_unavailable_for_cycle",
+                         error=str(e)[:200],
+                         detail="falling back to the configured default "
+                                "tenant for this cycle only; other tenants "
+                                "are NOT processed this round.")
+            default = self.config.get("client_id")
+            return [default] if default else []
         except Exception:
             # Fallback: use the default tenant from config
             default = self.config.get("client_id")
@@ -1490,13 +1709,33 @@ class AISocPlatform:
 
         In multi-tenant mode, iterates all active tenants.
         In single-tenant mode, uses the configured default tenant.
+
+        WO-H91 (QA D2): the same read as ``_get_active_tenant_ids``, and its
+        behaviour on a failed read CHANGED here. It used to come back as ``[]``
+        — poll nothing this cycle. It now raises, falls through, and returns
+        ``[client_id]`` — poll only the default tenant, so in a multi-tenant
+        deployment every OTHER tenant's alert ingestion stops for this cycle.
+        Better for availability than ingesting nothing, but not something that
+        may happen quietly: the bare ``except Exception: pass`` this replaces
+        is why a tenant could stop being polled with no record anywhere.
         """
-        from src.database.store import is_multi_tenant
+        from src.database.store import is_multi_tenant, TenantListUnavailable
         if is_multi_tenant():
             try:
                 return self.tenant_registry.get_active_tenant_ids()
-            except Exception:
-                pass
+            except TenantListUnavailable as e:
+                logger.error(
+                    "alert_loop_tenant_list_unavailable",
+                    error=str(e)[:200],
+                    detail="could not establish the active-tenant list. "
+                           "Polling ONLY the configured default tenant this "
+                           "cycle — every other tenant's alert ingestion is "
+                           "paused until the next cycle succeeds.")
+            except Exception as e:                   # noqa: BLE001
+                logger.error("alert_loop_tenant_list_failed",
+                             error=str(e)[:200],
+                             detail="falling back to the configured default "
+                                    "tenant for this cycle only.")
         default_tenant = self.config.get("client_id")
         return [default_tenant] if default_tenant else ["default"]
 
@@ -1594,6 +1833,21 @@ class AISocPlatform:
             try:
                 from src.api.liveness import record_cycle
                 record_cycle()
+            except Exception:
+                pass
+
+            # WO-H129: if this process is running against a PostgreSQL server
+            # below the supported floor, keep saying so. A single boot line is
+            # what the below-floor install already had (0018 printed its SKIP) and it
+            # scrolled away unread for months. Called every cycle, but the line
+            # is RATE-LIMITED inside pg_version — first detection, every state
+            # change, then at most hourly. This loop polls every ~10 s, and an
+            # ERROR repeated 8 640 times a day gets filtered, which is the same
+            # defect WO-H105 and WO-H107 were filed for. /api/health reports the
+            # condition continuously and is not throttled. No-op when supported.
+            try:
+                from src.database import pg_version
+                pg_version.log_if_unsupported(logger)
             except Exception:
                 pass
 
@@ -1777,10 +2031,31 @@ class AISocPlatform:
                                message="No SSL cert/key configured. "
                                        "Set api.ssl.certfile and api.ssl.keyfile "
                                        "for HTTPS.")
+        # WO-H67: run the platform's own shutdown when the API server stops.
+        #
+        # `_setup_signal_handlers` installs SIGTERM/SIGINT handlers in start(),
+        # but `uvicorn.run()` REPLACES them with its own. So on `systemctl stop`
+        # uvicorn began its graceful shutdown while `stop()` was never called:
+        # the APScheduler kept running and — the part that actually costs
+        # something — the WO-H9 BOUNDED DRAIN of the triage worker pool never
+        # executed, so alerts already dequeued for triage lost their decision
+        # and their checkpoint instead of being saved. systemd then hit
+        # TimeoutStopSec and SIGKILLed the process ("Failed with result
+        # 'timeout'"), which is why the unit kept landing in `failed`.
+        #
+        # Registering stop() as an ASGI shutdown handler is the reliable hook:
+        # uvicorn runs it during graceful shutdown regardless of who owns the
+        # signal handlers.
+        app.add_event_handler("shutdown", self.stop)
+
         uvicorn.run(app, **uvicorn_kwargs)
 
     def stop(self):
-        """Graceful shutdown."""
+        """Graceful shutdown. Idempotent — may be called by both the ASGI
+        shutdown hook and a direct signal handler."""
+        if getattr(self, "_stopped", False):
+            return
+        self._stopped = True
         logger.info("platform_stopping")
         self.running = False
         self._shutdown_event.set()
@@ -1796,6 +2071,40 @@ class AISocPlatform:
             except Exception:
                 pass
         logger.info("platform_stopped")
+
+
+def _check_migrate_server_version(dsn: str):
+    """WO-H129: apply the PostgreSQL floor BEFORE running migrations.
+
+    ``--migrate`` is where a fresh install first touches its database, so it is
+    the earliest honest place to say "this server is too old" — before 0018
+    prints its SKIP line and the install proceeds looking healthy. The verdict
+    is the same one the store applies at boot, from the same module:
+
+      * fresh + below floor    -> exit 1, nothing has been migrated
+      * populated + below floor -> WARN and continue. Refusing would block
+        ``upgrade.sh`` on an existing client, i.e. it would turn a routine
+        version upgrade into a failed deploy. That is the exact "bricks a
+        running client" outcome the floor is not allowed to cause.
+
+    Any failure to connect is left to alembic, which reports it better.
+    """
+    try:
+        import psycopg
+        from src.database import pg_version
+    except Exception:                                    # pragma: no cover
+        return
+    try:
+        with psycopg.connect(dsn, connect_timeout=10, autocommit=True) as conn:
+            verdict = pg_version.check_connection(conn)
+    except Exception:
+        return
+    if verdict.ok:
+        return
+    if verdict.action == pg_version.ACTION_REFUSE:
+        sys.stderr.write("error: %s\n" % verdict.message)
+        sys.exit(1)
+    sys.stderr.write("warning: %s\n" % verdict.message)
 
 
 def _run_alembic_upgrade():
@@ -1821,6 +2130,7 @@ def _run_alembic_upgrade():
             "error: DATABASE_URL not set — set it to your Postgres libpq URI "
             "before running --migrate (see docs/MIGRATION-FROM-SQLITE.md).\n")
         sys.exit(1)
+    _check_migrate_server_version(os.environ["DATABASE_URL"])
     repo_root = Path(__file__).resolve().parent
     migrations_dir = repo_root / "src" / "database" / "migrations"
     cfg = Config()

@@ -24,6 +24,10 @@ class OpenPhishCollector(BaseFeedCollector):
         resp.raise_for_status()
 
         iocs = []
+        # WO-H90: per-indicator host-extraction failures are counted, not
+        # logged, and reported once at the end of the cycle. See below.
+        _host_extract_failures = 0
+        _last_host_error = ""
         for line in resp.text.strip().splitlines():
             url = line.strip()
             if not url or not url.startswith("http"):
@@ -57,8 +61,21 @@ class OpenPhishCollector(BaseFeedCollector):
                         tags=["phishing"],
                         expires_at=self._default_expiry(30),
                     ))
-            except Exception:
-                pass
+            except Exception as e:                       # noqa: BLE001
+                # WO-H90: was a bare `except: pass`. A failure here means the
+                # DOMAIN half of each phishing indicator is dropped, so a hit on
+                # the domain alone (a different URL path on the same host) never
+                # matches and the alert reads clean. HOT LOOP — this runs per
+                # URL in a feed of thousands, so it is counted here and reported
+                # ONCE below rather than logged per indicator.
+                _host_extract_failures += 1
+                _last_host_error = str(e)[:200]
+
+        if _host_extract_failures:
+            logger.warning("openphish_host_extraction_failed",
+                           feed=self.FEED_NAME,
+                           failed=_host_extract_failures,
+                           error=_last_host_error)
 
         return self._store(iocs)
 

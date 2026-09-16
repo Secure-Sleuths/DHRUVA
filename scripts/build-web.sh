@@ -9,6 +9,22 @@
 # for index.html. No build artifacts are committed (Option 1: build at release
 # time); .gitignore ignores both web/out/ and src/api/static/app/.
 #
+# WO-H132 — WHY THIS BUILDS FROM A STAGED COPY AND NOT FROM web/ IN PLACE
+# ========================================================================
+# The Next App Router routes on the DIRECTORY, so every page under web/src/app
+# becomes a route in the static export whether or not git has ever heard of it.
+# web/.gitignore line 42 ignores /src/app/shotharness — a screenshot-only dev
+# harness — and on the working repo those pages exist on disk and are filled
+# with realistic data. Measured: `next build` compiled them into
+# out/_next/static/chunks/app/shotharness/h86/page-*.js, carrying a live
+# client's hostname, and that export is staged into src/api/static/app and
+# packaged by BOTH tarball lanes and the Docker image. A dev-only route is not
+# a shipped route, and a git-ignored file is not project content.
+#
+# So the build runs against a tracked-files-only copy of web/. node_modules is
+# not copied (npm ci recreates it from the tracked package-lock.json, which is
+# what npm ci does anyway), so this costs nothing it was not already paying.
+#
 # Usage: bash scripts/build-web.sh
 # Output: src/api/static/app/index.html (+ hashed _next assets)
 # =============================================================================
@@ -18,8 +34,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WEB_DIR="${PROJECT_DIR}/web"
-WEB_OUT="${WEB_DIR}/out"
 SPA_DEST="${PROJECT_DIR}/src/api/static/app"
+
+# shellcheck source=lib/tracked_copy.sh
+source "${SCRIPT_DIR}/lib/tracked_copy.sh"
+
+# Staged under DHRUVA_BUILD_DIR for the same reason the packagers are: /tmp is
+# a 1.9 GB tmpfs on this build host and a node_modules tree does not always fit.
+# mktemp, not a fixed name: the community and full tarballs are built
+# back-to-back in CI and a shared staging path would have them racing.
+STAGE_ROOT="${DHRUVA_BUILD_DIR:-/tmp}"; mkdir -p "${STAGE_ROOT}"
+WEB_STAGE="$(mktemp -d -p "${STAGE_ROOT}" dhruva-web-build.XXXXXXXX)"
+WEB_SRC="${WEB_STAGE}/web"
+WEB_OUT="${WEB_SRC}/out"
 
 echo "============================================================"
 echo "  DHRUVA — Frontend SPA build (Next.js static export)"
@@ -35,7 +62,14 @@ if [ ! -d "${WEB_DIR}" ]; then
     exit 1
 fi
 
-cd "${WEB_DIR}"
+echo "[0/3] Staging tracked web/ sources -> ${WEB_SRC} ..."
+# node_modules under the stage is ~0.5 GB and DHRUVA_BUILD_DIR defaults to a
+# 1.9 GB tmpfs. Reclaim it however this script exits.
+trap 'rm -rf "${WEB_STAGE}"' EXIT
+tracked_copy_skipped "${PROJECT_DIR}" web
+tracked_copy "${PROJECT_DIR}" "${WEB_STAGE}" web
+
+cd "${WEB_SRC}"
 
 echo "[1/3] Installing web dependencies (npm ci)..."
 npm ci

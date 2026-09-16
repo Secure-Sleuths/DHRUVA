@@ -99,6 +99,11 @@ export interface TriageDecision {
   escalated?: boolean;
   human_verdict?: TriageVerdict | string | null;
   /**
+   * WO-H85 — the reviewer's free-text reason for `human_verdict`. Rides the
+   * same `SELECT *` row the queue serves; surfaced on the decision case view.
+   */
+  review_reason?: string | null;
+  /**
    * WO-H46-c: true when the LLM was unreachable and triage FAILED CLOSED — the
    * alert was escalated WITHOUT being analyzed. Such a row carries
    * `verdict: 'needs_investigation'` + `escalated: true` + `confidence: 0`,
@@ -307,7 +312,28 @@ export interface RiskBreakdown {
   host_fim_recent_changes?: number;
   raw_score?: number;
   clamped_score?: number;
-  [key: string]: number | string | undefined;
+  /**
+   * WO-H71 bounded scorer: `"bounded"` (the default since v5.x) or `"legacy"`.
+   * The two models record COMPLETELY different keys — the legacy one the
+   * multiplier chain above, the bounded one the fields below — so read `model`
+   * before reading anything else.
+   */
+  model?: string;
+  /** bounded: share of HUMAN labels on this rule that said the rule fired correctly */
+  rule_tp_rate_human?: number | null;
+  /** bounded: how many human labels the rule has (0 = never labelled) */
+  rule_human_labels?: number;
+  /** bounded: how many of those said true_positive */
+  rule_human_tp?: number;
+  /** bounded: smoothed probability actually used, 0..1 */
+  smoothed_p?: number;
+  /** bounded: false when the rule has too few human labels to have a record */
+  confident?: boolean;
+  /** bounded: plain-language reason `confident` is false */
+  confidence_reason?: string;
+  /** bounded: the cold-start prior, present only when `confident` is false */
+  unknown_rule_rate?: number | null;
+  [key: string]: number | string | boolean | null | undefined;
 }
 
 /** WO-B4 provenance for THIS exact verdict. Any field may be null on old rows. */
@@ -393,6 +419,54 @@ export interface IncidentAlert {
    * (a member alert IS an agent_decisions row). Absent → unclaimed. */
   claimed_by?: string | null;
   claimed_at?: string | null;
+  /**
+   * WO-H85 — the CURRENT human reviewer's free-text reason (`review_reason`).
+   * It has ridden the `SELECT *` row all along and reached no component: 6,400+
+   * closure reasons existed only in the database, so the analyst who wrote one
+   * could not read it back. Rendered on the decision panel now.
+   */
+  review_reason?: string | null;
+  /**
+   * WO-H85 — the APPEND-ONLY review history, attached by
+   * `GET /api/incidents/{id}` (batched server-side, oldest first). ABSENT on
+   * older backends; an empty array means nobody has reviewed this alert.
+   * Shown BEFORE the override form so a reviewer sees they are disagreeing
+   * with a colleague, and can read what that person said.
+   */
+  review_history?: DecisionReview[];
+}
+
+/**
+ * One APPEND-ONLY entry in an alert's review history (`decision_reviews`,
+ * WO-H85) — the alert-level equivalent of `IncidentTimelineEntry`. Previous
+ * entries are never mutated: a second override APPENDS, it does not overwrite.
+ */
+export interface DecisionReview {
+  id: string;
+  /** strictly monotonic read order (a BIGSERIAL, not a timestamp). */
+  seq?: number;
+  decision_id: string;
+  reviewer: string;
+  human_verdict?: TriageVerdict | string | null;
+  /** free text — the specific finding. Never an enum. */
+  reason?: string | null;
+  /** the verdict this review replaced; null when it was the first. */
+  previous_verdict?: TriageVerdict | string | null;
+  /**
+   * `"human_review"` (a person judged THIS alert) or
+   * `"incident_verdict_propagation"` (an opt-in incident-level apply that only
+   * ever filled an EMPTY verdict). An inherited label must never read as an
+   * individually-judged one.
+   */
+  source?: string;
+  created_at?: string;
+}
+
+/** `GET /api/triage/decisions/{id}/reviews` envelope (WO-H85). */
+export interface DecisionReviewsResponse {
+  decision_id: string;
+  reviews: DecisionReview[];
+  count: number;
 }
 
 /** One incident-timeline entry (append-only audit of the case). */
@@ -431,6 +505,13 @@ export interface IncidentListRow {
   flagged_interesting?: boolean | number | null;
   /** notes attached when flagged interesting. */
   interesting_notes?: string | null;
+  /**
+   * WO-H85 — the free-text reason recorded with the CURRENT status
+   * (`incidents.status_reason`). It has been on the wire since WO-B3 and was
+   * rendered nowhere, so the next shift could not see why anything was closed.
+   * The full history of prior reasons stays in `timeline`.
+   */
+  status_reason?: string | null;
 }
 
 /** `GET /api/incidents` envelope. */
@@ -448,6 +529,31 @@ export interface IncidentDetail extends IncidentListRow {
   affected_ips?: string | string[] | null;
   alerts: IncidentAlert[];
   timeline: IncidentTimelineEntry[];
+  /** WO-H85 — read-only preview of what a verdict propagation WOULD do. */
+  verdict_propagation?: IncidentVerdictPropagationPreview;
+}
+
+/**
+ * `verdict_propagation` on the incident detail (WO-H85) — what an opt-in
+ * verdict propagation would touch, computed server-side.
+ *
+ * `agree === false` means the incident's member alerts DO NOT already agree
+ * with each other, which is exactly when one blanket verdict is most likely to
+ * be wrong (one observed chain correlated 24 distinct source addresses — our
+ * own operational access, staff ranges, and genuine attackers — purely because
+ * they touched the same host). The control warns on it.
+ */
+export interface IncidentVerdictPropagationPreview {
+  /** member alerts on this incident. */
+  total: number;
+  /** members with NO human verdict — the ones propagation would fill. */
+  eligible: number;
+  /** members a human already judged — propagation REFUSES these. */
+  protected: number;
+  /** the distinct effective verdicts across the members. */
+  distinct_verdicts: string[];
+  /** true when every member currently carries the same effective verdict. */
+  agree: boolean;
 }
 
 /**
@@ -475,6 +581,19 @@ export interface TriageReviewBody {
 export type IncidentStatus = "open" | "investigating" | "resolved" | "closed";
 
 /**
+ * WO-H112 — the five closure reasons a metric can count.
+ *
+ * "normal action", the free text an analyst used to close the one real
+ * intrusion of August 2026, is deliberately not among them.
+ */
+export type IncidentClosureReason =
+  | "true_positive"
+  | "benign_positive"
+  | "false_positive"
+  | "duplicate"
+  | "insufficient_data";
+
+/**
  * `POST /api/incidents/{id}/status` (WO-B3) — `IncidentStatusRequest`. `reason`
  * is MANDATORY server-side (empty/whitespace → 422); the panel disables submit
  * until a reason is present so it never fires a request the server rejects.
@@ -484,6 +603,51 @@ export type IncidentStatus = "open" | "investigating" | "resolved" | "closed";
 export interface IncidentStatusChangeBody {
   status: IncidentStatus;
   reason: string;
+  /**
+   * WO-H112. REQUIRED by the server when `status` is "resolved" or "closed"
+   * (422 otherwise). `reason` is prose for a human to read; this is the only
+   * field the AI-correctness metric can be computed from.
+   */
+  closure_reason?: IncidentClosureReason;
+  /** The closer's explicit judgement on the AI. Omitted means NOT STATED — it
+   *  must never be read as agreement. */
+  ai_was_wrong?: boolean;
+  ai_wrong_detail?: string;
+}
+
+/**
+ * `POST /api/incidents/{id}/propagate-verdict` (WO-H85) —
+ * `IncidentVerdictPropagationRequest`.
+ *
+ * Deliberately NOT part of the status change. Closing an incident cascades
+ * WORK-ITEM state only (`resolved_at`); recording a verdict on every alert it
+ * grouped is a different and far larger claim, because an incident groups
+ * alerts nobody individually judged.
+ *
+ * `confirm` DEFAULTS TO FALSE and the server refuses the request without it
+ * (400), so the control cannot fire as a side effect. Members that already
+ * carry a human verdict are REFUSED, never overwritten — they come back in
+ * `skipped`. RBAC is the SAME analyst+/assignee gate as the other incident
+ * writes; because it can only ever set a FIRST verdict it does not widen who
+ * may override an existing one (still admin-only on `/api/triage/review`).
+ */
+export interface IncidentVerdictPropagationBody {
+  human_verdict: TriageVerdict;
+  reason: string;
+  confirm: boolean;
+}
+
+/** `POST /api/incidents/{id}/propagate-verdict` result envelope (WO-H85). */
+export interface IncidentVerdictPropagationResult {
+  status: string;
+  incident_id: string;
+  total: number;
+  /** members that had no human verdict and were filled. */
+  applied: number;
+  /** members left untouched because a human had already judged them. */
+  skipped: number;
+  applied_ids: string[];
+  skipped_ids: string[];
 }
 
 /** `POST /api/incidents/{id}/assign` — `IncidentAssignRequest`. RBAC: senior_analyst+. */
@@ -1161,6 +1325,14 @@ export interface RemediationVerifyResult {
   version_after?: string | null;
   version_current?: string | null;
   still_vulnerable?: boolean;
+  /**
+   * WO-H68: set on an `updated` result when the upgraded package does not take
+   * effect until the host REBOOTS (kernel/libc/systemd/openssl class). The
+   * version changed but the running code did not, so this is NOT a closed CVE
+   * — it renders as a warning, never as a success. Server-side name heuristic,
+   * not a read of the agent's /var/run/reboot-required flag.
+   */
+  reboot_required?: boolean;
 }
 
 // ---- Host Integrity (WO-U14) — syscollector inventory + SCA ------------------
@@ -2183,6 +2355,29 @@ export interface UpdateUserResult {
   user_id: string;
 }
 
+// ---- Self-service password (POST /api/my/password) — WO-H58 -----------------
+/**
+ * `ChangePasswordRequest` — the CALLER's own password change (any authenticated
+ * role). The current password is required even with a valid token: a stolen/idle
+ * token alone must not lock out the real owner. Neither value is ever logged or
+ * echoed. New-password policy (server-enforced, mirrored client-side only to
+ * pre-explain the rule): ≥12 chars + upper + lower + digit + special, and it must
+ * differ from the current password.
+ */
+export interface ChangeMyPasswordBody {
+  current_password: string;
+  new_password: string;
+}
+/**
+ * `POST /api/my/password` success envelope. On 200 the server ALSO revokes the
+ * presenting token, so the session is now invalid — the caller must clear the
+ * token and route to sign-in. `detail` is a human-readable confirmation.
+ */
+export interface ChangeMyPasswordResult {
+  status: string;
+  detail: string;
+}
+
 // ---- Tenants (mssp_admin only) ----------------------------------------------
 /** `CreateTenantRequest` — name + slug + optional config. The UI sends only
  * name/slug (no secret config) to avoid credential handling; secrets are
@@ -2390,6 +2585,68 @@ export interface HandoffResult {
   handoff_id: string | number;
 }
 
+// ---- Shift SCHEDULE (WO-H79) ------------------------------------------------
+/**
+ * One entry of `config/guidance/shift_schedule.yaml`. Times are ALWAYS UTC —
+ * either a whole hour (`14`, the original schema) or `"HH:MM"` (`"18:30"`,
+ * which a SOC on a half-hour UTC offset needs to describe itself at all). The
+ * editor enters local time and converts; the wire format never carries a
+ * local time.
+ *
+ * `analysts` are `platform_users` usernames — the server rejects a name that is
+ * not an active user, because `get_least_loaded_analyst()` AUTO-ASSIGNS
+ * incidents to whoever is on duty. `on_call_primary` must be one of this
+ * shift's own analysts. `days` empty means every day.
+ */
+export interface ShiftDefinition {
+  name: string;
+  start_utc: string | number;
+  end_utc: string | number;
+  days: string[];
+  analysts: string[];
+  on_call_primary: string;
+}
+/** `GET /api/admin/shifts/schedule` (admin + "sla"). `validation_errors`
+ *  reports a file that was hand-edited into a broken state — the read is not
+ *  refused, so the operator can see what to fix. */
+export interface ShiftScheduleResponse {
+  shifts: ShiftDefinition[];
+  path: string;
+  valid: boolean;
+  validation_errors: string[];
+  /** The file exists but could NOT be parsed. `shifts` is then empty because
+   *  nothing could be read — NOT because none are configured. Never render
+   *  this as "no shifts configured": saving over it destroys a recoverable
+   *  rota, which is the failure this feature exists to remove. */
+  unreadable?: boolean;
+  load_error?: string;
+  /** False when the guidance directory is not writable (the documented Docker
+   *  deploy bind-mounts config/guidance `:ro`), with the operator-actionable
+   *  reason. The editor must not offer a save the install cannot perform. */
+  writable?: boolean;
+  write_blocked_reason?: string;
+}
+/** `PUT /api/admin/shifts/schedule` body. `timezone` is the IANA zone the
+ *  operator entered times in; it only regenerates the local-time comments in
+ *  the YAML and never changes the stored (UTC) values. */
+export interface ShiftScheduleBody {
+  shifts: ShiftDefinition[];
+  timezone?: string;
+  /** Explicit confirmation that an existing UNPARSEABLE file may be replaced.
+   *  The server 409s without it. */
+  overwrite_unreadable?: boolean;
+}
+export interface ShiftScheduleSaveResult {
+  status: string;
+  path: string;
+  shifts: ShiftDefinition[];
+  guidance_reloaded?: boolean;
+  /** False when the write LANDED but left no audit record. Surface it — a
+   *  rota change that decides incident routing must not look fully
+   *  successful when nothing recorded who made it. */
+  audited?: boolean;
+}
+
 // =============================================================================
 // Tickets / SOAR / Closed-loop WRITE bodies + results (Tickets/SOAR/ClosedLoop)
 // -----------------------------------------------------------------------------
@@ -2588,6 +2845,31 @@ export interface PipelineHeartbeat {
   reporting_agents?: number;
   silent_agents?: number;
   silent_agent_names?: string[];
+  // WO-H105: "silent" now means the Wazuh manager has stopped hearing from
+  // the host (disconnected, or a stale lastKeepAlive) — NOT "raised no
+  // alerts". These break that number down by cause.
+  disconnected_agents?: number;
+  stale_keepalive_agents?: number;
+  never_connected_agents?: number;
+  unknown_keepalive_agents?: number;
+  skewed_keepalive_agents?: number;
+  pending_agents?: number;
+  // Hosts whose state is NOT being claimed: suppressed by the clock-skew
+  // backstop, or carrying a timestamp that will not parse. Neither reporting
+  // nor silent — do not round them into either tile.
+  unknown_state_agents?: number;
+  unknown_agent_names?: string[];
+  newly_silent?: number;
+  newly_restored?: number;
+  // True when nearly every active agent looked stale at once, which is read
+  // as clock skew rather than a site-wide outage; per-agent alerts are
+  // suppressed for that cycle.
+  clock_skew_suspected?: boolean;
+  dark_cycles_required?: number;
+  restore_cycles_required?: number;
+  // Set when the inventory could not be fetched: the numbers beside it are
+  // the LAST KNOWN picture, not this cycle's.
+  stale?: boolean;
   error?: string;
 }
 export interface PipelineEps {
@@ -2604,12 +2886,59 @@ export interface PipelineEps {
 }
 export interface PipelineParser {
   checked_at?: string;
-  status?: string; // "no_events"
-  total_events_1h?: number;
-  unparsed_events_1h?: number;
+  // WO-H109: sourced from wazuh-analysisd counters differenced between checks,
+  // not from alerts missing decoder.name (the alerts index only holds events a
+  // rule matched, so it could never see a real parse failure).
+  // status: "ok" | "unknown" | "priming" | "counter_reset" | "accumulating"
+  //         | "insufficient_events".
+  // Anything other than "ok" means NO rate was measured this cycle — the
+  // numeric fields below are absent, and absent is not zero.
+  status?: string;
+  reason?: string;
+  source?: string;
+  window_seconds?: number | null;
+  events_received?: number;
+  events_decoded?: number;
+  events_undecoded?: number;
+  events_dropped?: number;
+  events_dropped_total?: number;
+  min_events_for_rate?: number;
+  // The window the RATE was computed over, which is one check on a busy
+  // estate and several on a quiet one (the volume floor defers rather than
+  // discards).
+  // rate_window_events is the DECODABLE count (received minus dropped) —
+  // dropped events never reached a decoder, so they are excluded from both
+  // sides of the ratio.
+  rate_window_events?: number;
+  rate_window_decodable?: number;
+  rate_window_dropped?: number;
+  rate_window_cycles?: number;
+  rate_window_seconds?: number;
+  // NOTE: analysisd queue-pressure fields (queue_measured, queue_worst,
+  // queue_gauges_unreadable, queue_pressure_condition_open, ...) were built
+  // and then CUT from WO-H109 — see the block comment in
+  // src/pipeline/health_monitor.py where their constants used to live. They
+  // ship in their own work order; the backend does not emit them today, so
+  // nothing here may claim them.
+  // Set only on a CLUSTERED manager, where these counters describe the one
+  // node the API serves and not the estate.
+  scope?: string;
+  cluster_single_node_warning?: boolean;
+  events_dropped_condition_open?: boolean;
+  counter_skew?: number;
   failure_rate?: number; // 0-1
   threshold?: number;
   is_above_threshold?: boolean;
+  // WO-H105: three different facts, deliberately not merged.
+  // is_above_threshold = the instantaneous reading.
+  // condition_open     = the check has decided the rate is high (after the
+  //                      two-cycle debounce).
+  // notified           = a channel ACCEPTED the message. Still false if all
+  //                      five send attempts failed.
+  clear_level?: number;
+  condition_open?: boolean;
+  notified?: boolean;
+  sustained_cycles_required?: number;
   error?: string;
 }
 export interface PipelineAutomationLatency {
@@ -3030,4 +3359,37 @@ export interface DecisionPlaybookResponse {
   matched: boolean;
   playbook: CasePlaybook | null;
   reason: string | null;
+}
+
+/** `GET /api/admin/shifts/handoff-report`. Lists are capped server-side; the
+ *  `*_count` fields are separate COUNT(*) queries, so list length and backlog
+ *  size deliberately differ — never render one as the other. */
+export interface HandoffIncident {
+  id: string;
+  title: string;
+  severity: string;
+  status: string;
+  assigned_to: string | null;
+  alert_count: number;
+  created_at: string;
+}
+export interface HandoffSoar {
+  id: string;
+  playbook: string;
+  incident_id: string | null;
+  created_at: string;
+}
+export interface HandoffReport {
+  generated_at: string;
+  open_incidents: HandoffIncident[];
+  pending_soar_approvals: HandoffSoar[];
+  recent_sla_breaches: unknown[];
+  recent_verdict_summary: Record<string, number>;
+  open_incident_count: number;
+  critical_count: number;
+  pending_soar_count?: number;
+  window_hours?: number;
+  list_limit?: number;
+  open_incidents_truncated?: boolean;
+  pending_soar_truncated?: boolean;
 }

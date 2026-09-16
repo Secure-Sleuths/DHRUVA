@@ -87,8 +87,14 @@ always_escalate:
         in: ["account_management"]
       - field: "action"
         in: ["create_admin", "privilege_escalation"]
+      # WO-H76: a maintenance window IS outside business hours — the two are
+      # facts about the same timestamp, not alternatives. Once the resolver
+      # started preserving "maintenance_window" (so the auto-close rule above
+      # could finally match), a bare match on "outside_business_hours" would
+      # have stopped escalating admin-account creation during maintenance
+      # windows — which is precisely when an attacker would use one as cover.
       - field: "time_context"
-        match: "outside_business_hours"
+        in: ["outside_business_hours", "maintenance_window"]
 
   - name: "High severity on any tier-1 asset"
     conditions:
@@ -98,6 +104,16 @@ always_escalate:
         operator: ">="
         value: 10
 
+# ⚠ THIS BLOCK IS NOT THE NOTIFICATION GATE. Nothing in src/ reads
+# `notification_channels` — it is descriptive/prompt config only. The real gate
+# is code: src/notifications/service.py::notify_incident_created returns early
+# unless the incident severity is `critical` or `high`, and the channels are
+# whatever is configured in .env (Slack/Telegram/email).
+#
+# So the `medium: hourly_digest` line below does NOT mean a medium incident is
+# emailed in a digest. A medium incident is NOT ANNOUNCED AT ALL. This matters
+# when reading the severity_policy ceilings at the bottom of this file: capping
+# an incident to medium is silence, not a quieter channel.
 notification_channels:
   critical:
     - type: "telegram"
@@ -132,3 +148,321 @@ sla_targets:
   low:
     initial_response_minutes: 1440
     resolution_hours: 168
+
+
+# =============================================================================
+# WO-H97 — deterministic severity floors and ceilings
+# -----------------------------------------------------------------------------
+# DHRUVA's risk score answers "how often has a human agreed this rule fired
+# correctly?" (WO-H71). Severity is read as "how dangerous is this?". Those are
+# different questions, and two cases prove no amount of further learning closes
+# the gap on its own:
+#
+#   * A public crawler asking for /.env.bak and getting 404 thirty times scored
+#     99.41 — because 443 of 443 human labels on rule 31516 correctly say the
+#     rule fired correctly.
+#   * A host that stopped reporting scored 15.62 — because analysts correctly
+#     say a disconnected agent is not an attack. That label is TRUE, so the
+#     score can never learn its way up.
+#
+# These entries are the SOC's judgement about consequence, and they live here —
+# next to sla_targets and always_escalate — so they are hot-reloadable via
+# POST /api/guidance/reload and tunable per client without a release. Only the
+# lookup is in code (src/incidents/severity.py).
+#
+# ── READ THIS BEFORE EDITING ─────────────────────────────────────────────────
+#
+# A CEILING IS NOT "LOWER PRIORITY". IT IS SILENCE.
+# src/notifications/service.py::notify_incident_created returns early unless the
+# severity is `critical` or `high`. Capping an incident to `medium` means NO
+# creation notification is sent — not a quieter one, none. Adding a ceiling is a
+# decision to stop telling anyone about that alert.
+#
+# MATCHING: an entry fires when the alert's rule id is in `rule_ids` OR one of
+# its rule groups is in `rule_groups`, AND every condition below that is present
+# also holds:
+#     http_status        exact code(s) the server returned, e.g. ["404", "400"]
+#     http_status_class  the class, e.g. ["4xx"]
+#     max_rule_level     bounds the `rule_groups` selector ONLY — see below
+#     exclude_paths      exact absolute file paths this entry is scoped away
+#                        from (structured `syscheck.path`; no wildcards)
+#
+# `max_rule_level` BOUNDS THE GROUP SELECTOR AND NOTHING ELSE. A rule named in
+# `rule_ids` always matches, whatever its level. The cap exists to limit how far
+# an UNENUMERATED group can reach; a named id is a number someone typed and a
+# reviewer can read in the diff. If the cap also silenced a named id you could
+# write `rule_ids: [110128]` with `max_rule_level: 9` against a level-12 rule
+# and get a config that looks correct, loads clean and protects nothing — this
+# work order's own defect in config clothes. An entry that sets a cap with NO
+# `rule_groups` is refused at load for the same reason, naming the rule and the
+# cap, and a cap that a named rule walks past is logged once.
+#
+# ⚠ THIS CHANGED THE MEANING OF AN EXISTING KEY (2026-08-24). Before, the cap
+# applied to every match including named ids. Exactly one config in existence
+# used it — this one, unshipped — so the change cost nothing. If you are reading
+# this with a customer file in hand, check any `max_rule_level` beside
+# `rule_ids` before assuming it still means what it did.
+# A missing status does NOT match — "we do not know" is never "it failed".
+#
+# PREFER `rule_ids` ON A CEILING. A group selector is a loaded gun: the first
+# version of this file used `rule_groups: ["web"]` believing it covered 8 rules.
+# It covered 15 rules / 164,241 alerts, including Wazuh's LEVEL 10 frequency
+# rules 31151 / 31153 / 31154 — "multiple 400 error codes / common web attacks /
+# XSS attempts FROM SAME SOURCE IP". Those are composite rules built on 4xx
+# children, so their alerts always carry a 4xx and they were capped PERMANENTLY:
+# the burst detector, silenced, by an entry written for a crawler getting a 404.
+# A ceiling that uses `rule_groups` is now REFUSED unless it also sets
+# `max_rule_level`, and the refusal is reported by /api/guidance/reload.
+#
+# PRECEDENCE: a ceiling is skipped when threat intel confirms the indicator
+# (is_known_malicious, or threat_intel_hits > 0), then ceilings lower the band,
+# then floors raise it — so a floor always wins over a ceiling. Do NOT treat the
+# threat-intel skip as a safety net: measured on this estate it was true on 1 of
+# 2,486 covered web alerts. It is a correctness rule; the selector itself has to
+# be right.
+#
+# A typo'd `severity:` does not silently disable an entry — the entry is
+# rejected and /api/guidance/reload reports the reload as FAILED.
+# =============================================================================
+severity_policy:
+
+  floors:
+    # Loss of visibility. An analyst will never label a disconnected agent
+    # "dangerous", because it is not an attack — so this needs a RULE, not a
+    # score. On the live estate two endpoints sat at `low` for days while dark;
+    # one of them was running cracked software and loading a blocklisted kernel
+    # driver, which nobody could see precisely because it was dark.
+    #
+    # `medium` (a 4-hour response target), not `high`: a laptop closing its lid
+    # must not page anyone at 1am, but a host that is still dark hours later
+    # must show up as an SLA breach instead of sitting invisibly at the bottom
+    # of the queue. Raise it here per client if the estate is all servers.
+    #
+    # WHAT THIS ACTUALLY COVERS on the live estate (measured 2026-08-24, 8 rules
+    # / 69 alerts) — every one of them is "something that should be reporting or
+    # running has stopped":
+    #     110129  agent disconnected — this host is no longer being monitored
+    #     110126  manager reported a CRITICAL condition — detection degraded
+    #     110152  DHRUVA BLIND: SSH tunnel to Wazuh is DOWN — triage stopped
+    #     110153  DHRUVA BLIND: cannot reach the Wazuh indexer
+    #     110154  DHRUVA BLIND: the ai-soc service is not running — no triage
+    #     110155  DHRUVA DEGRADED: Wazuh API unreachable
+    #     110158  DHRUVA: platform health checks have stopped arriving
+    #       1010  Process segfaulted
+    #
+    # `siem_self_monitoring` / `wazuh_selfmon` were REMOVED after review: they
+    # also carry SIEM tampering (110128), failed agent enrolment (110121) and
+    # Wazuh API brute force (110125), which are attacks, not blindness. Floors
+    # only ever raise, so including them was safe — but the comment claimed
+    # something the selector did not do.
+    #
+    # `agent_disconnected` matches nothing on THIS estate; it is the hook for
+    # installs whose agent-down rule is a different id. Add your own rule id to
+    # `rule_ids` — stock Wazuh ids are deliberately not guessed at here.
+    #
+    # The floor is per ALERT, and it lifts by itself: it applies to the
+    # disconnect alert, and nothing re-applies it once the agent reports again.
+    - name: "Loss of visibility — something that should be reporting has stopped"
+      # 110129 is this estate's custom agent-down rule. 504 is stock Wazuh's
+      # ("Ossec agent disconnected", group `ossec`) and is included so a STOCK
+      # install is not shipped a floor that covers nothing — the previous
+      # version of this entry matched zero rules outside this estate. 504 is
+      # taken from the stock ruleset and is NOT verified against this estate,
+      # which has no such alerts; 503 ("agent started") is deliberately absent
+      # because an agent coming BACK is not a loss of visibility.
+      rule_ids: [504, 110129]
+      rule_groups:
+        - "service_availability"
+        - "agent_disconnected"
+      severity: "medium"
+      reason: >-
+        This host or service has stopped reporting, so DHRUVA can no longer see
+        what is happening on it. It is not an attack, which is why analysts
+        label it a false positive and why its learned score is near zero — but
+        a blind endpoint still needs someone to look.
+
+    # An attack on the SECURITY CONTROL ITSELF. Same argument as the floor
+    # above and the opposite failure: the score cannot price it, so it needs a
+    # rule — but here the consequence is loud, not quiet.
+    #
+    # WHY THIS EXISTS. Removing `verdict == "true_positive" -> critical` cost
+    # 104 incidents their notification, and 45 of them were rule 110128:
+    # "SIEM TAMPERING: detection rule/decoder file changed on the manager",
+    # level 12. Somebody editing the detection rules on the SIEM is close to
+    # the worst thing this platform could fail to mention, and `medium` sends
+    # nothing.
+    #
+    # ⚠ AND WHY MOST OF THAT 45 IS DHRUVA'S OWN NOISE. Rule 110128 fires on ANY
+    # write to /var/ossec/etc/rules/ — and DHRUVA validates every proposed
+    # detection rule by writing a probe file into exactly that directory and
+    # deleting it again (see WazuhClient.LOGTEST_TEMP_FILENAME, which explains
+    # why the directory is not a choice: the Wazuh API's rule-file endpoint
+    # writes only there, and wazuh-logtest only exercises rules the manager has
+    # LOADED). Measured on the live tenant 2026-08-24, by file:
+    #
+    #     146  _ai_soc_validation_temp.xml   <- DHRUVA's rule-validation probe
+    #       6  _dhruva_logtest_probe.xml     <- a second DHRUVA probe
+    #      24  zz-*.xml / shodan_rules.xml   <- real edits to detection content
+    #
+    # 152 of 176 (86%) are the platform tripping its own alarm, several hundred
+    # a day once detection is re-enabled (it has been off since 2026-08-11,
+    # WO-H77). Flooring THAT to `high` is a page plus a 60-minute SLA clock on
+    # DHRUVA doing its job — and it is the same self-inflicted file the ceiling
+    # notes below correctly refuse to page on from the other side (rule 408 is
+    # the DELETE of the same probe).
+    #
+    # So the floor EXCLUDES the platform's own probe files by path. The
+    # exclusion reads `syscheck.path` — a structured field — and an alert that
+    # names NO path is never excluded, so "we cannot prove this was us" still
+    # pages. `tests/test_severity_h97.py` asserts these patterns still cover
+    # WazuhClient's probe filename, so renaming it in code without updating
+    # this list fails the build rather than restoring the flood.
+    #
+    # The estate's own suppression rule (110133, level 0, in
+    # zz-siem-selfmon.xml) does the same job one layer earlier and is scoped to
+    # a single literal filename — which is exactly how the 6
+    # `_dhruva_logtest_probe.xml` alerts escaped it. This exclusion is a glob
+    # and covers both. NOTE 110128 is NOT the only rule in `detection_integrity`
+    # — 110133 is in it too, at level 0.
+    #
+    # `high`, not `critical`: it pages (60-minute SLA) without claiming a
+    # confirmed compromise. Raise it if your detection rules are change-managed
+    # and any edit outside that process is by definition an incident.
+    #
+    # Rule 411 ("Wazuh API: ... Unauthorized") was in this floor and has been
+    # REMOVED. On this estate all 43 of its decisions are
+    # `POST /security/user/authenticate Unauthorized` from 127.0.0.1 — DHRUVA
+    # authenticating to the manager over its own tunnel, the same self-inflicted
+    # class. On a STOCK install 411 is generic: any 401 on any Wazuh API
+    # endpoint from any client. 110125 stays, because it is the FREQUENCY rule
+    # ("repeated Wazuh API authentication failures", level 10) — repetition is
+    # what makes it an attack rather than a stale credential.
+    - name: "Attack on the security control itself"
+      rule_ids: [110125]
+      rule_groups:
+        - "detection_integrity"
+      # EXACT ABSOLUTE PATHS, no wildcard. Two reasons, both learned the hard
+      # way:
+      #   * `_dhruva_logtest_*` was ATTACKER-SELECTABLE. Anyone who can write to
+      #     the rules directory — which is precisely what rule 110128 detects —
+      #     names their file `_dhruva_logtest_backdoor.xml` and drops out of the
+      #     floor that exists to catch them.
+      #   * a leading `*/` matched ANY directory, so
+      #     `/home/attacker/_ai_soc_validation_temp.xml` was excluded too. (The
+      #     matcher no longer lets `*` cross a `/`, but the pattern was still
+      #     wrong.)
+      # Only paths DHRUVA itself writes belong here. The first is
+      # WazuhClient.LOGTEST_TEMP_FILE and a test fails if that constant and this
+      # line stop agreeing. The second is written by a local hot-patch on a
+      # deployed box, not by this repo — it is listed so that estate is
+      # covered today, and it should be folded into LOGTEST_TEMP_FILENAME so
+      # there is one probe filename again.
+      exclude_paths:
+        - "/var/ossec/etc/rules/_ai_soc_validation_temp.xml"
+        - "/var/ossec/etc/rules/_dhruva_logtest_probe.xml"
+      severity: "high"
+      reason: >-
+        This alert is about the security control itself — the detection rules,
+        or the SIEM's own API. Whatever its learned score, an attempt to change
+        what does the detecting has to be seen by a human: everything else
+        DHRUVA reports depends on it. DHRUVA's own rule-validation probe files
+        are excluded, because those are the platform working, not an attack.
+
+    # ⛔ WO-H111 FLOOR — DISABLED. The rationale below describes what it WAS
+    # for; the ⛔ block at the end of it says why it is off. Read both.
+    #
+    # WHY IT EXISTED. Rule 61138 fired for a kernel driver whose service name
+    # was eight random lowercase letters, registered SYSTEM START on an
+    # analyst's workstation 31 seconds after Microsoft Defender quarantined
+    # Trojan:Win32/Kepavll!rfn (Severe) on that same host. DHRUVA scored it
+    # 20.83 and it landed at `low`. A human analyst picked it up, correctly
+    # identified it as BYOVD / rootkit persistence (T1543.003), assigned it —
+    # and closed it 41 minutes later as "normal action". Ten days on, the
+    # driver was gone and had never been hashed.
+    #
+    # Every WinRing0 alert on that host also scores 20.83 — 80 of them since
+    # April, all CPUID HWMonitor's own driver, all benign. The score cannot
+    # separate them and no further learning will: they are the same rule at the
+    # same frequency. The field that separates them is `startType`, and
+    # config/guidance/rule_guidance.yaml reads it.
+    #
+    # This floor fires ONLY when a deterministic, field-exact signal in that
+    # file returns `escalate` — not on the rule, not on a model verdict. It is
+    # not reachable by a score and cannot drift the way the verdict does
+    # (WO-H104: 5/5 alerts changed verdict on byte-identical prompts at
+    # temperature 0).
+    #
+    # EXPECTED VOLUME: two alerts in the month measured (the driver above, and
+    # a second random-named driver eight days earlier) out of 100 rule-61138
+    # service installations on that host since April. `high` pages, and that is
+    # the intent — this is the one case on this rule that has ever mattered.
+    #
+    # A FAILED or ABSENT guidance load does NOT satisfy this floor: DHRUVA will
+    # not manufacture an escalation out of "we could not read the file". The
+    # unreadable case is loud elsewhere — RuleGuidance.load logs it at error
+    # level and the triage prompt carries an explicit UNAVAILABLE block.
+    # ⛔ DISABLED 2026-08-31 by QA audit (BLOCK, finding B1). DO NOT RE-ENABLE
+    # until the rule_guidance.yaml signals are fixed and tested.
+    #
+    # WHAT WENT WRONG. The signals this floor keys on match ANY eight-lowercase
+    # -letter driver name. That is not a description of malware; it is a
+    # description of a large slice of the stock Windows driver set. Verified
+    # against 24 driver names taken from the affected host's own directory
+    # listing: intelppm, mssmbios, nsiproxy, vdrvroot, tcpipreg, msisadrv,
+    # acpitime, hdaudbus, kbdclass, mouclass, storahci, stornvme ... ALL 24
+    # escalate. With this floor on, every one of them pages at `high`.
+    #
+    # BOTH signals fire, not just the path one: `intelppm` IS a system-start
+    # kernel-mode driver with an eight-lowercase name, so the extra conditions
+    # on signal 1 do not discriminate either.
+    #
+    # The "only two system-start kernel drivers in 100 installs" measurement
+    # that justified this floor was about how rarely rule 61138 FIRES on one
+    # host — not about what the name pattern matches. Those are different
+    # claims and only the first was measured.
+    #
+    # The guidance text still reaches the triage prompt, so the analyst and the
+    # model still see the reasoning. What is switched off is the automatic
+    # page, which is the part that was wrong.
+    #
+    # - name: "Per-rule guidance escalated this alert"
+    #   rule_ids: [61138]
+    #   guidance_signal: "escalate"
+    #   severity: "high"
+
+  ceilings:
+    # Reconnaissance the server refused. Both rules fire on the REQUEST,
+    # whatever the server answered; the response code is right there in the
+    # alert (Wazuh's web-accesslog decoder puts it in data.id).
+    #
+    #     31101  "Web server 400 error code."   level 5   148,696 alerts
+    #     31516  "Suspicious URL access."       level 6     2,561 alerts
+    #
+    # Those two are 91% of this estate's web-error volume. They are named
+    # EXPLICITLY rather than selected by the `web` group, because the group also
+    # contains the level-10 "from same source ip" frequency rules and the
+    # SQLi / XSS / Shellshock / blacklisted-user-agent rules, none of which
+    # should ever be silenced (see the header).
+    #
+    # ONLY 404 AND 400 ARE CAPPED — deliberately not 401 or 403.
+    # Measured status split:
+    #     31101   401: 80,603   404: 61,713   400: 6,326   403: 36
+    #     31516   404:  1,485   401:  1,041   400:    32
+    # A 404 is "you asked for something that is not there" and a 400 is "your
+    # request was malformed": the attempt failed and nothing was reached. A 401
+    # is a FAILED CREDENTIAL — a burst of those from one source is credential
+    # stuffing — and a 403 is an authenticated session being refused, which is
+    # a different and more interesting event. Neither is a crawler finding
+    # nothing, so neither is capped.
+    #
+    # This deliberately does NOT cap a 2xx. If the crawler ever gets a 200 for
+    # /.env.bak, the alert keeps its full score-derived severity.
+    - name: "Web request the server refused (404/400)"
+      rule_ids: [31101, 31516]
+      http_status: ["404", "400"]
+      severity: "medium"
+      reason: >-
+        The server refused this request — it asked for something that is not
+        there, or the request was malformed. Nothing was found and nothing was
+        served. The high risk score means the rule fires accurately, not that
+        anything was reached.

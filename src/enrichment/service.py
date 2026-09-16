@@ -13,6 +13,7 @@ import requests as _requests
 from datetime import datetime, timezone
 from typing import Optional
 
+from src.timestamps import parse_iso8601
 from src.enrichment.wazuh_client import WazuhClient
 from src.enrichment.opensearch_client import OpenSearchClient
 from src.enrichment.enrichers import (
@@ -57,12 +58,104 @@ def _sort_value_to_millis(val) -> Optional[int]:
     if isinstance(val, (int, float)):
         return int(val)
     try:
-        parsed = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+        # WO-H116: the proxy path's ISO string is formatted by OpenSearch, not
+        # by us, so it must go through the version-independent parser.
+        parsed = parse_iso8601(str(val))
         return int(parsed.timestamp() * 1000)
     except Exception:
+        # WO-H90 reviewed, left silent on purpose: this is a parse helper with a
+        # documented `None` default (see the docstring above), it runs per alert,
+        # and every caller already treats `None` as "no cursor value". A log here
+        # would be a per-alert flood that tells an on-call person nothing.
         return None
+
+
+def _time_context_block(container, source: str) -> dict:
+    """Pull a ``time_context`` mapping out of ``container``, defensively.
+
+    ``config/guidance/risk_criteria.yaml`` is operator-editable and now
+    reloadable live, so a typo in it must not be able to stop the platform
+    booting. A YAML *syntax* error was already handled (``_load_risk_criteria``
+    catches it); a *type* error was not — ``{**rc_tc, **cfg_tc}`` raises
+    ``TypeError`` if either side is a list or a scalar, and
+    ``EnrichmentService.__init__`` does not guard it, so ``main.py`` would fail
+    to start. Before WO-H76 a botched ``time_context`` was harmless simply
+    because nothing read it.
+    """
+    if container is None:
+        return {}
+    if not isinstance(container, dict):
+        logger.warning("time_context_source_not_a_mapping",
+                       source=source, got=type(container).__name__,
+                       msg="Expected a mapping — ignoring this source.")
+        return {}
+    block = container.get("time_context")
+    if block is None:
+        return {}
+    if not isinstance(block, dict):
+        logger.warning("time_context_block_not_a_mapping",
+                       source=source, got=type(block).__name__,
+                       msg="time_context must be a mapping of business_hours "
+                           "/ maintenance_windows / risk_adjustments — "
+                           "ignoring it.")
+        return {}
+    return block
+
+
+def resolve_time_context_config(enrich_cfg: dict, risk_criteria: dict) -> dict:
+    """Build the config dict handed to :class:`TimeContextEnricher` (WO-H76).
+
+    The ``time_context`` block (business hours, timezone, maintenance windows,
+    risk adjustments) lives in ``config/guidance/risk_criteria.yaml`` — it has
+    never existed under ``enrichment:`` in config.yaml. The enricher was
+    nevertheless constructed with the ``enrichment:`` section, so it always saw
+    ``{}``: no business days, therefore never business hours, therefore a
+    ``time_risk_multiplier`` of 1.0 in 0 of ~25k alerts across two live
+    deployments.
+
+    Backward compatible: if a deployment HAS put a ``time_context`` block under
+    ``enrichment:``, it still works and wins — it is the explicit, deployment
+    -local override. The merge is per top-level key
+    (``business_hours`` / ``maintenance_windows`` / ``risk_adjustments``) so an
+    override of just one of them keeps the rest from risk_criteria.yaml.
+    """
+    rc_tc = _time_context_block(risk_criteria, "risk_criteria.yaml")
+    cfg_tc = _time_context_block(enrich_cfg, "config.yaml enrichment:")
+    merged = {**rc_tc, **cfg_tc}
+
+    # The merge is per TOP-LEVEL key, so an override that supplies its own
+    # business_hours replaces the whole block — including a timezone it did not
+    # restate. That silently reverts to UTC, which is exactly defect (2) coming
+    # back through the documented backward-compat path. Say so.
+    rc_bh = rc_tc.get("business_hours")
+    cfg_bh = cfg_tc.get("business_hours")
+    if isinstance(cfg_bh, dict) and isinstance(rc_bh, dict) \
+            and rc_bh.get("timezone") and not cfg_bh.get("timezone"):
+        logger.warning(
+            "time_context_override_drops_timezone",
+            dropped_timezone=rc_bh.get("timezone"),
+            msg="enrichment.time_context.business_hours overrides the "
+                "risk_criteria.yaml block but declares no `timezone`, so "
+                "business hours will be evaluated in UTC. Restate the "
+                "timezone in the override.")
+
+    if not merged:
+        logger.warning(
+            "time_context_config_unresolved",
+            msg="No time_context found in risk_criteria.yaml or in the "
+                "enrichment: config section — every alert will be treated as "
+                "business hours (time_risk_multiplier 1.0).")
+    else:
+        logger.info("time_context_config_resolved",
+                    from_risk_criteria=bool(rc_tc),
+                    from_enrichment_config=bool(cfg_tc),
+                    business_days=len(
+                        (merged.get("business_hours") or {}).get("days") or []),
+                    timezone=(merged.get("business_hours") or {}).get(
+                        "timezone") or merged.get("timezone") or "UTC",
+                    maintenance_windows=len(
+                        merged.get("maintenance_windows") or []))
+    return {"time_context": merged}
 
 
 class EnrichmentService:
@@ -108,6 +201,9 @@ class EnrichmentService:
             ssh_key_path=wazuh_cfg.get("ssh_key_path", ""),
             ssh_key_passphrase=wazuh_cfg.get("ssh_key_passphrase", ""),
             ssh_sudo_nopasswd=wazuh_cfg.get("ssh_sudo_nopasswd", False),
+            # WO-H83: every OTHER ssh_* key was forwarded and this one was not,
+            # so an operator who set it correctly got no signal it was ignored.
+            ssh_host=wazuh_cfg.get("ssh_host", ""),
         )
 
         # Initialize OpenSearch client
@@ -151,7 +247,11 @@ class EnrichmentService:
             opensearch_client=self.opensearch,
             db=self.db
         )
-        self.time_enricher = TimeContextEnricher(enrich_cfg)
+        # WO-H76: the time_context block lives in risk_criteria.yaml, NOT in
+        # the enrichment: section — passing enrich_cfg here gave the enricher
+        # an empty config and made every alert "outside business hours".
+        self.time_enricher = TimeContextEnricher(
+            resolve_time_context_config(enrich_cfg, risk_criteria))
 
         # Per-tenant override registry. May be passed here OR set externally
         # (main.py sets self._tenant_registry after construction). The vuln
@@ -191,8 +291,81 @@ class EnrichmentService:
         logger.info("enrichment_service_initialized")
         self.alert_buffer = None
 
+        # Self-heal cadence for a failed asset-inventory load. The real key is
+        # enrichment.asset_inventory.refresh_interval_minutes — read by nothing
+        # until now. An earlier version of this looked for a top-level assets:
+        # block, which does not exist in config.yaml, so it silently fell back
+        # to the default and left the operator's setting still dead.
+        _ai_cfg = ((config or {}).get("enrichment", {}) or {}).get(
+            "asset_inventory", {}) or {}
+        try:
+            _mins = float(_ai_cfg.get("refresh_interval_minutes", 5) or 5)
+        except (TypeError, ValueError):
+            _mins = 5.0
+        # Floored at 60s so a persistent outage cannot turn into a DB hammer.
+        self._asset_reload_cooldown = max(60.0, _mins * 60.0)
+        # MEDIUM-2: keyed per tenant, like _reload_failed_tenants. A single
+        # process-global timer let the busiest tenant take the only retry slot
+        # at every cooldown expiry and starve a quieter tenant's recovery
+        # indefinitely — the same cross-tenant coupling WO-S11 fixed for the
+        # inventory itself.
+        self._asset_reload_retry_after: dict = {}
+
         # Try loading enrichment data from DB (settings panel)
         self._try_db_load(db)
+
+    def _maybe_self_heal_assets(self):
+        """Retry a failed asset-inventory load, on a cooldown.
+
+        ``reload_from_db`` is otherwise called only at startup and from the
+        admin reload endpoint (``refresh_interval_minutes`` in config is read by
+        nothing), so a single failure at boot pinned the inventory as degraded
+        for the entire process lifetime. That is not a graceful degradation: it
+        switches the pre-filter and the durable cache off and force-escalates
+        every dismissal, at 0% or 100%, with no path back short of a restart.
+
+        Cheap because it is gated on the enricher ALREADY reporting failure for
+        this tenant, and then rate-limited — a persistent outage costs one DB
+        attempt per cooldown, not one per alert.
+        """
+        db = getattr(self, "db", None)
+        enricher = getattr(self, "asset_enricher", None)
+        if db is None or enricher is None:
+            return
+        failed = getattr(enricher, "_reload_failed_tenants", None)
+        if not failed:
+            return
+        from src.enrichment.enrichers import _tenant_slice_key
+        try:
+            key = _tenant_slice_key()
+        except Exception as e:                           # noqa: BLE001
+            # WO-H90: was a bare `except: return`. `_tenant_slice_key()` has its
+            # own fallback and cannot normally raise, so this is belt-and-braces
+            # — but if it ever does fire, asset-inventory self-heal is off and
+            # the inventory stays degraded until a restart. `debug` because this
+            # is gated per alert and the loud signal (asset_enrichment_failed)
+            # is already being logged elsewhere; this is the trail that explains
+            # why it never recovered.
+            logger.debug("asset_self_heal_tenant_key_failed",
+                         error=str(e)[:200])
+            return
+        if key not in failed:
+            return
+        now = time.monotonic()
+        retry_after = getattr(self, "_asset_reload_retry_after", None)
+        cooldown = getattr(self, "_asset_reload_cooldown", None)
+        if retry_after is None or cooldown is None:
+            return
+        if now < retry_after.get(key, 0.0):
+            return
+        # Advanced BEFORE the attempt, so a persistent outage costs one DB call
+        # per cooldown rather than one per alert.
+        retry_after[key] = now + cooldown
+        logger.info("asset_inventory_self_heal_attempt", tenant_slice=key)
+        try:
+            enricher.reload_from_db(db)
+        except Exception as e:      # reload_from_db swallows its own, belt+braces
+            logger.warning("asset_inventory_self_heal_failed", error=str(e))
 
     def _try_db_load(self, db):
         """Load enrichment data from DB, overriding YAML if DB has data."""
@@ -208,12 +381,85 @@ class EnrichmentService:
         local_iocs_count = 0
         try:
             local_iocs_count = len(db.get_local_iocs(limit=10000))
-        except Exception:
-            pass
+        except Exception as e:                           # noqa: BLE001
+            # WO-H90: was a bare `except: pass`. A failure here means the admin
+            # reload screen reports "0 local IOCs" when the real answer is "we
+            # could not ask" — so an operator who just imported an IOC list is
+            # told their import did nothing.
+            logger.warning("local_ioc_count_failed", error=str(e)[:200])
         return {
             "assets": len(self.asset_enricher.assets),
             "identities": len(self.identity_enricher.identities),
             "local_iocs": local_iocs_count,
+        }
+
+    def reload_risk_criteria(self) -> dict:
+        """Re-read risk_criteria.yaml and refresh every enricher that uses it.
+
+        WO-H76: ``self.risk_criteria`` was read once in ``__init__`` and never
+        again, so editing ANY risk multiplier — asset criticality, user risk
+        profile, the time-context adjustments — needed a full service restart.
+        ``POST /api/guidance/reload`` reloaded only the triage agent's guidance
+        text, which is a different consumer of the same file.
+
+        Consumers refreshed here: ``_compute_risk_score`` (reads
+        ``self.risk_criteria`` live), ``AssetEnricher`` and ``IdentityEnricher``
+        (hold their own reference), and ``TimeContextEnricher`` (rebuilt — it is
+        stateless, and its business-hours/timezone config is parsed at
+        construction).
+
+        ``IdentityEnricher`` is refreshed for consistency only: it stores
+        ``risk_criteria`` but does not currently read it anywhere, so that half
+        has no enrichment-side effect today. ``AssetEnricher`` genuinely reads
+        it (hostname-pattern tiering), and ``_compute_risk_score`` reads
+        ``self.risk_criteria`` live.
+
+        ALL-OR-NOTHING. A failed/empty reload keeps the current criteria rather
+        than silently zeroing scoring config, and the new time enricher is
+        BUILT BEFORE anything is swapped in: committing risk_criteria and the
+        asset enricher first and then raising left the service permanently
+        half-reloaded (time context stuck on the old config with no retry)
+        while the endpoint reported success.
+        """
+        risk_criteria = self._load_risk_criteria(self.config)
+        if not risk_criteria:
+            logger.warning("risk_criteria_reload_empty",
+                           msg="Reload produced no risk criteria — keeping the "
+                               "previously loaded copy.")
+            return {"status": "error",
+                    "message": "risk_criteria.yaml missing, empty or not a "
+                               "mapping; kept previous criteria"}
+
+        enrich_cfg = (self.config or {}).get("enrichment", {}) or {}
+        try:
+            new_time_enricher = TimeContextEnricher(
+                resolve_time_context_config(enrich_cfg, risk_criteria))
+        except Exception as e:
+            logger.error("risk_criteria_reload_failed", error=str(e),
+                         msg="Time-context rebuild failed — nothing was "
+                             "swapped in, the previous criteria still apply.")
+            return {"status": "error",
+                    "message": "time context rebuild failed (%s); kept "
+                               "previous criteria" % e}
+
+        # ── commit point: nothing below may fail ──
+        self.risk_criteria = risk_criteria
+        for name in ("asset_enricher", "identity_enricher"):
+            enricher = getattr(self, name, None)
+            if enricher is not None:
+                enricher.risk_criteria = risk_criteria
+        self.time_enricher = new_time_enricher
+
+        logger.info("risk_criteria_reloaded",
+                    asset_tiers=len(risk_criteria.get("asset_criticality", {})),
+                    user_profiles=len(
+                        risk_criteria.get("user_risk_profiles", {})),
+                    time_context=bool(risk_criteria.get("time_context")))
+        return {
+            "status": "ok",
+            "asset_tiers": len(risk_criteria.get("asset_criticality", {})),
+            "user_profiles": len(risk_criteria.get("user_risk_profiles", {})),
+            "time_context": bool(risk_criteria.get("time_context")),
         }
 
     def _load_risk_criteria(self, config: dict) -> dict:
@@ -224,7 +470,18 @@ class EnrichmentService:
             base_path = guidance_cfg.get("base_path", "./config/guidance")
             criteria_file = guidance_cfg.get("risk_criteria", "risk_criteria.yaml")
             with open(f"{base_path}/{criteria_file}") as f:
-                return yaml.safe_load(f)
+                loaded = yaml.safe_load(f)
+            if loaded is None:
+                logger.error("risk_criteria_empty", file=criteria_file)
+                return {}
+            if not isinstance(loaded, dict):
+                # An empty or list-rooted file used to propagate as None/list
+                # into AssetEnricher.risk_criteria, where ``.get`` then raised
+                # on EVERY alert. Fail to an empty mapping instead.
+                logger.error("risk_criteria_not_a_mapping",
+                             file=criteria_file, got=type(loaded).__name__)
+                return {}
+            return loaded
         except Exception as e:
             logger.error("risk_criteria_load_failed", error=str(e))
             return {}
@@ -271,6 +528,31 @@ class EnrichmentService:
             "decoder": raw_alert.get("decoder", {}),
             "location": raw_alert.get("location", ""),
         }
+
+        # WO-H97 re-audit (F1): CARRY THE STRUCTURED EVENT OBJECTS THROUGH.
+        #
+        # A Wazuh FIM alert puts the changed file in a TOP-LEVEL ``syscheck``
+        # object and carries no ``data`` at all — verified on both live tenants:
+        # all 176 rule-110128 hits are
+        #   {"syscheck": {"path": "/var/ossec/etc/rules/..."}, "location": "syscheck"}
+        # This dict was built from ``rule``/``agent``/``data``/``full_log``/
+        # ``decoder``/``location`` only, so every one of those objects was
+        # DROPPED on the floor here — and it is this dict, not the raw alert,
+        # that reaches the incident engine.
+        #
+        # That silently defeated the severity policy's path exclusion: with no
+        # ``syscheck.path`` to read, the exclusion could never match, and the
+        # ``detection_integrity`` floor fired at `high` on DHRUVA's OWN rule
+        # validation probe file — several hundred pages a day. The exclusion was
+        # correct and unreachable.
+        #
+        # Same list and same reason as ``webhook_handler.py::_normalize_alert``,
+        # which has always done this; the two ingestion paths now agree. Copied
+        # by reference like ``data`` above — nothing here mutates them.
+        for _structured in ("syscheck", "rootcheck", "compliance",
+                            "aws", "gcp", "office365"):
+            if _structured in raw_alert:
+                normalized[_structured] = raw_alert[_structured]
         # Stamp tenant identity — required for multi-tenant indexing
         tenant_id = _tenant_ctx.get()
         if tenant_id and tenant_id != "__CROSS_TENANT__":
@@ -279,6 +561,7 @@ class EnrichmentService:
 
     def enrich_alert(self, normalized_alert: dict) -> dict:
         """Run all enrichers on a normalized alert and compute risk score."""
+        self._maybe_self_heal_assets()
         enrichment = {}
         enricher_timings = {}
 
@@ -289,6 +572,13 @@ class EnrichmentService:
             enrichment.update(asset_ctx)
         except Exception as e:
             logger.warning("asset_enrichment_failed", error=str(e))
+            # Record the degradation rather than leaving it inferable only from
+            # a missing key. asset_tier is one of the deterministic verdict
+            # guard's trip conditions, and an absent key is indistinguishable
+            # from "not a tier-1 asset" — which would turn the guard off
+            # silently on exactly the alerts it exists for. See
+            # src/agents/verdict_guard.py.
+            enrichment.setdefault("degraded_enrichers", []).append("asset")
         enricher_timings["asset"] = round((time.monotonic() - t0) * 1000, 2)
 
         # Identity context
@@ -330,6 +620,11 @@ class EnrichmentService:
             enrichment.update(ti_ctx)
         except Exception as e:
             logger.warning("threat_intel_enrichment_failed", error=str(e))
+            # threat_intel_hits / is_known_malicious are two of the three
+            # verdict-guard trip conditions. Without this marker a TI outage
+            # reads downstream as "clean", which is the most dangerous possible
+            # default. See src/agents/verdict_guard.py.
+            enrichment.setdefault("degraded_enrichers", []).append("threat_intel")
         enricher_timings["threat_intel"] = round((time.monotonic() - t0) * 1000, 2)
 
         # Historical context
@@ -348,6 +643,12 @@ class EnrichmentService:
             enrichment.update(time_ctx)
         except Exception as e:
             logger.warning("time_enrichment_failed", error=str(e))
+            # Same contract as asset/threat_intel above: an enricher that RAISED
+            # must leave a trace, otherwise its absent keys read downstream as
+            # "nothing to report". NOTE this does not trip the verdict guard —
+            # "time" is deliberately not in verdict_guard.EVIDENCE_ENRICHERS, so
+            # this is operator/audit visibility, not a dismissal block.
+            enrichment.setdefault("degraded_enrichers", []).append("time")
         enricher_timings["time"] = round((time.monotonic() - t0) * 1000, 2)
 
         # Record enrichment latency metrics
@@ -391,8 +692,304 @@ class EnrichmentService:
         finally:
             _tenant_ctx.reset(token)
 
+    # ── WO-H71: bounded scoring ──────────────────────────────────────────
+    # Composition happens in LOG-ODDS and is squashed by a logistic at the
+    # end, replacing "multiply nine independent factors, then clamp at 100".
+    #
+    # Three properties fall out of the shape rather than out of tuning:
+    #
+    #   BOUNDED BY CONSTRUCTION — the logistic maps any input into (0, 100),
+    #   so nothing is destroyed at a ceiling. Under the old formula a raw 108
+    #   and a raw 4,050 both persisted as exactly 100.
+    #
+    #   SUPPRESSIVE EVIDENCE CAN ACT — a negative adjustment moves the result
+    #   at any magnitude. The old `fp_discount` was a multiplier floored at
+    #   0.4 applied to a raw score often sitting 10x over the ceiling, so
+    #   "this rule is a false positive 95% of the time" was computed, stored,
+    #   displayed, and arithmetically incapable of changing the outcome.
+    #
+    #   DIMINISHING RETURNS — the logistic flattens near its extremes, so
+    #   stacking boosts on an already-high score barely moves it. The old
+    #   multiplier envelope reached ~60x.
+    #
+    # Measured on a live tenant against 305 reviewer-attributed human
+    # labels (2026-08-12), leave-one-out:
+    #
+    #                          AUC     95% CI     at ceiling
+    #   old multiplicative    0.354    +/-0.067      53%
+    #   this formula          0.967    +/-0.019       0%
+    #
+    # The old score was not merely uninformative, it was INVERTED: mean score
+    # 89.7 on analyst-confirmed false positives against 82.2 on true positives.
+    _SCORE_PRIOR = 5.0        # smoothing strength, in pseudo-observations
+    _SCORE_MAX_ADJ = 1.5      # total adjustment ceiling, in log-odds
+    _SCORE_MIN_LABELS = 3     # below this a rule has no usable track record
+
+    @staticmethod
+    def _logit(p: float) -> float:
+        p = min(max(p, 1e-6), 1.0 - 1e-6)
+        return math.log(p / (1.0 - p))
+
+    @staticmethod
+    def _sigmoid(x: float) -> float:
+        # Overflow-safe: math.exp(710) raises OverflowError, and a large
+        # negative sum is reachable from a rule with a long clean record.
+        if x >= 0:
+            return 1.0 / (1.0 + math.exp(-min(x, 700.0)))
+        e = math.exp(max(x, -700.0))
+        return e / (1.0 + e)
+
     def _compute_risk_score(self, alert: dict, enrichment: dict) -> dict:
-        """Compute composite risk score with full breakdown for audit trail.
+        """Dispatch to the configured scoring model.
+
+        DEFAULTS TO ``bounded``. This was briefly shipped defaulting to
+        ``legacy`` on the reasoning that a fresh install has no human labels to
+        score on. That reasoning does not survive measurement: on the 308
+        reviewer-attributed labels, the day-one signal available to any install
+        (the Wazuh rule level) scores **AUC 0.518** while the legacy composite
+        scores **0.351**. Legacy is not merely weaker on a cold start, it points
+        the WRONG WAY — a coin toss beats it. A default that actively misleads
+        is not a safe default, so ``legacy`` is retained only as an explicit
+        escape hatch for a deployment that needs to reproduce old scores:
+
+            enrichment:
+              scoring:
+                mode: legacy       # bounded (default) | legacy
+
+        Both models populate ``breakdown``, so an operator can run either and
+        compare distributions.
+        """
+        # getattr, not self.config: this dispatcher must degrade to the legacy
+        # model on any construction that lacks config rather than raising —
+        # a scorer that throws takes enrichment down with it.
+        cfg = getattr(self, "config", None) or {}
+        mode = str(((cfg.get("enrichment", {}) or {})
+                    .get("scoring", {}) or {}).get("mode", "bounded")).lower()
+        if mode == "legacy":
+            return self._compute_risk_score_legacy(alert, enrichment)
+        return self._compute_risk_score_bounded(alert, enrichment)
+
+    def _compute_risk_score_bounded(self, alert: dict, enrichment: dict) -> dict:
+        """WO-H71 replacement — see the block comment above for the rationale.
+
+        The rule's own human-labelled track record supplies the base
+        probability; bounded log-odds adjustments move it; a logistic squashes
+        the result into (0, 100).
+
+        A rule with fewer than ``_SCORE_MIN_LABELS`` human labels has NO usable
+        track record. It falls back to the estate's base rate and is marked
+        ``confident: False`` — deliberately not given an invented number, since
+        inventing confidence is the failure this work order exists to fix.
+        """
+        rule_id = alert.get("rule_id", 0)
+        scoring_cfg = ((self.risk_criteria or {}).get("scoring", {}) or {})
+
+        # WO-H115 — WHO WROTE THE LABEL IS PART OF THE EVIDENCE.
+        #
+        # Every new deployment starts with zero labels, so every rule is
+        # unlearned, so every alert takes the cold-start prior below and lands
+        # in `high`. The only way out is for somebody to label alerts, and the
+        # obvious shortcut is to let the platform label its own backlog. Do
+        # that and the machine's opinion becomes indistinguishable from a
+        # person's — it can make a rule QUIET with exactly the authority of an
+        # analyst who looked.
+        #
+        # So machine labels are EVIDENCE, not TESTIMONY: they count, at a
+        # discount, up to a hard cap, and they never confer confidence.
+        # `confident` remains human-only, so everything downstream that already
+        # respects it (the severity log line, the case view's "no track record
+        # for this rule yet") keeps telling the truth.
+        #
+        # `machine_reviewers` is EMPTY by default, so a deployment that has
+        # never used machine review scores exactly as it did before this change.
+        machine_reviewers = [str(m) for m in
+                             (scoring_cfg.get("machine_reviewers") or [])
+                             if str(m).strip()]
+        # getattr, not a direct call. A db object that predates WO-H115 has
+        # `get_rule_human_outcomes` and not `get_rule_label_tiers`, and a bare
+        # call would raise AttributeError straight into the broad except below
+        # — silently scoring EVERY rule at the cold-start prior while logging a
+        # lookup failure. "This method does not exist" is a programming error,
+        # not a data condition, and must not be laundered into "this rule has
+        # no history". So the older interface is used instead, which treats
+        # every reviewer as human — exactly the behaviour before this change.
+        #
+        # The shape is CHECKED, not assumed. `getattr` alone is not enough: a
+        # test double or a partially-migrated store can answer every attribute
+        # and return something that is not a label split, and the broad except
+        # below would then turn that into "this rule has no history" — scoring
+        # the entire estate at the cold-start prior while logging a lookup
+        # failure nobody reads.
+        def _usable(t):
+            if not isinstance(t, dict):
+                return False
+            for side in ("human", "machine"):
+                part = t.get(side)
+                if not isinstance(part, dict):
+                    return False
+                try:
+                    int(part.get("n") or 0), int(part.get("k") or 0)
+                except (TypeError, ValueError):
+                    return False
+            return True
+
+        tiers = None
+        _tiered = getattr(self.db, "get_rule_label_tiers", None)
+        try:
+            if callable(_tiered):
+                tiers = _tiered(rule_id, machine_reviewers=machine_reviewers)
+                if not _usable(tiers):
+                    logger.warning("rule_label_tiers_malformed",
+                                   rule_id=rule_id, got=type(tiers).__name__)
+                    tiers = None
+            if tiers is None:
+                legacy = self.db.get_rule_human_outcomes(rule_id)
+                tiers = {"human": {"n": int(legacy.get("total") or 0),
+                                   "k": int(legacy.get("tp_count") or 0)},
+                         "machine": {"n": 0, "k": 0}}
+        except Exception as e:                      # noqa: BLE001 — never fail a score
+            logger.warning("rule_history_lookup_failed",
+                           rule_id=rule_id, error=str(e)[:200])
+            tiers = {"human": {"n": 0, "k": 0}, "machine": {"n": 0, "k": 0}}
+
+        base_rate = float(scoring_cfg.get("base_tp_rate", 0.5))
+        # FAIL-SAFE COLD START. An unlearned rule must escalate until it earns
+        # a lower score, not sit mid-scale where it escalates nothing.
+        #
+        # A fresh install has no human labels, so every alert would land on the
+        # base rate. At 0.5 that is a score of 50 — below a typical escalation
+        # threshold — so a genuine threat on a brand-new deployment would score
+        # its way out of the queue on day one. Missing a real intrusion costs
+        # more than an extra review, so unknown resolves upward.
+        #
+        # This is the cold-start prior ONLY. Once a rule has
+        # ``_SCORE_MIN_LABELS`` human labels its own record takes over and this
+        # value stops applying, so a noisy rule is loud briefly and then quiet.
+        #
+        # WO-H97 — THIS VALUE IS DELIBERATELY UNCHANGED, and the collision it
+        # caused was fixed on the other side. With adjustments empty (which is
+        # the norm: 400 of 400 recent decisions carry ``adjustments: {}``),
+        # sigmoid(logit(0.75)) is exactly 0.75, so an unlearned rule scores
+        # EXACTLY 75.00 — 3,208 of 35,129 decisions on a live tenant,
+        # 9.1%. The incident engine's old ladder opened critical at ``>= 75``,
+        # so every alert on a rule DHRUVA had not learned yet became a critical
+        # incident. Nobody chose that; two independently sensible constants
+        # happened to be equal.
+        #
+        # Lowering the prior to make the number look better would be wrong: the
+        # comment above is explicit that a LOW-CONFIDENCE score is not a LOW
+        # score, and "unknown" genuinely is mid-scale. So the BOUNDARY moved
+        # instead (``src/incidents/severity.py``: critical at >= 80, which is
+        # also what the SPA has always used), and 75.00 now lands in `high` —
+        # escalated, at a 60-minute SLA, shown in the case view as "no track
+        # record for this rule yet". Not critical, and not invisible.
+        #
+        # If you change this value, re-read src/incidents/severity.py first: a
+        # band boundary must never sit on the score the model emits when it
+        # knows nothing.
+        unknown_rate = float(scoring_cfg.get("unknown_rule_tp_rate", 0.75))
+
+        n_h = int((tiers.get("human") or {}).get("n") or 0)
+        k_h = int((tiers.get("human") or {}).get("k") or 0)
+        n_m = int((tiers.get("machine") or {}).get("n") or 0)
+        k_m = int((tiers.get("machine") or {}).get("k") or 0)
+
+        # Machine labels are discounted and then CAPPED. The cap is what stops
+        # volume becoming authority: 5,000 machine labels are worth no more
+        # than `machine_label_cap` observations, because they are one model's
+        # opinion repeated, not independent evidence.
+        weight = float(scoring_cfg.get("machine_label_weight", 0.25))
+        cap = float(scoring_cfg.get("machine_label_cap", 10.0))
+        eff_n_m = min(n_m * weight, cap) if n_m > 0 else 0.0
+        eff_k_m = (k_m / n_m) * eff_n_m if n_m > 0 else 0.0
+
+        min_labels = int(scoring_cfg.get("min_human_labels",
+                                         self._SCORE_MIN_LABELS))
+        # CONFIDENCE IS HUMAN-ONLY, deliberately. A machine may inform the
+        # number; it may not vouch for it.
+        confident = n_h >= min_labels
+
+        # ONCE PEOPLE HAVE SPOKEN, THE MACHINE STOPS VOTING.
+        #
+        # Machine labels are a BRIDGE until analysts arrive, not a permanent
+        # co-signer. The first cut kept both in the average, and with the cap at
+        # 10 observations that meant four analysts saying "this is real" were
+        # outnumbered 10:4 by a bot and the rule scored 34. A person who
+        # actually looked must outrank any amount of machine opinion, so as
+        # soon as the human record is usable the machine's is dropped whole.
+        if confident:
+            p = (k_h + self._SCORE_PRIOR * base_rate) / (n_h + self._SCORE_PRIOR)
+        elif (n_h + eff_n_m) >= min_labels:
+            p = ((k_h + eff_k_m + self._SCORE_PRIOR * base_rate)
+                 / (n_h + eff_n_m + self._SCORE_PRIOR))
+        else:
+            p = unknown_rate
+
+        if confident:
+            label_tier = "human"
+        elif eff_n_m > 0:
+            label_tier = "assisted"
+        else:
+            label_tier = "none"
+
+        n = n_h + n_m
+        k = k_h + k_m
+        hist_tp_rate = (k_h / n_h) if n_h else None
+
+        # Adjustments are DELIBERATELY SPARSE. Every enrichment multiplier was
+        # measured at or below 0.5 AUC on this estate — asset criticality
+        # 0.488, vuln context 0.438, host integrity 0.475, baseline deviation
+        # 0.442, time 0.318 — so none of them earns a weight yet. Adding a
+        # factor here without measuring it first is how the old formula grew.
+        adjustments = {}
+        if enrichment.get("is_known_malicious"):
+            # UNMEASURED on this estate (no sampled alert carried one). Kept on
+            # first principles — a confirmed malicious IOC is evidence anywhere
+            # — at a weight small enough that it cannot alone saturate.
+            adjustments["known_malicious"] = 1.0
+        elif (enrichment.get("threat_intel_hits") or 0) > 0:
+            adjustments["threat_intel"] = 0.4
+
+        raw_adj = sum(adjustments.values())
+        adj = max(-self._SCORE_MAX_ADJ, min(self._SCORE_MAX_ADJ, raw_adj))
+        log_odds = self._logit(p) + adj
+        score = round(100.0 * self._sigmoid(log_odds), 2)
+
+        return {
+            "score": score,
+            "breakdown": {
+                "model": "bounded",
+                "rule_tp_rate_human": hist_tp_rate,
+                "rule_human_labels": n_h,
+                "rule_human_tp": k_h,
+                # WO-H115 provenance. `label_tier` is the field to read when
+                # asking "did a person actually look at this rule?".
+                "label_tier": label_tier,
+                "rule_machine_labels": n_m,
+                "rule_machine_tp": k_m,
+                "machine_labels_effective": round(eff_n_m, 3),
+                "base_rate": base_rate,
+                "unknown_rule_rate": unknown_rate if not confident else None,
+                "smoothed_p": round(p, 4),
+                "adjustments": adjustments,
+                "adjustment_total": round(adj, 4),
+                "adjustment_clipped": raw_adj != adj,
+                "log_odds": round(log_odds, 4),
+                "confident": confident,
+                # Why a low-confidence score is not a low score: an unknown rule
+                # sits at the base rate, which is mid-scale, not zero.
+                "confidence_reason": (
+                    ("rule has %d human label(s); %d required%s"
+                     % (n_h, min_labels,
+                        (" — %d machine label(s) counted as %.1f observation(s)"
+                         % (n_m, eff_n_m)) if n_m else ""))
+                    if not confident else ""),
+            },
+        }
+
+    def _compute_risk_score_legacy(self, alert: dict, enrichment: dict) -> dict:
+        """The original multiplicative model. Retained as the default until an
+        operator opts into ``bounded`` — see WO-H71 for why it saturates.
 
         Returns {"score": float, "breakdown": dict} so callers can store
         the individual multipliers for compliance explainability.
@@ -723,18 +1320,28 @@ class EnrichmentService:
             if newest_ts:
                 try:
                     from datetime import datetime as _dt, timezone as _tz
-                    parsed = _dt.fromisoformat(
-                        str(newest_ts).replace("Z", "+00:00"))
-                    if parsed.tzinfo is None:
-                        parsed = parsed.replace(tzinfo=_tz.utc)
+                    # WO-H116: ``timestamp`` comes from Wazuh via OpenSearch as
+                    # ``...905+0000`` — an offset with no colon, which
+                    # ``fromisoformat`` REJECTS on Python < 3.11. This metric
+                    # was therefore dead on every 3.10 deployment (876
+                    # ``triage_backlog_metric_failed`` lines in one day on the
+                    # live tenant) while dev and CI stayed green.
+                    parsed = parse_iso8601(str(newest_ts))
                     lag = (_dt.now(_tz.utc) - parsed).total_seconds()
                     self.db.record_metric(
                         "triage_backlog_seconds", max(0.0, lag),
                         {"tenant": current_tenant,
                          "cursor": str(newest_ts),
                          "batch": len(raw_alerts)})
-                except Exception:
-                    pass
+                except Exception as e:                   # noqa: BLE001
+                    # WO-H90: was a bare `except: pass`. A failure here means the
+                    # triage-backlog metric stops being recorded, so the "how far
+                    # behind is triage" graph flatlines and nobody can tell a
+                    # stalled pipeline from a quiet night. Once per collection
+                    # cycle per tenant, not per alert.
+                    logger.warning("triage_backlog_metric_failed",
+                                   tenant=current_tenant,
+                                   error=str(e)[:200])
 
         # WO-H13: bounded look-back overlap. In ADDITION to the forward scan,
         # re-query the small window immediately BEHIND the high-water mark so an

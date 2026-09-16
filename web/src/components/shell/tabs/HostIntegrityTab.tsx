@@ -1570,8 +1570,13 @@ function verifyPresentation(r: RemediationVerifyResult): {
   className: string;
 } {
   switch (r.status) {
+    // WO-H68: the package version changed, but a kernel/libc/systemd/openssl
+    // upgrade does not take effect until the host reboots — the running code
+    // is still the vulnerable code. Never render that as a green success.
     case "updated":
-      return { text: r.message, className: "text-teal" };
+      return r.reboot_required
+        ? { text: r.message, className: "text-sev-med" }
+        : { text: r.message, className: "text-teal" };
     // WO-H41: version unchanged AND a dispatch happened within the last scan
     // interval — UNKNOWN, not a success claim. Either the inventory hasn't
     // refreshed yet or the upgrade did not apply; the operator re-verifies

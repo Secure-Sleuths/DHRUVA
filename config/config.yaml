@@ -1,6 +1,6 @@
 platform:
   name: SecureSleuths DHRUVA
-  version: 5.1.0
+  version: 5.3.0
   log_level: INFO
   data_dir: /var/lib/ai-soc
 licensing:
@@ -48,7 +48,7 @@ llm:
   provider: anthropic
   model: claude-sonnet-4-20250514
   max_tokens: 8192
-  temperature: 0.1
+  temperature: 0
   rate_limit:
     cooldown_seconds: 5
     max_concurrent_calls: 4
@@ -70,6 +70,7 @@ agents:
   triage:
     enabled: true
     auto_close_confidence_threshold: 0.92
+    auto_close_enabled: true
     escalation_confidence_threshold: 0.5
     max_context_alerts: 20
     cooldown_seconds: 5
@@ -131,6 +132,7 @@ enrichment:
     local_iocs_file: /var/lib/ai-soc/local_iocs.yaml
   historical:
     baseline_window_days: 30
+    fp_rate_window_days: 30
     anomaly_std_deviations: 2.5
     baseline_refresh_hours: 6
   vulnerability_context:
@@ -209,11 +211,13 @@ incidents:
     enabled: true
     window_minutes: 120
     min_distinct_tactics: 2
+    min_triaged_alerts: 1
 notifications:
   enabled: true
   slack:
+    bot_token: ${SLACK_BOT_TOKEN}
+    channel: ${SLACK_CHANNEL}
     webhook_url: ${SLACK_WEBHOOK_URL}
-    channel: ''
   email:
     smtp_host: ${SMTP_HOST}
     smtp_port: 587
@@ -262,7 +266,9 @@ retention:
     operational_metrics: 90
     agent_decisions: 365
     decision_audit_trail: 365
+    decision_reviews: 365
     soar_executions: 180
     llm_usage_metrics: 400
     webhook_requests: 14
+    sla_breaches: 365
     llm_budget_reservations: 1

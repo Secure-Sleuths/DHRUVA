@@ -49,10 +49,24 @@ const HEALTHY: PipelineHealth = {
     is_anomaly: false,
     threshold: 3,
   },
+  // WO-H109: analysisd counters differenced between checks, not alerts
+  // missing decoder.name. The window is the gap between checks, not an hour.
   parser: {
     checked_at: "2026-07-03T05:58:00Z",
-    total_events_1h: 109_400,
-    unparsed_events_1h: 318,
+    status: "ok",
+    source: "wazuh:/manager/stats/analysisd",
+    window_seconds: 300,
+    events_received: 109_400,
+    events_decoded: 109_082,
+    events_undecoded: 318,
+    events_dropped: 0,
+    events_dropped_total: 0,
+    min_events_for_rate: 500,
+    rate_window_events: 109_400,
+    rate_window_decodable: 109_400,
+    rate_window_dropped: 0,
+    rate_window_cycles: 1,
+    rate_window_seconds: 300,
     failure_rate: 0.0029,
     threshold: 0.05,
     is_above_threshold: false,
@@ -80,7 +94,7 @@ const EMPTY: PipelineHealth = {
   // sub-status is present-but-empty (mirrors the real `{}` default).
   heartbeat: {},
   eps: { status: "insufficient_data", bucket_count: 2 },
-  parser: { status: "no_events" },
+  parser: { status: "unknown", reason: "wazuh-analysisd statistics unreadable" },
   automation_health: { period_days: 7, enrichment_latency: {}, soar_actions: {} },
 };
 

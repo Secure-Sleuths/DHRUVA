@@ -5,8 +5,11 @@ Uses incident timestamps to derive Mean Time to Detect, Acknowledge, and Resolve
 Stores daily rollups in operational_metrics for historical trending.
 """
 
+import json
 import structlog
 from datetime import datetime, timezone, timedelta
+
+from src.timestamps import parse_iso8601
 
 logger = structlog.get_logger(__name__)
 
@@ -130,7 +133,9 @@ class MetricsCalculator:
         now = datetime.now(timezone.utc)
         for r in rows:
             try:
-                created = datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))
+                # WO-H116: ``incidents.created_at`` is TEXT written by several
+                # producers, including ``CURRENT_TIMESTAMP::text``.
+                created = parse_iso8601(r["created_at"])
                 hours_open = (now - created).total_seconds() / 3600
             except Exception:
                 hours_open = 0
@@ -169,6 +174,81 @@ class MetricsCalculator:
             "enrichment_automation_pct": 100.0,  # All alerts are auto-enriched
             "false_positives": row["fp"] or 0,
             "true_positives": row["tp_count"] or 0,
+            # Deterministic verdict-guard overrides. Surfaced on the SAME panel
+            # as auto_close_rate because the guard is what removes alerts from
+            # the auto-dismissal path: reading one rate without the other gives
+            # a misleading picture of how much triage is actually automated.
+            "verdict_guard": self.get_verdict_guard_rates(days=days, total=total),
+        }
+
+    def get_verdict_guard_rates(self, days: int = 30, total: int = None) -> dict:
+        """Override rate for the deterministic verdict guard.
+
+        The guard blocks a dismissal verdict that contradicts hard enrichment
+        evidence (TI hit / known-malicious IOC / tier-1 asset) and forces the
+        alert to a human — see src/agents/verdict_guard.py. Every trip emits an
+        ``verdict_guard_override`` counter with the firing conditions in its
+        dimensions; this aggregates them into a dashboard-ready rate.
+
+        A RISING rate means the model is increasingly trying to dismiss alerts
+        that hard evidence says it should not. On a local/small model that is
+        the signal to watch: it is the observable footprint of both model
+        degradation and a successful prompt-injection attempt.
+
+        ``total`` is the triage-decision count for the same window; passed in by
+        get_automation_rates to avoid a second scan, recomputed if omitted.
+        Never raises — a metrics panel must not 500 on a reporting query.
+        """
+        conn = self.db._get_conn()
+        tf, tp = self.db._tenant_filter()
+
+        if total is None:
+            try:
+                r = conn.execute(f"""
+                    SELECT COUNT(*) as total FROM agent_decisions
+                    WHERE agent_type = 'triage' AND created_at >= %s {tf}
+                """, [_iso_ago(days)] + tp).fetchone()
+                total = r["total"] or 0
+            except Exception:
+                total = 0
+
+        empty = {"period_days": days, "overrides": 0, "override_rate": 0.0,
+                 "by_trigger": {}, "by_ai_verdict": {}}
+        try:
+            rows = conn.execute(f"""
+                SELECT dimensions FROM operational_metrics
+                WHERE metric_name = 'verdict_guard_override'
+                AND recorded_at >= %s {tf}
+            """, [_iso_ago(days)] + tp).fetchall()
+        except Exception as e:
+            logger.warning("verdict_guard_rates_failed", error=str(e))
+            return empty
+
+        by_trigger, by_ai_verdict = {}, {}
+        for r in rows:
+            try:
+                dims = r["dimensions"]
+                dims = json.loads(dims) if isinstance(dims, str) else (dims or {})
+            except (ValueError, TypeError):
+                dims = {}
+            # One override can fire on several conditions at once; count each so
+            # operators can see WHICH evidence is doing the blocking.
+            for trig in str(dims.get("triggers", "")).split(","):
+                trig = trig.strip()
+                if trig:
+                    by_trigger[trig] = by_trigger.get(trig, 0) + 1
+            av = str(dims.get("ai_verdict", "") or "unknown")
+            by_ai_verdict[av] = by_ai_verdict.get(av, 0) + 1
+
+        overrides = len(rows)
+        return {
+            "period_days": days,
+            "overrides": overrides,
+            "override_rate": round(overrides / total * 100, 1) if total else 0.0,
+            "by_trigger": dict(sorted(by_trigger.items(),
+                                      key=lambda kv: -kv[1])),
+            "by_ai_verdict": dict(sorted(by_ai_verdict.items(),
+                                         key=lambda kv: -kv[1])),
         }
 
     def get_hunt_cycle_trends(self, days: int = 90) -> list[dict]:

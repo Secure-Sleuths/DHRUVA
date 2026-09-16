@@ -1800,13 +1800,64 @@ async function loadIncidentSlideOver(id, tab) {
 // Legacy function kept for any remaining callers
 async function loadIncidentDetail(id) { openIncidentSlideOver(id, {severity:'',status:'',title:''}); }
 
+// WO-H112 — one place that posts a status change, and it SURFACES FAILURE.
+//
+// Three Daily Review buttons (drHandled, drNormal, drBlockIP) posted
+// {status:'resolved'} with NO `reason` — which WO-B3 made mandatory — so the
+// server answered 422 and none of them checked r.ok. The buttons appeared to
+// work and changed nothing. That is fixed here as well as the closure reason.
+const CLOSING_STATUSES_JS = ['resolved', 'closed'];
+
+async function postIncidentStatus(id, status, reason, closureReason, aiWasWrong) {
+  const body = { status: status, reason: reason };
+  if (CLOSING_STATUSES_JS.indexOf(status) !== -1 && closureReason) {
+    body.closure_reason = closureReason;
+    if (aiWasWrong !== undefined && aiWasWrong !== null) {
+      body.ai_was_wrong = !!aiWasWrong;
+    }
+  }
+  const r = await fetch(API + '/incidents/' + id + '/status', {
+    method: 'POST',
+    headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) {
+    const e = await r.json().catch(() => ({}));
+    throw new Error(esc(e.detail || ('HTTP ' + r.status)));
+  }
+  return r;
+}
+
+// The five reasons the server accepts. Free text is for the next human to
+// read; this is the only field the AI-accuracy measure can be computed from.
+const CLOSURE_REASONS_JS = [
+  ['1', 'true_positive', 'True positive — real, and acted on'],
+  ['2', 'benign_positive', 'Benign positive — fired correctly, activity authorised'],
+  ['3', 'false_positive', 'False positive — should not have fired'],
+  ['4', 'duplicate', 'Duplicate — covered by another case'],
+  ['5', 'insufficient_data', 'Insufficient data — could not be decided']
+];
+
+function askClosureReason() {
+  const menu = CLOSURE_REASONS_JS.map(function (c) { return c[0] + ') ' + c[2]; }).join('\n');
+  const pick = prompt('Closure reason (required to close):\n\n' + menu + '\n\nEnter 1-5:');
+  if (pick === null) return null;
+  const hit = CLOSURE_REASONS_JS.filter(function (c) { return c[0] === pick.trim(); })[0];
+  if (!hit) { alert('Pick a number 1-5.'); return null; }
+  return hit[1];
+}
+
 async function changeIncidentStatus(id, status) {
   const reason = prompt('Reason for changing status to '+status+' (required):');
   if (reason === null || !reason.trim()) return;
+  let closureReason = null;
+  if (CLOSING_STATUSES_JS.indexOf(status) !== -1) {
+    closureReason = askClosureReason();
+    if (!closureReason) return;
+  }
   try {
-    const r = await fetch(API+'/incidents/'+id+'/status', {method:'POST',headers:{...authHeaders(),'Content-Type':'application/json'},body:JSON.stringify({status:status,reason:reason.trim()})});
-    if (!r.ok) { const e = await r.json().catch(()=>({})); alert('Status change failed: '+esc(e.detail||r.status)); return; }
-  } catch(e) { alert('Status change failed: network error'); return; }
+    await postIncidentStatus(id, status, reason.trim(), closureReason);
+  } catch(e) { alert('Status change failed: ' + (e.message || 'network error')); return; }
   refresh();
 }
 async function assignIncident(id) {
@@ -2662,26 +2713,57 @@ async function renderAdminPipeline() {
   try { sources = (await fetchJSON('/health/log-sources')).sources || []; } catch(e) { sources = []; }
 
   // KPI tiles. Backend at health_monitor.get_pipeline_status() returns
-  // {heartbeat: {silent_agents, reporting_agents, ...}, eps: {recent_5min_avg, mean_events_per_minute, is_anomaly, ...}, parser: {failure_rate, total_events_1h, unparsed_events_1h, is_above_threshold, ...}}.
+  // {heartbeat: {silent_agents, reporting_agents, ...}, eps: {recent_5min_avg, mean_events_per_minute, is_anomaly, ...}, parser: {failure_rate, events_received, events_undecoded, events_dropped, is_above_threshold, ...}}.
+  // WO-H109: the parser block is now sourced from wazuh-analysisd counters differenced
+  // between checks, not from a count of alerts missing decoder.name. failure_rate is
+  // ABSENT (not 0) on cycles that could not measure — see parser.status.
   const heartbeat = pipe.heartbeat || {};
   const epsBlock = pipe.eps || {};
   const parserBlock = pipe.parser || {};
   const ah = pipe.automation_health || {};
   // Derive overall health from the three sub-statuses
   const heartbeatBad = (heartbeat.silent_agents || 0) > 0;
+  const heartbeatUnknown = (heartbeat.unknown_state_agents || 0) > 0;
   const epsBad = !!epsBlock.is_anomaly;
   const parserBad = !!parserBlock.is_above_threshold;
+  // WO-H109 audit Finding 1 — a REGRESSION this work order introduced.
+  //
+  // get_analysisd_stats() swallows every failure and returns None, which the
+  // monitor correctly turns into status:'unknown' — with NO `error` key. The
+  // headline below keyed off `error` alone, so an unreadable Wazuh API gave a
+  // non-empty parser block with no error, no is_above_threshold and no
+  // failure_rate: the Decode tile was not rendered at all and the headline
+  // printed HEALTHY in green while the check was blind.
+  //
+  // At HEAD the equivalent condition (OpenSearch unreachable) RAISED into the
+  // broad except, set `error`, and the headline read ERROR. So this change
+  // turned a red headline into a green one on the ordinary API-down path.
+  //
+  // The note six lines below is about exactly this mistake, in this function.
+  // A thing we cannot see is degraded, not well — same verdict as
+  // heartbeatUnknown, for the same reason.
+  const parserBlind = parserBlock.status === 'unknown' || !!parserBlock.stale;
+  // WO-H105: while the clock-skew backstop is engaged, silent_agents is 0 BY
+  // DESIGN — the per-agent verdicts are suppressed. Keying the headline off
+  // silent alone printed HEALTHY in green directly above a banner saying the
+  // whole estate's state is unknown. Hosts we cannot see are degraded, not
+  // well.
   const overall = heartbeat.error || epsBlock.error || parserBlock.error ? 'error'
                 : (heartbeatBad || parserBad) ? 'critical'
-                : epsBad ? 'degraded'
+                : (epsBad || heartbeatUnknown || parserBlind) ? 'degraded'
                 : (Object.keys(heartbeat).length || Object.keys(epsBlock).length || Object.keys(parserBlock).length) ? 'healthy' : 'unknown';
   const overallColor = overall === 'healthy' ? '#34D399' : overall === 'degraded' ? '#FBBF24' : overall === 'critical' || overall === 'error' ? '#EF4444' : '#94A3B8';
 
   h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:16px">';
   h += `<div class="c" style="text-align:center"><div style="font-size:22px;font-weight:800;color:${overallColor};font-family:'JetBrains Mono',monospace;text-transform:uppercase">${esc(String(overall))}</div><div class="l" style="margin-top:4px">Overall</div></div>`;
   if (heartbeat.reporting_agents != null) {
-    const total = (heartbeat.reporting_agents || 0) + (heartbeat.silent_agents || 0);
-    h += `<div class="c" style="text-align:center"><div style="font-size:22px;font-weight:800;color:${heartbeatBad?'#EF4444':'#34D399'};font-family:'JetBrains Mono',monospace">${heartbeat.reporting_agents}/${total}</div><div class="l" style="margin-top:4px">Reporting Agents</div></div>`;
+    // WO-H105: unknown-state hosts (clock-skew suppressed, or an unreadable
+    // keepalive) are counted in the denominator. Leaving them out showed
+    // "0/0 Reporting" while a whole estate sat in limbo.
+    const total = (heartbeat.reporting_agents || 0) + (heartbeat.silent_agents || 0)
+                + (heartbeat.unknown_state_agents || 0);
+    const hbColor = heartbeatBad ? '#EF4444' : heartbeatUnknown ? '#FBBF24' : '#34D399';
+    h += `<div class="c" style="text-align:center"><div style="font-size:22px;font-weight:800;color:${hbColor};font-family:'JetBrains Mono',monospace">${heartbeat.reporting_agents}/${total}</div><div class="l" style="margin-top:4px">Reporting Agents</div></div>`;
   }
   if (epsBlock.recent_5min_avg != null) {
     h += `<div class="c" style="text-align:center"><div style="font-size:22px;font-weight:800;color:${epsBad?'#FBBF24':'#1E293B'};font-family:'JetBrains Mono',monospace">${epsBlock.recent_5min_avg}</div><div class="l" style="margin-top:4px">Events/min (5m avg)${epsBlock.mean_events_per_minute!=null?', μ '+epsBlock.mean_events_per_minute:''}</div></div>`;
@@ -2689,7 +2771,29 @@ async function renderAdminPipeline() {
   if (parserBlock.failure_rate != null) {
     const pfr = (parserBlock.failure_rate*100).toFixed(2);
     const pfc = parserBlock.failure_rate > 0.05 ? '#EF4444' : parserBlock.failure_rate > 0.01 ? '#FBBF24' : '#34D399';
-    h += `<div class="c" style="text-align:center"><div style="font-size:22px;font-weight:800;color:${pfc};font-family:'JetBrains Mono',monospace">${pfr}%</div><div class="l" style="margin-top:4px">Parser Fail Rate</div></div>`;
+    h += `<div class="c" style="text-align:center"><div style="font-size:22px;font-weight:800;color:${pfc};font-family:'JetBrains Mono',monospace">${pfr}%</div><div class="l" style="margin-top:4px">Decode Fail Rate</div></div>`;
+  }
+  // Dropped events are LOSS, not degradation, so they get their own tile and
+  // any non-zero value is red. Absent on cycles that measured nothing.
+  if (parserBlock.events_dropped != null) {
+    const dcol = parserBlock.events_dropped > 0 ? '#EF4444' : '#34D399';
+    h += `<div class="c" style="text-align:center"><div style="font-size:22px;font-weight:800;color:${dcol};font-family:'JetBrains Mono',monospace">${parserBlock.events_dropped}</div><div class="l" style="margin-top:4px">Events Dropped</div></div>`;
+  }
+  // Audit Q-3: app.js rendered NONE of the *_condition_open fields while the
+  // React tab rendered them all, so the two dashboards disagreed about
+  // whether the estate was losing events. One surface, one fact, both places.
+  // Any status other than "ok" means no rate was measured this cycle. Say
+  // WHY. Rendering nothing — which is what happened before, because every
+  // tile is gated on a numeric field — reads as "nothing is wrong".
+  if (parserBlock.status && parserBlock.status !== 'ok') {
+    const why = parserBlock.error || parserBlock.reason || 'no rate measured this cycle';
+    h += `<div class="c" style="text-align:center;grid-column:1/-1"><div style="color:${parserBlind?'#FBBF24':'#64748B'};font-size:12px">Decode check: ${esc(String(parserBlock.status))} \u2014 ${esc(String(why))}${parserBlind?'. Not the same as healthy.':''}</div></div>`;
+  }
+  if (parserBlock.events_dropped_condition_open) {
+    h += `<div class="c" style="text-align:center;grid-column:1/-1"><div style="color:#EF4444;font-size:12px;font-weight:600">Open: analysisd is DROPPING events \u2014 discarded at a full queue, never analysed, not recoverable.</div></div>`;
+  }
+  if (parserBlock.cluster_single_node_warning) {
+    h += `<div class="c" style="text-align:center;grid-column:1/-1"><div style="color:#B45309;font-size:12px">Clustered manager: these counters describe ONE node, not the estate.</div></div>`;
   }
   // Automation health is nested. enrichment_latency.{p50_ms, p95_ms, ...}, soar_actions.{success_rate (0-100), success_count, failure_count, total_actions}
   if (ah.enrichment_latency && ah.enrichment_latency.p95_ms != null) {
@@ -2702,10 +2806,29 @@ async function renderAdminPipeline() {
   }
   h += '</div>';
 
+  // Clock-skew backstop + unknown-state hosts (WO-H105). Rendered BEFORE the
+  // silent list, because while skew is suspected the silent count is zero by
+  // design and the reader needs to know why.
+  if (heartbeat.clock_skew_suspected) {
+    h += '<div class="c" style="margin-bottom:16px;border-left:3px solid #EF4444;padding:10px 14px">';
+    h += '<div style="color:#EF4444;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Clock Skew Suspected</div>';
+    h += '<div style="color:#1E293B;font-size:12px">'+esc(String(heartbeat.stale_keepalive_agents||0))+' agents went stale in the same cycle. Per-agent alerts are SUPPRESSED — this is far more likely to be NTP drift between DHRUVA and the Wazuh manager than a site-wide outage. Check NTP on both.</div>';
+    h += '</div>';
+  }
+  if (heartbeatUnknown) {
+    h += '<div class="c" style="margin-bottom:16px;border-left:3px solid #FBBF24;padding:10px 14px">';
+    h += '<div style="color:#B45309;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Unknown State ('+esc(String(heartbeat.unknown_state_agents))+') — not reporting, not silent</div>';
+    h += '<div style="color:#1E293B;font-size:12px;font-family:\'JetBrains Mono\',monospace">'+(heartbeat.unknown_agent_names||[]).map(esc).join(', ')+'</div>';
+    h += '</div>';
+  }
+  if (heartbeat.stale === true) {
+    h += '<div class="c" style="margin-bottom:16px;padding:10px 14px"><div style="color:#94A3B8;font-size:12px">Last known picture — this cycle could not reach the Wazuh manager.</div></div>';
+  }
+
   // Silent-agents detail (when any)
   if (heartbeat.silent_agent_names && heartbeat.silent_agent_names.length) {
     h += '<div class="c" style="margin-bottom:16px;border-left:3px solid #EF4444;padding:10px 14px">';
-    h += '<div style="color:#EF4444;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Silent Agents (last '+(heartbeat.window_minutes||'?')+' min)</div>';
+    h += '<div style="color:#EF4444;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">Silent Agents (disconnected, or no keepalive for '+(heartbeat.window_minutes||'?')+' min)</div>';
     h += '<div style="color:#1E293B;font-size:12px;font-family:\'JetBrains Mono\',monospace">'+heartbeat.silent_agent_names.map(esc).join(', ')+'</div>';
     h += '</div>';
   }
@@ -3603,10 +3726,19 @@ async function execRemediation(agentId, pkgName) {
       try {
         const vr = await fetchJSON('/vulnerabilities/verify?agent_id='+agentId+'&package_name='+encodeURIComponent(pkgName)+'&version_before='+encodeURIComponent(vBefore));
         if (vr.status === 'updated') {
-          btn.textContent = 'Updated!';
-          btn.style.color = '#1E293B';
-          btn.style.background = '#E8EDF220';
-          alert('SUCCESS: '+vr.message);
+          // WO-H68: a kernel/libc/systemd/openssl upgrade changes the package
+          // version while the running system stays on the old, vulnerable
+          // code. Do not report that as a success.
+          if (vr.reboot_required) {
+            btn.textContent = 'Reboot required';
+            btn.style.color = '#FBBF24';
+            alert('NOT YET REMEDIATED: '+vr.message);
+          } else {
+            btn.textContent = 'Updated!';
+            btn.style.color = '#1E293B';
+            btn.style.background = '#E8EDF220';
+            alert('SUCCESS: '+vr.message);
+          }
           verified = true;
           break;
         } else if (vr.status === 'possibly_updated') {
@@ -5711,10 +5843,11 @@ async function drBlockIP(incidentId, ip) {
       body: JSON.stringify({action:'block_ip', agent_id:agentId, target:ip})
     });
     if (!r.ok) { const d = await r.json().catch(()=>({})); alert('Block failed: ' + (d.detail||'Error')); return; }
-    await fetch(API + '/incidents/' + incidentId + '/status', {
-      method:'POST', headers:{...authHeaders(),'Content-Type':'application/json'},
-      body: JSON.stringify({status:'resolved'})
-    });
+    // Blocking the source IP IS the judgement that this was real, so the
+    // closure reason is not invented here — it follows from the action taken.
+    await postIncidentStatus(incidentId, 'resolved',
+      'Source IP ' + ip + ' blocked via agent ' + agentId + ' from Daily Review.',
+      'true_positive');
     drNavClick=true; drView='morning'; drIncidentId=null; refresh();
   } catch(e) { alert('Error: ' + e.message); }
 }
@@ -5725,12 +5858,16 @@ async function drHandled(incidentId) {
     ? 'Resolve all ' + ids.length + ' grouped incidents?'
     : 'Mark this incident as resolved?';
   if (!confirm(msg)) return;
-  for (const id of ids) {
-    await fetch(API + '/incidents/' + id + '/status', {
-      method:'POST', headers:{...authHeaders(),'Content-Type':'application/json'},
-      body: JSON.stringify({status:'resolved'})
-    });
-  }
+  // "Handled" does not say WHAT it was, and guessing would put a fabricated
+  // label into the one column the accuracy metric is computed from. Ask.
+  const closureReason = askClosureReason();
+  if (!closureReason) return;
+  try {
+    for (const id of ids) {
+      await postIncidentStatus(id, 'resolved',
+        'Marked handled from Daily Review.', closureReason);
+    }
+  } catch(e) { alert('Could not resolve: ' + (e.message || 'network error')); return; }
   drNavClick=true; drView='morning'; drIncidentId=null; drGroupIds=[]; refresh();
 }
 
@@ -5752,10 +5889,10 @@ async function drNormal(incidentId) {
           });
         }
       }
-      await fetch(API + '/incidents/' + id + '/status', {
-        method:'POST', headers:{...authHeaders(),'Content-Type':'application/json'},
-        body: JSON.stringify({status:'resolved'})
-      });
+      // This button has just written human_verdict=false_positive onto every
+      // unreviewed alert in the case, so the case-level reason is not a guess.
+      await postIncidentStatus(id, 'resolved',
+        'All alerts marked false positive from Daily Review.', 'false_positive');
     }
     drNavClick=true; drView='morning'; drIncidentId=null; drGroupIds=[]; refresh();
   } catch(e) { alert('Error: ' + e.message); }

@@ -298,7 +298,13 @@ def _deployment_mode() -> str:
     try:
         from src.database.store import is_multi_tenant
         return "multi_tenant" if is_multi_tenant() else "single_tenant"
-    except Exception:
+    except Exception as e:                               # noqa: BLE001
+        # WO-H90: was a bare `except: return`. Failing closed is right, but
+        # silently failing closed means a single-tenant install starts reporting
+        # itself as multi-tenant to the SPA — tabs and gates change under the
+        # operator's feet with nothing anywhere to explain it.
+        logger.warning("deployment_mode_resolution_failed",
+                       error=str(e)[:200])
         return "multi_tenant"
 
 

@@ -9,6 +9,7 @@
 
 import { clearToken, getToken } from "./token";
 import type {
+  HandoffReport,
   AdminAnonMappingsResponse,
   AdminAuditLogResponse,
   AdminConfigResponse,
@@ -37,6 +38,7 @@ import type {
   FrameworkCoverage,
   DashboardStats,
   DecisionAuditTrail,
+  DecisionReviewsResponse,
   DetectionProposalsResponse,
   FeedbackPatternsResponse,
   HuntTrendsResponse,
@@ -65,6 +67,8 @@ import type {
   IncidentReviewBody,
   IncidentStatusChangeBody,
   IncidentsResponse,
+  IncidentVerdictPropagationBody,
+  IncidentVerdictPropagationResult,
   IncidentWriteResult,
   LicenseTierInfo,
   MitreGaps,
@@ -98,6 +102,9 @@ import type {
   TriageReviewBody,
   TriageSort,
   VulnSummary,
+  ShiftScheduleBody,
+  ShiftScheduleResponse,
+  ShiftScheduleSaveResult,
 } from "./types";
 // [frontend-integrator — parity gap ①] locally-scoped types for the restored
 // IOC-lookup + MITRE-heatmap read fetchers appended at the bottom of this file.
@@ -498,6 +505,25 @@ export async function getPendingReview(
   });
 }
 
+// ---- Shift handover ---------------------------------------------------------
+/**
+ * `GET /api/admin/shifts/handoff-report` → outstanding work + what happened in
+ * `hours`. Gated: senior_analyst+ and the `sla` licence feature (402/403 when
+ * absent — the caller should render a locked state, not an error).
+ *
+ * `hours`/`limit` are validated server-side (422 outside 1-72 / 1-200), so the
+ * UI does not need to re-police them; it only needs to not offer silly values.
+ */
+export async function getHandoffReport(
+  params: { hours?: number; limit?: number } = {},
+  signal?: AbortSignal,
+): Promise<HandoffReport> {
+  return request<HandoffReport>("/api/admin/shifts/handoff-report", {
+    query: { hours: params.hours, limit: params.limit },
+    signal,
+  });
+}
+
 // ---- Incidents (glass-box case) — WO-U4 -------------------------------------
 /**
  * `GET /api/incidents` (optionally `?status=open`) → `{ incidents, total }`.
@@ -560,6 +586,33 @@ export async function submitTriageReview(
     body,
     signal,
   });
+}
+
+/**
+ * `GET /api/triage/decisions/{id}/reviews` (WO-H85) — the APPEND-ONLY review
+ * history for one decision, OLDEST FIRST: who reviewed, when, what verdict they
+ * recorded, their free-text reason, and the verdict it replaced.
+ *
+ * READ-ONLY and gated by `verify_jwt` server-side, exactly like the audit trail
+ * — every role that can open the case can read the history. It exists so a
+ * reviewer sees they are disagreeing with a colleague, and can read what that
+ * person said, BEFORE they override. It widens NOTHING: writing a verdict is
+ * still `POST /api/triage/review` (analyst+ first verdict, admin+ to override).
+ *
+ * Fixture mode short-circuits to an empty history — the fixtures carry no
+ * review rows, and inventing reviewers for screenshots would be a lie.
+ */
+export async function getDecisionReviews(
+  decisionId: string,
+  signal?: AbortSignal,
+): Promise<DecisionReviewsResponse> {
+  if (FIXTURES === "true" || FIXTURES === "empty") {
+    return { decision_id: decisionId, reviews: [], count: 0 };
+  }
+  return request<DecisionReviewsResponse>(
+    `/api/triage/decisions/${encodeURIComponent(decisionId)}/reviews`,
+    { signal },
+  );
 }
 
 // ---- Alert-level claim (WO-H25) ----------------------------------------------
@@ -640,6 +693,44 @@ export async function changeIncidentStatus(
   }
   return request<IncidentWriteResult>(
     `/api/incidents/${encodeURIComponent(id)}/status`,
+    { method: "POST", body, signal },
+  );
+}
+
+/**
+ * `POST /api/incidents/{id}/propagate-verdict` (WO-H85) — apply ONE human
+ * verdict to the incident's UNREVIEWED member alerts.
+ *
+ * Separate from `changeIncidentStatus` on purpose: closing an incident cascades
+ * work-item state (`resolved_at`) server-side and records NO verdict. This is
+ * the explicit action for the case where the analyst has looked and does mean
+ * it for all of them.
+ *
+ * `confirm` must be `true` — the server refuses the request without it (400) so
+ * the propagation can never happen as a side effect. Members that already carry
+ * a human verdict are REFUSED server-side (`AND human_verdict IS NULL` in the
+ * write, so even a verdict recorded mid-request survives) and returned in
+ * `skipped`. RBAC: the same analyst+/assignee gate as the other incident
+ * writes; nothing about who may OVERRIDE an existing verdict changes.
+ */
+export async function propagateIncidentVerdict(
+  id: string,
+  body: IncidentVerdictPropagationBody,
+  signal?: AbortSignal,
+): Promise<IncidentVerdictPropagationResult> {
+  if (FIXTURES === "true" || FIXTURES === "empty") {
+    return {
+      status: "ok",
+      incident_id: id,
+      total: 0,
+      applied: 0,
+      skipped: 0,
+      applied_ids: [],
+      skipped_ids: [],
+    };
+  }
+  return request<IncidentVerdictPropagationResult>(
+    `/api/incidents/${encodeURIComponent(id)}/propagate-verdict`,
     { method: "POST", body, signal },
   );
 }
@@ -2437,6 +2528,7 @@ import type {
   CreateAssetBody,
   CreateIdentityBody,
   CreateLocalIocBody,
+  ChangeMyPasswordResult,
   CreateTenantBody,
   CreateTenantResult,
   CreateUserBody,
@@ -2495,6 +2587,35 @@ export async function updateAdminUser(
     `/api/admin/users/${encodeURIComponent(userId)}`,
     { method: "POST", body, signal },
   );
+}
+
+// ---- Self-service password (WO-H58) -----------------------------------------
+/**
+ * `POST /api/my/password` — change the CALLER's own password. Auth: `verify_jwt`
+ * (ANY authenticated role, incl. `read_only`) — this is NOT the admin reset path
+ * (`/api/admin/users`), so it needs no elevated role. The current password is
+ * required alongside the token; both values are sent once in the body and are
+ * NEVER logged or returned. Server behaviours the caller must handle:
+ *   - 200 `{status:"password_changed", detail}` — success. The server ALSO
+ *     revokes the presenting token, so the session is now dead: the caller MUST
+ *     clear the token and route to sign-in (the very next authed request 401s).
+ *   - 400 `{detail}` — wrong current password / unknown user, or new-password
+ *     policy failure / new==current. Surface `detail` verbatim (it IS the message).
+ *   - 429 — rate-limited (5/min). Surfaced typed by the caller.
+ *
+ * Unlike the admin/screenshot writes this is NOT fixture-gated: it is a real
+ * account-security action reachable by every role, so it always hits the backend.
+ */
+export async function changeMyPassword(
+  currentPassword: string,
+  newPassword: string,
+  signal?: AbortSignal,
+): Promise<ChangeMyPasswordResult> {
+  return request<ChangeMyPasswordResult>("/api/my/password", {
+    method: "POST",
+    body: { current_password: currentPassword, new_password: newPassword },
+    signal,
+  });
 }
 
 // ---- Tenants (require_role("mssp_admin")) -----------------------------------
@@ -2815,6 +2936,148 @@ export async function reloadGuidance(
     signal,
   });
 }
+// ---- Shift SCHEDULE (WO-H79) — ADMIN-only read + write ----------------------
+/**
+ * `GET /api/admin/shifts/schedule` — `require_role("admin")` + the `sla`
+ * licence feature. DELIBERATELY stricter than the handoff endpoints
+ * (senior_analyst+): the rota decides who incidents are auto-assigned to, so
+ * editing it is an administrative act. A 402/403 is the licence gate (render a
+ * locked state); in a Community build the whole module is stripped → 404.
+ */
+export async function getShiftSchedule(
+  signal?: AbortSignal,
+): Promise<ShiftScheduleResponse> {
+  if (FIXTURES === "true" || FIXTURES === "empty") {
+    return {
+      shifts:
+        FIXTURES === "empty"
+          ? []
+          : [
+              {
+                name: "Morning",
+                start_utc: "02:30",
+                end_utc: "10:30",
+                days: [],
+                analysts: ["analyst-one"],
+                on_call_primary: "analyst-one",
+              },
+              {
+                name: "Afternoon",
+                start_utc: "10:30",
+                end_utc: "18:30",
+                days: [],
+                analysts: ["analyst-two"],
+                on_call_primary: "analyst-two",
+              },
+              {
+                name: "Night",
+                start_utc: "18:30",
+                end_utc: "02:30",
+                days: [],
+                analysts: ["analyst-three"],
+                on_call_primary: "analyst-three",
+              },
+            ],
+      path: "config/guidance/shift_schedule.yaml",
+      valid: true,
+      validation_errors: [],
+      unreadable: false,
+      load_error: "",
+      writable: true,
+      write_blocked_reason: "",
+    };
+  }
+  return request<ShiftScheduleResponse>("/api/admin/shifts/schedule", {
+    signal,
+  });
+}
+
+/**
+ * `PUT /api/admin/shifts/schedule` (admin + "sla"). The SERVER is the gate: it
+ * 422s with a `{error, reasons[]}` detail for an analyst who is not an active
+ * platform user, an unstaffed shift, an on-call primary who is not on that
+ * shift, an analyst double-booked across overlapping shifts, or a day that
+ * does not tile 24 hours. `scheduleRejectionReasons` unpacks those for display
+ * — the client-side checks are convenience only.
+ */
+export async function saveShiftSchedule(
+  body: ShiftScheduleBody,
+  signal?: AbortSignal,
+): Promise<ShiftScheduleSaveResult> {
+  if (FIXTURES === "true" || FIXTURES === "empty") {
+    return {
+      status: "ok",
+      path: "config/guidance/shift_schedule.yaml",
+      shifts: body.shifts,
+      audited: true,
+    };
+  }
+  return request<ShiftScheduleSaveResult>("/api/admin/shifts/schedule", {
+    method: "PUT",
+    body,
+    signal,
+  });
+}
+
+/**
+ * Pull the server's specific rejection reasons out of a 422. `request()`
+ * JSON-stringifies a non-string `detail`, so the reasons arrive as text; an
+ * unparseable body degrades to the raw message rather than swallowing it.
+ */
+export function scheduleRejectionReasons(e: unknown): string[] {
+  if (!(e instanceof ApiError)) return [];
+  if (e.status !== 422) return [];
+  try {
+    const parsed = JSON.parse(e.message) as { reasons?: unknown };
+    if (Array.isArray(parsed?.reasons)) {
+      return parsed.reasons.map((r) => String(r));
+    }
+  } catch {
+    /* not the structured detail — fall through */
+  }
+  return [e.message];
+}
+
+/**
+ * The server's other two structured refusals, in plain language:
+ *
+ *   - 409 `schedule_unreadable`  — the file on disk could not be parsed, so
+ *     saving would replace a rota of UNKNOWN content. Needs an explicit
+ *     `overwrite_unreadable`.
+ *   - 503 `schedule_not_writable` — the guidance directory is read-only (the
+ *     documented Docker deploy mounts it `:ro`). Names the mount to change.
+ *
+ * Returns `null` for anything else so the caller falls back to its normal
+ * error handling. Without this the raw JSON `detail` would be shown verbatim.
+ */
+export type ScheduleBlockKind = "unreadable" | "not_writable";
+export interface ScheduleBlock {
+  kind: ScheduleBlockKind;
+  message: string;
+}
+export function scheduleBlock(e: unknown): ScheduleBlock | null {
+  if (!(e instanceof ApiError)) return null;
+  if (e.status !== 409 && e.status !== 503) return null;
+  try {
+    const parsed = JSON.parse(e.message) as {
+      error?: string;
+      message?: string;
+    };
+    if (parsed?.error === "schedule_unreadable") {
+      return { kind: "unreadable", message: String(parsed.message ?? e.message) };
+    }
+    if (parsed?.error === "schedule_not_writable") {
+      return {
+        kind: "not_writable",
+        message: String(parsed.message ?? e.message),
+      };
+    }
+  } catch {
+    /* not the structured detail */
+  }
+  return null;
+}
+
 /** `POST /api/admin/shifts/handoff` (admin/senior_analyst + "sla" license). */
 export async function saveShiftHandoff(
   body: HandoffBody,

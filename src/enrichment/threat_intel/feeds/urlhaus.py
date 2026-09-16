@@ -25,6 +25,10 @@ class URLhausCollector(BaseFeedCollector):
 
         # Download format: {id: [item], id: [item], ...}
         iocs = []
+        # WO-H90: per-indicator host-extraction failures are counted, not
+        # logged, and reported once at the end of the cycle. See below.
+        _host_extract_failures = 0
+        _last_host_error = ""
         for _id, items in data.items():
             if not isinstance(items, list):
                 continue
@@ -70,8 +74,21 @@ class URLhausCollector(BaseFeedCollector):
                             last_seen=item.get("last_online") or item.get("dateadded"),
                             expires_at=self._default_expiry(90),
                         ))
-                except Exception:
-                    pass
+                except Exception as e:                   # noqa: BLE001
+                    # WO-H90: was a bare `except: pass`. A failure here means the
+                    # HOST half of each malware-distribution indicator is
+                    # dropped, so DHRUVA knows the exact payload URL but not the
+                    # domain/IP serving it — and an alert touching that host
+                    # reads clean. HOT LOOP — counted per indicator, reported
+                    # ONCE below.
+                    _host_extract_failures += 1
+                    _last_host_error = str(e)[:200]
+
+        if _host_extract_failures:
+            logger.warning("urlhaus_host_extraction_failed",
+                           feed=self.FEED_NAME,
+                           failed=_host_extract_failures,
+                           error=_last_host_error)
 
         return self._store(iocs)
 

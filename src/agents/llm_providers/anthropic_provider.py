@@ -24,6 +24,13 @@ class AnthropicProvider(BaseLLMProvider):
         super().__init__(config)
         self.sub_mode = config.get("mode", "auto")
 
+        # WO-H118: cache the static prefix. ON by default — it changes cost,
+        # never output, and the measured saving is ~5.4M tokens/day on one
+        # tenant. `prompt_cache: false` turns it off for a deployment whose
+        # guidance churns so often that the write premium would outweigh the
+        # reads.
+        self.prompt_cache_enabled = bool(config.get("prompt_cache", True))
+
         if not self.model:
             self.model = config.get("model", "claude-sonnet-4-20250514")
 
@@ -157,7 +164,11 @@ class AnthropicProvider(BaseLLMProvider):
                 [self.cli_path, "-p", "Reply with exactly: OK",
                  "--output-format", "text"],
                 capture_output=True, text=True, timeout=timeout,
-                env={**os.environ},
+                # WO-S16: minimized env here too. The probe's prompt is a fixed
+                # constant so argv leaks nothing, but there is still no reason
+                # to hand the child DATABASE_URL, JWT_SECRET or
+                # TENANT_ENCRYPTION_KEY.
+                env=self._cli_env(),
             )
         except subprocess.TimeoutExpired:
             self.cli_authenticated = False
@@ -200,12 +211,42 @@ class AnthropicProvider(BaseLLMProvider):
             return self._call_api(system_prompt, user_message)
         return self._call_cli(system_prompt, user_message)
 
+    #: WO-H118. Anthropic ignores a cache marker on a prefix shorter than its
+    #: minimum (1024 tokens for most models, 2048 for Haiku) — it is not an
+    #: error, the block is simply not cached. This guard exists so we do not
+    #: pay the cache-WRITE premium on a prefix that can never be re-read.
+    _CACHE_MIN_CHARS = 4096
+
+    def _system_param(self, system_prompt: str):
+        """The `system` argument, with a cache marker when it is worth one.
+
+        WO-H118. Measured on the shipped guidance: the system prompt is ~3,465
+        tokens and byte-identical on every call, against ~724 tokens of
+        per-alert content. At 1,551 triage calls/day on ONE tenant that is
+        5,374,215 static tokens re-sent daily — about two billion a year — and
+        nothing was cached.
+
+        There is no stale-cache risk. Anthropic keys the cache on the exact
+        prefix bytes, so editing a guidance YAML and calling
+        `/api/guidance/reload` changes the prefix, misses the cache, and writes
+        a new entry. A stale entry cannot be served for a prompt that no longer
+        matches it — which is why WO-H111 deliberately put per-rule guidance in
+        the USER message: alert-specific text in the system prompt would break
+        the prefix on every single call and make caching worthless.
+        """
+        if not self.prompt_cache_enabled:
+            return system_prompt
+        if len(system_prompt) < self._CACHE_MIN_CHARS:
+            return system_prompt
+        return [{"type": "text", "text": system_prompt,
+                 "cache_control": {"type": "ephemeral"}}]
+
     def _call_api(self, system_prompt: str, user_message: str) -> str:
         response = self.client.messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
             temperature=self.temperature,
-            system=system_prompt,
+            system=self._system_param(system_prompt),
             messages=[{"role": "user", "content": user_message}],
         )
         raw_text = response.content[0].text
@@ -213,16 +254,52 @@ class AnthropicProvider(BaseLLMProvider):
         # WO-H50: capture the SDK's REAL token counts instead of logging them
         # at debug and discarding them. LLMBackend reads last_usage after the
         # call and records these exact numbers rather than a chars//4 estimate.
+        # WO-H118: cache counters are separate fields and are NOT included in
+        # `input_tokens`. Recording them matters for cost attribution — a read
+        # bills at a fraction of an input token and a write at a premium, so a
+        # cost model that ignores both is wrong in both directions. getattr
+        # with 0, because older SDKs do not carry these attributes at all.
+        cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
         self.last_usage = {
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_write,
             "cost_usd": None,   # SDK doesn't return cost; priced from tokens
             "estimated": False,
         }
         logger.debug("anthropic_api_tokens",
                      input=usage.input_tokens,
-                     output=usage.output_tokens)
+                     output=usage.output_tokens,
+                     cache_read=cache_read,
+                     cache_write=cache_write)
         return raw_text
+
+    # WO-S16: the only environment variables the Claude CLI needs to locate its
+    # binary, resolve the user's home/credentials, and run. Everything else in
+    # the service environment — DATABASE_URL, JWT_SECRET, TENANT_ENCRYPTION_KEY,
+    # ANONYMIZATION_SALT, Wazuh/OpenSearch passwords — is deliberately withheld.
+    # ANTHROPIC_* is included so an operator running the CLI against a specific
+    # endpoint/profile still works; the CLI's own auth lives under HOME.
+    _CLI_ENV_ALLOWLIST = (
+        "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "LANG",
+        "LC_ALL", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "no_proxy",
+        "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    )
+
+    @classmethod
+    def _cli_env(cls) -> dict:
+        """Minimized environment for the CLI child process (WO-S16)."""
+        env = {k: v for k, v in os.environ.items()
+               if k in cls._CLI_ENV_ALLOWLIST}
+        # Anthropic-specific settings the CLI legitimately reads (endpoint,
+        # model override, auth token for API-key CLI usage).
+        env.update({k: v for k, v in os.environ.items()
+                    if k.startswith("ANTHROPIC_") or k.startswith("CLAUDE_")})
+        return env
 
     def _call_cli(self, system_prompt: str, user_message: str) -> str:
         combined_prompt = f"""<system>
@@ -242,11 +319,28 @@ Respond ONLY with the JSON object as specified in the system prompt. No other te
         # as text (estimated usage) if the envelope can't be parsed, so a CLI
         # version that doesn't speak this format still works.
         self.last_usage = None
+        # WO-S16: the prompt goes over STDIN, never in argv.
+        #
+        # argv is world-readable via /proc/<pid>/cmdline and `ps` for the whole
+        # life of the call (up to the 120s timeout). CLI mode is the DEFAULT
+        # when ANTHROPIC_API_KEY is unset, and by design this prompt carries raw
+        # alert `data` — full command lines and script blocks verbatim, per
+        # _DETECTION_EXCLUDE_KEYS — which routinely contain credentials
+        # (`mysql -p<pw>`, `net user <u> <pw> /add`, bearer tokens). Any
+        # unprivileged local account or co-tenant process sharing the PID
+        # namespace could harvest every triaged alert with a loop over
+        # /proc/*/cmdline, without touching the database or the API.
+        #
+        # The child also gets a MINIMIZED environment instead of the whole
+        # service environment, which held DATABASE_URL (with its password),
+        # JWT_SECRET, TENANT_ENCRYPTION_KEY and ANONYMIZATION_SALT — none of
+        # which a third-party agentic binary being fed attacker-influenced text
+        # has any reason to hold.
         result = subprocess.run(
-            [self.cli_path, "-p", combined_prompt,
-             "--output-format", "json"],
+            [self.cli_path, "-p", "--output-format", "json"],
+            input=combined_prompt,
             capture_output=True, text=True, timeout=120,
-            env={**os.environ},
+            env=self._cli_env(),
         )
 
         if result.returncode != 0:

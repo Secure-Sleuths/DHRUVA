@@ -37,6 +37,7 @@ import {
   escalateIncident,
   flagIncidentInteresting,
   mergeIncidents,
+  propagateIncidentVerdict,
   saveIncidentReview,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -51,8 +52,10 @@ import { errMessage, humanStatus } from "./GlassBoxCase";
 import type {
   EvidenceType,
   IncidentDetail,
+  IncidentClosureReason,
   IncidentStatus,
   PirStatus,
+  TriageVerdict,
 } from "@/lib/types";
 
 // ---- shared field styling (matches GlassBoxCase form controls) --------------
@@ -174,6 +177,44 @@ const STATUS_CHOICES: ReadonlyArray<{ status: IncidentStatus; label: string }> =
   { status: "closed", label: "Closed" },
 ];
 
+// ---- WO-H112: the structured closure reason -------------------------------
+//
+// `reason` above is prose an analyst writes for the next human. It is the field
+// that produced "normal action" — the closure of the only real intrusion of
+// the month measured, written by an analyst whose own investigation note
+// had correctly called it BYOVD/rootkit persistence. Prose reads fine and
+// measures nothing.
+//
+// These five are what a metric can count, and the server REQUIRES one when the
+// status ends the investigation (422 otherwise), so the panel must collect it
+// rather than fire a request it knows will be rejected.
+
+const CLOSING_STATUSES = new Set<string>(["resolved", "closed"]);
+
+const CLOSURE_CHOICES: ReadonlyArray<{
+  value: IncidentClosureReason;
+  label: string;
+  hint: string;
+}> = [
+  { value: "true_positive", label: "True positive", hint: "Real, and acted on" },
+  {
+    value: "benign_positive",
+    label: "Benign positive",
+    hint: "The rule fired correctly — the activity was authorised",
+  },
+  {
+    value: "false_positive",
+    label: "False positive",
+    hint: "The rule should not have fired",
+  },
+  { value: "duplicate", label: "Duplicate", hint: "Already covered by another case" },
+  {
+    value: "insufficient_data",
+    label: "Insufficient data",
+    hint: "Could not be decided with what was available",
+  },
+];
+
 function StatusPanel({
   detail,
   disabled,
@@ -187,12 +228,21 @@ function StatusPanel({
   const isClosed = current === "closed";
   const [choice, setChoice] = useState<IncidentStatus | null>(null);
   const [reason, setReason] = useState("");
+  // WO-H112
+  const [closureReason, setClosureReason] =
+    useState<IncidentClosureReason | null>(null);
+  const [aiWasWrong, setAiWasWrong] = useState(false);
+  const [aiWrongDetail, setAiWrongDetail] = useState("");
   const { submitting, result, run } = useWrite(onChanged);
   const reasonId = useId();
   const reasonErrId = useId();
 
   const reasonEmpty = reason.trim().length === 0;
-  const canSubmit = !disabled && choice !== null && !reasonEmpty && !submitting;
+  // WO-H112: closing without a countable reason is a 422, so block it here.
+  const closing = choice !== null && CLOSING_STATUSES.has(choice);
+  const closureMissing = closing && closureReason === null;
+  const canSubmit =
+    !disabled && choice !== null && !reasonEmpty && !closureMissing && !submitting;
 
   // The server forbids reopening a closed incident (400): once closed, only
   // "closed" is a legal target. Also disable the current status (no-op).
@@ -206,12 +256,29 @@ function StatusPanel({
         changeIncidentStatus(detail.id, {
           status: choice,
           reason: reason.trim(),
+          // Only sent when the status actually ends the investigation. A
+          // move to `investigating` carries no closure judgement, and
+          // inventing one would poison the very metric this feeds.
+          ...(closing && closureReason
+            ? {
+                closure_reason: closureReason,
+                // `false` here is a real statement ("the AI was right"),
+                // distinct from omitting the field, which means NOT STATED.
+                ai_was_wrong: aiWasWrong,
+                ...(aiWasWrong && aiWrongDetail.trim()
+                  ? { ai_wrong_detail: aiWrongDetail.trim() }
+                  : {}),
+              }
+            : {}),
         }).then(() => undefined),
       `Status changed to ${humanStatus(choice)}.`,
     );
     if (ok) {
       setReason("");
       setChoice(null);
+      setClosureReason(null);
+      setAiWasWrong(false);
+      setAiWrongDetail("");
     }
   };
 
@@ -274,6 +341,76 @@ function StatusPanel({
         />
       </div>
 
+      {closing && (
+        <div className="mt-3 rounded-md border border-line bg-field/40 p-2">
+          <div className="text-kbd text-dim">
+            Closure reason <span className="text-sev-crit">*required</span>
+          </div>
+          <p className="mt-1 text-meta text-dim2">
+            The written reason above is for the next human. This one is what
+            gets counted — it is the only field the AI-accuracy measure can be
+            computed from.
+          </p>
+          <div
+            role="radiogroup"
+            aria-label="Closure reason"
+            className="mt-2 flex flex-wrap gap-2"
+          >
+            {CLOSURE_CHOICES.map((c) => {
+              const selected = closureReason === c.value;
+              return (
+                <button
+                  key={c.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={selected}
+                  disabled={disabled}
+                  title={c.hint}
+                  onClick={() => setClosureReason(c.value)}
+                  className={cn(
+                    "rounded-md border px-2.5 py-1 text-meta",
+                    selected
+                      ? "border-cite-border bg-cite-bg text-cite-ink"
+                      : "border-line bg-field text-ink hover:bg-hover",
+                    disabledCls(disabled),
+                    focusRing,
+                  )}
+                >
+                  {c.label}
+                </button>
+              );
+            })}
+          </div>
+          {closureReason && (
+            <p className="mt-1 text-meta text-dim2">
+              {CLOSURE_CHOICES.find((c) => c.value === closureReason)?.hint}
+            </p>
+          )}
+
+          <label className="mt-3 flex items-center gap-2 text-kbd text-dim">
+            <input
+              type="checkbox"
+              checked={aiWasWrong}
+              disabled={disabled}
+              onChange={(e) => setAiWasWrong(e.target.checked)}
+              className={focusRing}
+            />
+            The AI got this wrong
+          </label>
+          {aiWasWrong && (
+            <textarea
+              value={aiWrongDetail}
+              disabled={disabled}
+              onChange={(e) => setAiWrongDetail(e.target.value)}
+              rows={2}
+              placeholder="What did it get wrong? This is what tunes the next verdict…"
+              aria-label="Detail on what the AI got wrong"
+              className={cn("mt-2", FIELD_CLS, disabledCls(disabled), focusRing)}
+            />
+          )}
+        </div>
+      )}
+
       <div className="mt-2 flex flex-wrap items-center gap-2">
         <button
           type="button"
@@ -283,6 +420,11 @@ function StatusPanel({
         >
           {submitting ? "Recording…" : "Change status"}
         </button>
+        {!disabled && closureMissing && (
+          <span className="text-kbd text-sev-med" role="alert">
+            Pick a closure reason — the server rejects a close without one (422).
+          </span>
+        )}
         {!disabled && choice !== null && reasonEmpty && (
           <span id={reasonErrId} className="text-kbd text-sev-med" role="alert">
             A reason is required — the server rejects a status change without one
@@ -291,9 +433,237 @@ function StatusPanel({
         )}
         <ResultLine result={result} />
       </div>
+
+      <div className="mt-2 border-t border-line pt-2 text-kbd text-dim2">
+        Resolving or closing this incident also stamps{" "}
+        <span className="font-mono">resolved_at</span> on its member alerts, so
+        they read as finished work items. It records <b>no verdict</b> on them —
+        whether each alert was a real threat is a separate judgement (see
+        &ldquo;Apply a verdict to member alerts&rdquo;).
+        <br />
+        Alerts that are <b>escalated and still awaiting a human verdict are
+        left open</b> and stay in the review queue: closing a case does not
+        review them. The queue itself is keyed on the verdict, not on{" "}
+        <span className="font-mono">resolved_at</span>, so closing an incident
+        does not by itself change the pending-review count.
+      </div>
     </div>
   );
 }
+
+// ---- VERDICT PROPAGATION (WO-H85 — opt-in, default OFF, never overwrites) ----
+/**
+ * Recording ONE human verdict across an incident's unreviewed member alerts.
+ *
+ * This is deliberately NOT folded into the status change. Closing an incident
+ * says "this investigation is finished"; saying "every alert in it was a false
+ * positive" is a different and much bigger claim, because an incident groups
+ * alerts nobody individually judged — one observed chain correlated 24 distinct
+ * source addresses (our own operational access, staff ranges, and genuine
+ * external attackers) purely because they touched the same host. One blanket
+ * verdict would have been wrong for most of them.
+ *
+ * Hence: a separate section, a verdict the analyst must pick, a required
+ * reason, and an explicit confirmation checkbox that DEFAULTS TO OFF (the
+ * server also refuses `confirm: false` — the client cannot be the only gate).
+ * The panel states the exact alert count it would touch and warns when the
+ * members do not already agree with each other. Alerts that already carry a
+ * human verdict are never overwritten — the server refuses them and returns
+ * them as `skipped`, which the result line reports back honestly.
+ */
+function PropagateVerdictPanel({
+  detail,
+  disabled,
+  onChanged,
+}: {
+  detail: IncidentDetail;
+  disabled: boolean;
+  onChanged: () => void;
+}) {
+  const preview = detail.verdict_propagation;
+  const eligible = preview?.eligible ?? 0;
+  const protectedCount = preview?.protected ?? 0;
+  const total = preview?.total ?? detail.alerts?.length ?? 0;
+  const disagree = preview ? !preview.agree : false;
+
+  const [choice, setChoice] = useState<TriageVerdict | null>(null);
+  const [reason, setReason] = useState("");
+  const [confirm, setConfirm] = useState(false); // DEFAULT OFF — never persisted
+  // Local write state instead of `useWrite`: the success line must report the
+  // ACTUAL applied/skipped counts the server returned, which a message fixed at
+  // call time cannot carry. Reporting "saved" while N alerts were refused would
+  // be the same looks-complete-but-stopped-halfway failure this fixes.
+  const [submitting, setSubmitting] = useState(false);
+  const [result, setResult] = useState<WriteResult>(null);
+  const reasonId = useId();
+  const confirmId = useId();
+
+  const reasonEmpty = reason.trim().length === 0;
+  const canSubmit =
+    !disabled &&
+    confirm &&
+    choice !== null &&
+    !reasonEmpty &&
+    eligible > 0 &&
+    !submitting;
+
+  const submit = async () => {
+    if (disabled || choice === null || reasonEmpty || !confirm) return;
+    setSubmitting(true);
+    setResult(null);
+    try {
+      const res = await propagateIncidentVerdict(detail.id, {
+        human_verdict: choice,
+        reason: reason.trim(),
+        confirm: true,
+      });
+      if (res.applied === 0) {
+        // The request succeeded and labelled nothing. Say so plainly.
+        setResult({
+          ok: false,
+          message: `Nothing was applied — all ${res.skipped} member alert(s) already carry a human verdict, which is never overwritten.`,
+        });
+      } else {
+        setResult({
+          ok: true,
+          message:
+            `${res.applied} alert(s) labelled` +
+            (res.skipped > 0
+              ? `; ${res.skipped} left unchanged — a human had already judged them.`
+              : "."),
+        });
+        setReason("");
+        setChoice(null);
+        setConfirm(false); // back to OFF — never a sticky bulk-apply mode
+      }
+      onChanged(); // refetch the case either way, so the counts are truthful
+    } catch (e) {
+      setResult({ ok: false, message: errMessage(e) });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div>
+      <div className="text-kbd text-dim">
+        This incident groups <b>{total}</b> alert{total === 1 ? "" : "s"}.{" "}
+        <b>{eligible}</b> ha{eligible === 1 ? "s" : "ve"} no human verdict yet
+        and would be labelled.
+        {protectedCount > 0 && (
+          <>
+            {" "}
+            <b>{protectedCount}</b> already carr
+            {protectedCount === 1 ? "ies" : "y"} a human verdict and{" "}
+            <b>will not be overwritten</b> — the server refuses those.
+          </>
+        )}
+      </div>
+
+      {disagree && (
+        <div className="mt-2 text-kbd text-sev-med" role="alert">
+          ⚠ These alerts do <b>not</b> currently agree with each other (
+          {preview?.distinct_verdicts.join(", ")}). They were correlated because
+          they share a host or user — not because anyone judged them the same.
+          One verdict across all of them will mislabel some.
+        </div>
+      )}
+
+      <div
+        role="radiogroup"
+        aria-label="Verdict to apply to member alerts"
+        className="mt-2 flex flex-wrap gap-2"
+      >
+        {PROPAGATE_CHOICES.map((c) => {
+          const selected = choice === c.verdict;
+          return (
+            <button
+              key={c.verdict}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              disabled={disabled}
+              onClick={() => setChoice(c.verdict)}
+              className={cn(
+                "rounded-md border px-2.5 py-1 text-meta",
+                selected
+                  ? "border-cite-border bg-cite-bg text-cite-ink"
+                  : "border-line bg-field text-ink hover:bg-hover",
+                disabledCls(disabled),
+                focusRing,
+              )}
+            >
+              {c.label}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="mt-2">
+        <label htmlFor={reasonId} className="text-kbd text-dim">
+          Reason <span className="text-sev-crit">*required</span>
+        </label>
+        <textarea
+          id={reasonId}
+          value={reason}
+          disabled={disabled}
+          onChange={(e) => setReason(e.target.value)}
+          rows={2}
+          placeholder="Recorded on every alert this labels, and kept in each alert's review history…"
+          className={cn(FIELD_CLS, disabledCls(disabled), focusRing)}
+        />
+      </div>
+
+      <label
+        htmlFor={confirmId}
+        className="mt-2 flex items-start gap-2 text-kbd text-ink"
+      >
+        <input
+          id={confirmId}
+          type="checkbox"
+          checked={confirm}
+          disabled={disabled}
+          onChange={(e) => setConfirm(e.target.checked)}
+          className={cn("mt-0.5", focusRing)}
+        />
+        <span>
+          I have reviewed these alerts and this verdict is correct for all{" "}
+          <b>{eligible}</b> of them. (Off by default — the server also rejects
+          an unconfirmed request.)
+        </span>
+      </label>
+
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={submit}
+          disabled={!canSubmit}
+          className={cn(BTN_PRIMARY, disabledCls(!canSubmit), focusRing)}
+        >
+          {submitting
+            ? "Applying…"
+            : `Apply to ${eligible} unreviewed alert${eligible === 1 ? "" : "s"}`}
+        </button>
+        {eligible === 0 && (
+          <span className="text-kbd text-dim2">
+            Nothing to apply — every member alert already carries a human
+            verdict.
+          </span>
+        )}
+        <ResultLine result={result} />
+      </div>
+    </div>
+  );
+}
+
+const PROPAGATE_CHOICES: ReadonlyArray<{
+  verdict: TriageVerdict;
+  label: string;
+}> = [
+  { verdict: "true_positive", label: "Confirm true positive" },
+  { verdict: "needs_investigation", label: "Needs investigation" },
+  { verdict: "false_positive", label: "False positive" },
+];
 
 // ---- ASSIGN -----------------------------------------------------------------
 
@@ -1000,6 +1370,7 @@ export function IncidentActions({
 
   const gate = {
     status: incidentActionGate(role, "status", isOwner),
+    propagate_verdict: incidentActionGate(role, "propagate_verdict", isOwner),
     assign: incidentActionGate(role, "assign", isOwner),
     note: incidentActionGate(role, "note", isOwner),
     flag: incidentActionGate(role, "flag", isOwner),
@@ -1045,6 +1416,21 @@ export function IncidentActions({
               <StatusPanel
                 detail={detail}
                 disabled={!gate.status.canSubmit}
+                onChanged={onChanged}
+              />
+            </Section>
+          )}
+
+          {gate.propagate_verdict.visible && (
+            <Section
+              title="Apply a verdict to member alerts"
+              hint="opt-in · never overwrites an existing verdict"
+              disabled={!gate.propagate_verdict.canSubmit}
+              lockNote={gate.propagate_verdict.lockNote}
+            >
+              <PropagateVerdictPanel
+                detail={detail}
+                disabled={!gate.propagate_verdict.canSubmit}
                 onChanged={onChanged}
               />
             </Section>

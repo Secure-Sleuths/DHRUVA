@@ -89,9 +89,17 @@ class ThreatIntelEnricher:
             "is_known_malicious": False,
             "highest_ti_severity": "none",
             "ti_matches": [],
+            # Whether the indicator lookups below actually RAN. False means
+            # threat_intel_hits/is_known_malicious mean "we could not look", not
+            # "clean" — src/agents/verdict_guard.py refuses an automated
+            # dismissal on that basis instead of reading the zeros as benign.
+            # Set pessimistically here and flipped to True only once a lookup
+            # has genuinely completed, so every early return fails closed.
+            "threat_intel_lookup_ok": False,
         }
 
         if not self.db:
+            # No IOC store wired up — nothing was checked. Leave the flag False.
             return enrichment
 
         # Extract indicators from alert
@@ -99,6 +107,10 @@ class ThreatIntelEnricher:
         cve_ids = self._extract_cve_ids(alert)
 
         if not indicators and not cve_ids:
+            # Nothing in this alert to look up. That is a complete answer, not a
+            # degraded one — the guard must not trip on every alert that simply
+            # carries no IP/hash/domain.
+            enrichment["threat_intel_lookup_ok"] = True
             return enrichment
 
         max_severity = "none"
@@ -106,6 +118,10 @@ class ThreatIntelEnricher:
         # ------ Step 1: Batch lookup against local Postgres DB ------
         values = [v for _, v in indicators]
         local_hits = self.db.lookup_iocs_batch(values)
+        # The local batch lookup completed. Live feed lookups further down are
+        # best-effort on top of this; the flag records that the authoritative
+        # local check ran.
+        enrichment["threat_intel_lookup_ok"] = True
         matched_values = set()
 
         for ioc_type, value in indicators:
@@ -388,5 +404,11 @@ class ThreatIntelEnricher:
             if host and not all(c.isdigit() or c == '.' for c in host):
                 return host
         except Exception:
+            # WO-H90 reviewed, left silent on purpose: a URL parse helper with a
+            # documented `None` fallback, called per alert per URL. `urlparse`
+            # raising means the string was not a URL, and a string that is not a
+            # URL has no domain to check against the IOC set either — so there
+            # is no lost coverage to report, and a per-alert log would be flood
+            # for no signal.
             pass
         return None

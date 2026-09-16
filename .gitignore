@@ -44,3 +44,6 @@ tools/license-manager/*.key
 # Sales — rendered derivatives (re-render from .md sources)
 sales/*.pptx
 sales/*.pdf
+
+# MkDocs build output
+site/

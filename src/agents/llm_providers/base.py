@@ -24,7 +24,7 @@ class BaseLLMProvider:
         # (json_parse_all_attempts_failed). Override per-call by setting
         # llm.max_tokens in config.yaml or per-tenant LLM config.
         self.max_tokens = config.get("max_tokens", 8192)
-        self.temperature = config.get("temperature", 0.1)
+        self.temperature = config.get("temperature", 0.0)  # WO-H104: classification, not generation
         # WO-H50: real usage from the most recent call_text(), when the provider
         # can obtain it. Shape: {"input_tokens": int, "output_tokens": int,
         # "cost_usd": float|None, "estimated": bool}. None until the first call,
@@ -37,6 +37,17 @@ class BaseLLMProvider:
         """Send a prompt to the LLM and return raw text response.
 
         This is the ONLY method providers must implement.
+
+        Providers MAY additionally implement::
+
+            call_text_json(system_prompt, user_message) -> str
+
+        to constrain the response to valid JSON server-side (e.g. Ollama's
+        ``format: "json"``). ``LLMBackend.call()`` prefers that hook when
+        present; ``LLMBackend.call_raw()`` never uses it, because raw callers
+        want prose. Keep it a separate METHOD rather than provider state: one
+        provider instance serves N concurrent triage workers (WO-H32), so a
+        mutable json-mode flag would race across threads.
         """
         raise NotImplementedError
 

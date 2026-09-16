@@ -3,7 +3,6 @@ Enrichment modules - Add context to raw Wazuh alerts.
 Each enricher adds a specific type of intelligence.
 """
 
-import re
 import json
 import hashlib
 import structlog
@@ -13,7 +12,69 @@ from datetime import datetime, timezone, timedelta
 from fnmatch import fnmatch
 from cachetools import TTLCache
 
+from src.timestamps import parse_iso8601_or_none
+
 logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# WO-S11 — per-tenant enrichment inventories
+# ---------------------------------------------------------------------------
+#
+# AssetEnricher.assets and IdentityEnricher.identities used to be ONE
+# process-wide dict on the single shared EnrichmentService. They are loaded from
+# the tenant-scoped `assets` / `identities` tables (db.get_assets() applies
+# _tenant_filter()), but the result was stored globally — so whichever tenant's
+# inventory was loaded most recently enriched EVERY tenant's alerts.
+#
+# Two consequences, both real:
+#   * Confidentiality — tenant A's asset owner name/email, tier, tags and
+#     identity roles/is_admin/known_ips were written into tenant B's
+#     enriched-alert documents, shown in B's case view, and sent to B's LLM
+#     provider inside the triage prompt.
+#   * Integrity — any tenant `admin` could register a hostname or username that
+#     another tenant also uses (DC01, administrator) with a
+#     criticality/risk multiplier of 0.1, call the tenant-scoped
+#     /api/admin/settings/reload-enrichers, and push the OTHER tenant's alerts
+#     below the min_risk triage threshold, where they are dropped without triage
+#     entirely.
+#
+# Fix (operator-approved 2026-08-03, "option 1"): keep the in-memory cache, but
+# key it by the tenant contextvar. DB-loaded inventory lands in the calling
+# tenant's slice and is only ever read back for that tenant.
+#
+# The file/YAML inventory is kept in a SEPARATE shared slot and used as a
+# fallback. That is deployment-level configuration written by the operator, not
+# tenant-submitted data, and sharing it is the existing intended behaviour — but
+# it is now explicit rather than an accident of a global dict.
+
+_DEFAULT_TENANT_SLICE = "__default__"
+
+
+def _tenant_slice_key() -> str:
+    """Cache key for the tenant currently in context.
+
+    Single-tenant deployments (and any code path with no tenant bound) share
+    ``__default__``, which is correct there — there is only one customer. The
+    cross-tenant sentinel also maps to ``__default__`` rather than leaking one
+    arbitrary tenant's inventory into an unscoped operation.
+    """
+    try:
+        from src.database.store import _tenant_ctx
+        tenant_id = _tenant_ctx.get()
+    except Exception as e:                               # noqa: BLE001
+        # WO-H90: was a bare `except: return`. This is the TENANT CACHE KEY. If
+        # resolving it ever fails we fall back to the shared `__default__` slice,
+        # which means alerts get enriched from the wrong customer's asset and
+        # identity inventory. `error` — not `warning` — because there is no
+        # benign version of this, and it must not stay quiet just because it is
+        # on a per-alert path. In practice `_tenant_ctx` has a default and cannot
+        # raise, so firing at all means the store module failed to import.
+        logger.error("tenant_slice_key_resolution_failed", error=str(e)[:200])
+        return _DEFAULT_TENANT_SLICE
+    if not tenant_id or tenant_id == "__CROSS_TENANT__":
+        return _DEFAULT_TENANT_SLICE
+    return str(tenant_id)
 
 
 # ---------------------------------------------------------------------------
@@ -24,11 +85,53 @@ class AssetEnricher:
     """Enriches alerts with asset criticality, ownership, and classification."""
 
     def __init__(self, config: dict):
-        self.assets: dict = {}
+        # WO-S11: DB-loaded inventory, keyed by tenant. Never read across
+        # tenants.
+        self._assets_by_tenant: dict[str, dict] = {}
+        # Operator-provided YAML inventory — deployment config, shared by
+        # design, used only as a fallback when the tenant has no own record.
+        self._shared_assets: dict = {}
+        # Tenants whose last DB reload RAISED. Keyed like _assets_by_tenant,
+        # because the inventory it describes is per-tenant: a process-global
+        # health flag let one tenant's outage mask another's (and vice versa),
+        # which is the defect class WO-S11 fixed for `assets` itself.
+        self._reload_failed_tenants: set = set()
         self.risk_criteria: dict = config.get("risk_criteria", {})
         self.source = config.get("source", "file")
         self.file_path = config.get("file_path", "")
         self._load_assets()
+
+    @property
+    def assets(self) -> dict:
+        """Effective inventory for the CURRENT tenant (shared + own).
+
+        Kept as a property so existing readers — including the counts returned
+        by ``EnrichmentService.reload_enrichers`` — keep working unchanged.
+        The hot path uses ``_lookup`` instead, which avoids building this dict
+        per alert.
+        """
+        return {**self._shared_assets,
+                **self._assets_by_tenant.get(_tenant_slice_key(), {})}
+
+    @assets.setter
+    def assets(self, value: dict):
+        """Assign the CURRENT tenant's inventory.
+
+        WO-S11 made ``assets`` a property; without this setter every existing
+        caller doing ``enricher.assets = {...}`` raises
+        ``AttributeError: property 'assets' has no setter``. That includes
+        ``tests/test_enrichers.py``, whose failures were masked because the
+        module is skipped when no Docker daemon is present — so the regression
+        would only have surfaced on a machine that could run the DB lane.
+        """
+        self._assets_by_tenant[_tenant_slice_key()] = dict(value or {})
+
+    def _lookup(self, hostname: str):
+        """Resolve a hostname for the current tenant. Own record wins."""
+        own = self._assets_by_tenant.get(_tenant_slice_key())
+        if own and hostname in own:
+            return own[hostname]
+        return self._shared_assets.get(hostname)
 
     def _load_assets(self):
         """Load asset inventory from configured source."""
@@ -37,25 +140,43 @@ class AssetEnricher:
                 import yaml
                 with open(self.file_path) as f:
                     data = yaml.safe_load(f) or {}
-                    self.assets = {a["hostname"]: a for a in (data.get("assets") or [])}
-                logger.info("assets_loaded", count=len(self.assets))
+                    self._shared_assets = {
+                        a["hostname"]: a for a in (data.get("assets") or [])}
+                logger.info("assets_loaded", count=len(self._shared_assets))
             except FileNotFoundError:
                 logger.warning("asset_file_not_found", path=self.file_path)
             except Exception as e:
                 logger.error("asset_load_failed", error=str(e))
 
     def reload_from_db(self, db):
-        """Reload asset data from the database (settings panel)."""
+        """Reload asset data from the database for the CURRENT tenant only.
+
+        WO-S11: writes into this tenant's slice. Previously this replaced the
+        one process-global dict, so a tenant admin hitting
+        /api/admin/settings/reload-enrichers repointed every other tenant's
+        enrichment at their own inventory.
+        """
+        key = _tenant_slice_key()
         try:
             db_assets = db.get_assets_as_dict()
             if db_assets:
-                self.assets = db_assets
-                logger.info("assets_reloaded_from_db", count=len(self.assets))
+                self._assets_by_tenant[key] = db_assets
+                logger.info("assets_reloaded_from_db",
+                            tenant_slice=key, count=len(db_assets))
+                self._reload_failed_tenants.discard(key)
             else:
                 logger.info("assets_db_empty_keeping_current",
-                            count=len(self.assets))
+                            tenant_slice=key,
+                            count=len(self._assets_by_tenant.get(key, {})))
         except Exception as e:
-            logger.error("asset_db_reload_failed", error=str(e))
+            logger.error("asset_db_reload_failed",
+                         tenant_slice=key, error=str(e))
+            # The inventory is now stale or empty, so hosts resolve to
+            # asset_tier "unknown". Downstream that is indistinguishable from
+            # "not a critical asset", which would silently switch off the
+            # verdict guard's tier_1_critical condition. Say so explicitly —
+            # and only for THIS tenant.
+            self._reload_failed_tenants.add(key)
 
     def enrich(self, alert: dict) -> dict:
         """Add asset context to an alert."""
@@ -67,9 +188,10 @@ class AssetEnricher:
             "asset_criticality_multiplier": 1.0
         }
 
-        # Try exact match first
-        if agent_name in self.assets:
-            asset = self.assets[agent_name]
+        # Try exact match first — WO-S11: scoped to the current tenant.
+        asset = self._lookup(agent_name)
+        matched_pattern = False
+        if asset is not None:
             enrichment.update({
                 "asset_tier": asset.get("tier", "unknown"),
                 "asset_owner": asset.get("owner", "unknown"),
@@ -86,8 +208,42 @@ class AssetEnricher:
                     if fnmatch(agent_name.lower(), pattern.lower()):
                         enrichment["asset_tier"] = tier_name
                         enrichment["asset_criticality_multiplier"] = tier_config.get("risk_multiplier", 1.0)
+                        matched_pattern = True
                         break
+                if matched_pattern:
+                    break
 
+        # Whether the tier in this record can be TRUSTED.
+        #
+        # Derived from whether the lookup could actually be PERFORMED, not from
+        # "the last call didn't throw". An earlier version tracked a boolean set
+        # on exception, which the shipped default reset to healthy: the asset
+        # YAML is absent, the DB reload returns empty and takes the
+        # "keeping current" branch, and every host reads asset_tier "unknown"
+        # while the flag says fine. That is the exact bypass the flag exists to
+        # catch, so the flag has to follow the data rather than the control flow.
+        #
+        # Trusted when EITHER:
+        #   * this alert was authoritatively classified (inventory record hit,
+        #     or a risk_criteria hostname pattern matched), or
+        #   * this tenant has a usable inventory and its last reload didn't
+        #     fail — a host simply not being listed is a real answer, not a
+        #     degradation, and must not trip the guard.
+        key = _tenant_slice_key()
+        inventory_usable = bool(self._assets_by_tenant.get(key)
+                                or self._shared_assets)
+        reload_failed = key in self._reload_failed_tenants
+        # A failed reload leaves the previous slice in place. Reading a STALE
+        # record must not count as an authoritative answer: a host promoted to
+        # tier_1_critical in the DB while the cached copy still says tier_3
+        # would otherwise report trusted, the tier-1 condition would not fire,
+        # and the alert would stay auto-close eligible on a now-critical asset.
+        # Only a pattern match — which is computed fresh from risk_criteria and
+        # cannot be stale — survives a failed reload.
+        enrichment["asset_lookup_ok"] = bool(
+            matched_pattern
+            or (not reload_failed and (asset is not None or inventory_usable))
+        )
         return enrichment
 
 
@@ -99,11 +255,31 @@ class IdentityEnricher:
     """Enriches alerts with user context: roles, privileges, behavior patterns."""
 
     def __init__(self, config: dict):
-        self.identities: dict = {}
+        # WO-S11: see the AssetEnricher note — same defect, same fix.
+        self._identities_by_tenant: dict[str, dict] = {}
+        self._shared_identities: dict = {}
         self.risk_criteria: dict = config.get("risk_criteria", {})
         self.source = config.get("source", "file")
         self.file_path = config.get("file_path", "")
         self._load_identities()
+
+    @property
+    def identities(self) -> dict:
+        """Effective directory for the CURRENT tenant (shared + own)."""
+        return {**self._shared_identities,
+                **self._identities_by_tenant.get(_tenant_slice_key(), {})}
+
+    @identities.setter
+    def identities(self, value: dict):
+        """Assign the CURRENT tenant's directory — see AssetEnricher.assets."""
+        self._identities_by_tenant[_tenant_slice_key()] = dict(value or {})
+
+    def _lookup(self, username: str):
+        """Resolve a username for the current tenant. Own record wins."""
+        own = self._identities_by_tenant.get(_tenant_slice_key())
+        if own and username in own:
+            return own[username]
+        return self._shared_identities.get(username)
 
     def _load_identities(self):
         if self.source == "file" and self.file_path:
@@ -111,26 +287,31 @@ class IdentityEnricher:
                 import yaml
                 with open(self.file_path) as f:
                     data = yaml.safe_load(f) or {}
-                    self.identities = {u["username"]: u for u in (data.get("users") or [])}
-                logger.info("identities_loaded", count=len(self.identities))
+                    self._shared_identities = {
+                        u["username"]: u for u in (data.get("users") or [])}
+                logger.info("identities_loaded",
+                            count=len(self._shared_identities))
             except FileNotFoundError:
                 logger.warning("identity_file_not_found", path=self.file_path)
             except Exception as e:
                 logger.error("identity_load_failed", error=str(e))
 
     def reload_from_db(self, db):
-        """Reload identity data from the database (settings panel)."""
+        """Reload identity data from the DB for the CURRENT tenant only (WO-S11)."""
+        key = _tenant_slice_key()
         try:
             db_identities = db.get_identities_as_dict()
             if db_identities:
-                self.identities = db_identities
+                self._identities_by_tenant[key] = db_identities
                 logger.info("identities_reloaded_from_db",
-                            count=len(self.identities))
+                            tenant_slice=key, count=len(db_identities))
             else:
                 logger.info("identities_db_empty_keeping_current",
-                            count=len(self.identities))
+                            tenant_slice=key,
+                            count=len(self._identities_by_tenant.get(key, {})))
         except Exception as e:
-            logger.error("identity_db_reload_failed", error=str(e))
+            logger.error("identity_db_reload_failed",
+                         tenant_slice=key, error=str(e))
 
     def enrich(self, alert: dict) -> dict:
         """Add identity context to an alert."""
@@ -150,8 +331,9 @@ class IdentityEnricher:
 
         max_risk = 1.0
         for username in users:
-            if username in self.identities:
-                identity = self.identities[username]
+            # WO-S11: scoped to the current tenant.
+            identity = self._lookup(username)
+            if identity is not None:
                 risk = identity.get("risk_multiplier", 1.0)
                 if risk > max_risk:
                     max_risk = risk
@@ -396,6 +578,20 @@ class HistoricalEnricher:
         self.db = db
         self.baseline_window = config.get("baseline_window_days", 30)
         self.anomaly_threshold = config.get("anomaly_std_deviations", 2.5)
+        # WO-H60 step 3: the window over which `historical_fp_rate` is computed
+        # and shown to the triage agent.
+        #
+        # This was hard-coded to 7 days. For a product whose thesis is
+        # COMPOUNDING intelligence, institutional memory that expires in a week
+        # barely compounds — and it measurably did not: on the live install the
+        # newest analyst label was 12 days old, so a 7-day window contained ZERO
+        # labelled decisions and the agent was shown 0.0% for rules analysts had
+        # dispositioned false-positive 100% of the time (rule 40101: 0.0% at 7d,
+        # 100.0% at 30d across 774 decisions).
+        #
+        # 30 days matches `baseline_window_days` above, so the two historical
+        # signals now describe the same period.
+        self.fp_window_days = config.get("fp_rate_window_days", 30)
         # Short-lived cache: (dimension_field, value) → 24h count
         self._count_cache = TTLCache(maxsize=5000, ttl=300)
 
@@ -464,10 +660,28 @@ class HistoricalEnricher:
 
         # Get FP rate from local database
         if self.db and rule_id:
-            fp_stats = self.db.get_fp_rate_for_rule(rule_id, days=7)
+            fp_stats = self.db.get_fp_rate_for_rule(
+                rule_id, days=self.fp_window_days)
             enrichment["historical_fp_rate"] = fp_stats.get("fp_rate", 0)
             enrichment["historical_occurrence_count"] = fp_stats.get("total", 0)
-            enrichment["same_rule_last_7d"] = fp_stats.get("total", 0)
+            # Carried so the prompt can state the ACTUAL window instead of a
+            # hard-coded "7d" that would now be a lie.
+            enrichment["historical_window_days"] = self.fp_window_days
+
+            # `same_rule_last_7d` is consumed by the dashboard
+            # (web/src/lib/incident.ts -> sameRule7d) and must stay a genuine
+            # SEVEN-day count. When the FP window is no longer 7 it needs its
+            # own query — one extra indexed aggregate per alert, paid only when
+            # the windows differ.
+            if self.fp_window_days == 7:
+                enrichment["same_rule_last_7d"] = fp_stats.get("total", 0)
+            else:
+                try:
+                    enrichment["same_rule_last_7d"] = self.db.get_fp_rate_for_rule(
+                        rule_id, days=7).get("total", 0)
+                except Exception as e:
+                    logger.warning("same_rule_7d_lookup_failed",
+                                   rule_id=rule_id, error=str(e))
 
         # Get correlated history from OpenSearch
         if self.opensearch:
@@ -550,39 +764,407 @@ class HistoricalEnricher:
 # ---------------------------------------------------------------------------
 
 class TimeContextEnricher:
-    """Adds time-based context: business hours, maintenance windows, etc."""
+    """Adds time-based context: business hours, maintenance windows, etc.
+
+    WO-H76 — three defects fixed here, all of which made every alert ever
+    scored look like it arrived outside business hours (verified on two live
+    deployments: ``time_multiplier`` was 1.0 in 0 of 14,259 and 0 of 10,878
+    alerts; only 1.5 and 1.95 were ever produced):
+
+    1. The ``time_context`` block lives in
+       ``config/guidance/risk_criteria.yaml``, not in the ``enrichment:``
+       section of config.yaml, so this enricher was constructed with an empty
+       config. See ``resolve_time_context_config`` in
+       ``src/enrichment/service.py`` for the wiring.
+    2. The configured ``timezone`` was loaded but never applied. Wazuh emits
+       UTC timestamps, so a 09:00-18:00 Asia/Kolkata window was being compared
+       against UTC wall-clock time — a 5.5 hour shift. Business hours,
+       maintenance windows AND the weekend check now all run against the
+       timestamp converted into the configured timezone, so all three agree on
+       what day it is.
+    3. The "default to business hours when config is missing" fallback was
+       dead: an empty ``days`` list raises nothing, so the guarded expression
+       returned False (= outside business hours) instead of hitting the
+       ``except``. A genuinely missing/empty config now defaults to business
+       hours (multiplier 1.0) AND says so in the log — silence is how this
+       survived in production.
+
+    WO-H76 follow-up (QA round): ``config/guidance/risk_criteria.yaml`` is the
+    OPERATOR-editable file, and it is now reloadable live, so a typo in it must
+    never crash enrichment and — worse — must never be accepted silently. The
+    whole block is therefore VALIDATED once at construction into normalized
+    fields (``_business_hours`` / ``_maintenance_windows`` /
+    ``_risk_adjustments``); every rejection is logged with the offending value
+    and falls back to a documented default. The shapes that motivated it, all
+    of which YAML makes easy to write by accident:
+
+    * ``days: monday`` (unquoted scalar) — iterating a str yields characters,
+      so ``bh_days`` became a truthy 6-element list of letters and EVERY
+      weekday alert silently scored 1.5 again: the original defect, restored.
+    * ``days: [0, 1, 2]`` — same silent outcome.
+    * ``start: 9:00`` unquoted — YAML 1.1 sexagesimal, parses to the int 540.
+      ``start: 9`` / ``start: "9am"`` / ``"25:00"`` are unparsable too, and the
+      old behaviour was "everything is business hours, 24/7" — i.e. ALL
+      out-of-hours risk silently gone.
+    * ``risk_adjustments:`` with an empty body — ``None``, so ``.get`` on it
+      raised ``AttributeError`` and killed time context, but only on
+      out-of-hours/weekend/maintenance alerts (it looks healthy during the
+      day).
+    * a ``maintenance_windows`` entry written as a bare string rather than a
+      mapping — ``.get`` raised and killed time context for 100% of alerts.
+    """
+
+    #: Fallback working week, used when ``business_hours`` declares no usable
+    #: ``days``. A COMPLETELY absent business_hours block defaults to business
+    #: hours (1.0) instead — see ``_is_business_hours``.
+    _DEFAULT_BUSINESS_DAYS = ("monday", "tuesday", "wednesday",
+                              "thursday", "friday")
+    _WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday",
+                      "friday", "saturday", "sunday")
+    _DEFAULT_START = "09:00"
+    _DEFAULT_END = "18:00"
 
     def __init__(self, config: dict):
-        self.time_config = config.get("time_context", {})
+        raw = (config or {}).get("time_context", {})
+        if raw and not isinstance(raw, dict):
+            logger.warning(
+                "time_context_config_not_a_mapping",
+                got=type(raw).__name__,
+                msg="time_context must be a mapping — ignoring it and "
+                    "defaulting every alert to business hours (1.0).")
+            raw = {}
+        self.time_config = raw or {}
+        self._tz = self._resolve_timezone(self.time_config)
+        # Warn-once latches — these run per alert, so an unconditional warning
+        # would be a log flood.
+        self._warned_missing_config = False
+        self._warned_unparsed_timestamp = False
+        if not self.time_config:
+            logger.warning(
+                "time_context_config_missing",
+                msg="No time_context block supplied to TimeContextEnricher — "
+                    "defaulting every alert to business hours (multiplier 1.0). "
+                    "Expected it under time_context in "
+                    "config/guidance/risk_criteria.yaml.")
+
+        # Validate ONCE, here, so a bad edit is reported at load/reload time
+        # rather than being silently absorbed on every alert forever. Wrapped
+        # because this now runs during EnrichmentService.__init__ AND during a
+        # live reload: an operator typo must not be able to stop the platform
+        # booting.
+        try:
+            self._business_hours = self._validate_business_hours(
+                self.time_config.get("business_hours"))
+            self._maintenance_windows = self._validate_maintenance_windows(
+                self.time_config.get("maintenance_windows"))
+            self._risk_adjustments = self._validate_risk_adjustments(
+                self.time_config.get("risk_adjustments"))
+        except Exception as e:      # pragma: no cover — belt and braces
+            logger.error("time_context_config_validation_failed", error=str(e),
+                         msg="Falling back to business hours for every alert "
+                             "(multiplier 1.0).")
+            self._business_hours = None
+            self._maintenance_windows = []
+            self._risk_adjustments = {}
+
+    # ── config validation ──────────────────────────────────────────────────
+
+    @classmethod
+    def _parse_hhmm(cls, value, field: str, where: str):
+        """Parse an ``"HH:MM"`` string, or return None having said why.
+
+        Deliberately strict about the type. ``start: 9:00`` without quotes is
+        YAML 1.1 sexagesimal and arrives here as the int 540; guessing at what
+        an int means (minutes past midnight? an hour?) would be inventing
+        intent, so it is rejected loudly with the fix in the message.
+        """
+        if isinstance(value, str):
+            try:
+                return datetime.strptime(value.strip(), "%H:%M").time()
+            except ValueError:
+                pass
+        logger.warning("time_context_time_unparsable",
+                       where=where, field=field, value=repr(value),
+                       msg='Expected a quoted "HH:MM" string, e.g. '
+                           'start: "09:00". Note an unquoted 9:00 is read by '
+                           'YAML as the number 540.')
+        return None
+
+    @classmethod
+    def _normalize_days(cls, value, where: str):
+        """Normalize a ``days`` value to a list of real weekday names.
+
+        Returns ``[]`` when nothing usable is present; the caller decides what
+        that means (business hours default to Mon-Fri, a maintenance window is
+        dropped). Never raises.
+        """
+        if value is None:
+            return []
+        if isinstance(value, str):
+            # Iterating a str yields CHARACTERS — the silent-failure shape.
+            logger.warning("time_context_days_not_a_list",
+                           where=where, value=repr(value),
+                           msg="`days` should be a list, e.g. "
+                               'days: ["monday"]. Reading it as one day.')
+            candidates = [value]
+        elif isinstance(value, (list, tuple, set)):
+            candidates = list(value)
+        else:
+            logger.warning("time_context_days_invalid_type",
+                           where=where, got=type(value).__name__,
+                           msg="`days` must be a list of weekday names — "
+                               "ignoring it.")
+            return []
+
+        days, rejected = [], []
+        for item in candidates:
+            name = str(item).strip().lower()
+            if name in cls._WEEKDAY_NAMES:
+                if name not in days:
+                    days.append(name)
+            elif name:
+                rejected.append(item)
+        if rejected:
+            logger.warning("time_context_invalid_weekday",
+                           where=where, rejected=[repr(r) for r in rejected],
+                           accepted=days,
+                           msg="Entries must be full weekday names "
+                               "(monday..sunday) — the rest were dropped.")
+        return days
+
+    @classmethod
+    def _validate_business_hours(cls, raw):
+        """Normalize ``business_hours`` or return None (= always in-hours)."""
+        if not raw:
+            return None
+        if not isinstance(raw, dict):
+            logger.warning("time_context_business_hours_invalid_type",
+                           got=type(raw).__name__,
+                           msg="business_hours must be a mapping — treating "
+                               "all alerts as business hours (1.0).")
+            return None
+
+        start = cls._parse_hhmm(raw.get("start", cls._DEFAULT_START),
+                                "start", "business_hours")
+        end = cls._parse_hhmm(raw.get("end", cls._DEFAULT_END),
+                              "end", "business_hours")
+        if start is None or end is None:
+            # A sane, documented default beats "everything is business hours,
+            # 24/7", which is what the old code silently did here.
+            logger.warning(
+                "time_context_business_hours_defaulted",
+                start=cls._DEFAULT_START, end=cls._DEFAULT_END,
+                msg="Falling back to the default business-hours window.")
+            start = start or datetime.strptime(cls._DEFAULT_START,
+                                               "%H:%M").time()
+            end = end or datetime.strptime(cls._DEFAULT_END, "%H:%M").time()
+
+        days = cls._normalize_days(raw.get("days"), "business_hours")
+        if not days:
+            logger.warning(
+                "time_context_business_days_undefined",
+                default=list(cls._DEFAULT_BUSINESS_DAYS),
+                msg="business_hours has no usable `days` — assuming "
+                    "Monday-Friday.")
+            days = list(cls._DEFAULT_BUSINESS_DAYS)
+        return {"start": start, "end": end, "days": days}
+
+    @classmethod
+    def _validate_maintenance_windows(cls, raw):
+        """Normalize maintenance windows, dropping (loudly) any unusable one."""
+        if not raw:
+            return []
+        if not isinstance(raw, (list, tuple)):
+            logger.warning("time_context_maintenance_windows_invalid_type",
+                           got=type(raw).__name__,
+                           msg="maintenance_windows must be a list of "
+                               "mappings — ignoring all of them.")
+            return []
+
+        windows = []
+        for idx, window in enumerate(raw):
+            where = "maintenance_windows[%d]" % idx
+            if not isinstance(window, dict):
+                logger.warning("time_context_maintenance_window_not_a_mapping",
+                               where=where, got=type(window).__name__,
+                               value=repr(window),
+                               msg="Each maintenance window must be a mapping "
+                                   "with day(s)/start/end — dropping it.")
+                continue
+            name = window.get("name", where)
+            # Both spellings ship in risk_criteria.yaml. Singular `day:` is a
+            # scalar BY DESIGN, so wrap it rather than warning about it.
+            raw_days = window.get("days")
+            if raw_days is None and window.get("day") is not None:
+                raw_days = [window.get("day")]
+            days = cls._normalize_days(raw_days, where)
+            if not days:
+                logger.warning("time_context_maintenance_window_no_days",
+                               where=where, window=str(name),
+                               msg="No usable day(s) — dropping this window "
+                                   "(it could never match).")
+                continue
+            start = cls._parse_hhmm(window.get("start"), "start", where)
+            end = cls._parse_hhmm(window.get("end"), "end", where)
+            if start is None or end is None:
+                logger.warning("time_context_maintenance_window_dropped",
+                               where=where, window=str(name),
+                               msg="Unusable start/end — dropping this window.")
+                continue
+            windows.append({"name": str(name), "days": days,
+                            "start": start, "end": end})
+        return windows
+
+    @classmethod
+    def _validate_risk_adjustments(cls, raw):
+        """Keep only numeric multipliers; anything else falls back to default.
+
+        ``risk_adjustments:`` with an empty body is ``None`` in YAML, which is
+        why this must not assume a mapping.
+        """
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            logger.warning("time_context_risk_adjustments_invalid_type",
+                           got=type(raw).__name__,
+                           msg="risk_adjustments must be a mapping — using "
+                               "the built-in default multipliers.")
+            return {}
+        clean = {}
+        for key, value in raw.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                logger.warning("time_context_risk_adjustment_not_numeric",
+                               field=str(key), value=repr(value),
+                               msg="Multiplier must be a number — using the "
+                                   "built-in default for this one.")
+                continue
+            clean[str(key)] = float(value)
+        return clean
+
+    @staticmethod
+    def _resolve_timezone(time_config: dict):
+        """Resolve the configured business timezone, falling back to UTC.
+
+        An unknown/invalid zone name must not take enrichment down: log it and
+        carry on in UTC (which is what the old code effectively did anyway).
+        """
+        name = ((time_config.get("business_hours") or {}).get("timezone")
+                or time_config.get("timezone"))
+        if not name:
+            return timezone.utc
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(str(name))
+        except Exception as e:
+            logger.warning("time_context_timezone_invalid",
+                           timezone=str(name), error=str(e),
+                           msg="Falling back to UTC for business-hours, "
+                               "maintenance-window and weekend evaluation.")
+            return timezone.utc
+
+    def _to_local(self, ts: datetime) -> datetime:
+        """Convert an alert timestamp into the configured business timezone.
+
+        Wazuh emits UTC. A naive timestamp (the ``%Y-%m-%d %H:%M:%S`` format)
+        is therefore assumed to be UTC rather than local-to-the-process —
+        though ``_parse_timestamp`` now guarantees an aware value, so the
+        ``tzinfo is None`` branch below is belt-and-braces for a caller that
+        hands us a datetime from somewhere else.
+        """
+        try:
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts.astimezone(self._tz)
+        except Exception as e:
+            logger.warning("time_context_tz_conversion_failed", error=str(e))
+            return ts
+
+    @staticmethod
+    def _assume_utc(ts: datetime) -> datetime:
+        """Stamp UTC on a naive datetime. Wazuh emits UTC.
+
+        PORTABILITY (WO-H76 QA round 2): this must happen HERE, at the parse
+        boundary, not only later in ``_to_local``. A naive datetime crossing a
+        function boundary carries no timezone contract, so anything that does
+        not route through ``_to_local`` — a future caller, or a test asserting
+        on the parsed value — gets SYSTEM-LOCAL semantics from ``astimezone()``.
+        That is correct on a UTC dev box or CI runner and silently wrong on the
+        Asia/Kolkata production host: the exact "right in test, wrong in
+        production because of where it runs" defect class this work order
+        exists to kill. Three tests failed only on an IST machine.
+        """
+        return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+
+    def _parse_timestamp(self, timestamp_str) -> datetime:
+        """Parse an alert timestamp, or fall back to NOW — and say so.
+
+        ALWAYS returns a timezone-AWARE datetime; a naive input is read as UTC
+        (see :meth:`_assume_utc`), never as the host's local time.
+
+        The fallback scores the alert against PROCESSING time rather than
+        EVENT time, which is silently wrong for a backfill or a replay. It used
+        to happen with no log at all for perfectly ordinary shapes: bare
+        ISO-8601 with no offset (``2026-08-12T12:00:00``), fractional seconds
+        with no offset, sub-microsecond precision, and epoch numbers.
+        """
+        try:
+            if isinstance(timestamp_str, str) and timestamp_str.strip():
+                raw = timestamp_str.strip()
+                # WO-H116: one version-independent parse covers every shape the
+                # hand-rolled ladder below used to cover — ``+0000``, ``Z``,
+                # offset-less, and sub-microsecond — on 3.10 as well as 3.14.
+                # ``parse_iso8601`` applies the same naive-means-UTC rule as
+                # :meth:`_assume_utc`.
+                parsed = parse_iso8601_or_none(raw)
+                if parsed is not None:
+                    return parsed
+                # Compatibility net for non-ISO shapes ``strptime`` tolerates
+                # but ISO-8601 does not (e.g. unpadded ``2026-9-1 8:05:00``).
+                for fmt in ["%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
+                            "%Y-%m-%d %H:%M:%S"]:
+                    try:
+                        return self._assume_utc(datetime.strptime(raw, fmt))
+                    except ValueError:
+                        continue
+            elif isinstance(timestamp_str, (int, float)) and \
+                    not isinstance(timestamp_str, bool):
+                # Epoch seconds or milliseconds (Wazuh integrations emit both).
+                value = float(timestamp_str)
+                if abs(value) >= 1e11:
+                    value /= 1000.0
+                return datetime.fromtimestamp(value, tz=timezone.utc)
+        except Exception:
+            pass
+
+        if not self._warned_unparsed_timestamp:
+            self._warned_unparsed_timestamp = True
+            logger.warning(
+                "time_context_timestamp_unparsed",
+                timestamp=repr(timestamp_str),
+                msg="Could not parse the alert timestamp — scoring time "
+                    "context against PROCESSING time, not event time. "
+                    "Warned once per enricher instance.")
+        else:
+            logger.debug("time_context_timestamp_unparsed",
+                         timestamp=repr(timestamp_str))
+        return datetime.now(timezone.utc)
 
     def enrich(self, alert: dict) -> dict:
         """Determine time context for the alert."""
-        timestamp_str = alert.get("timestamp", "")
-        try:
-            if isinstance(timestamp_str, str):
-                # Handle common Wazuh timestamp formats
-                for fmt in ["%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
-                             "%Y-%m-%d %H:%M:%S"]:
-                    try:
-                        ts = datetime.strptime(timestamp_str, fmt)
-                        break
-                    except ValueError:
-                        continue
-                else:
-                    ts = datetime.now(timezone.utc)
-            else:
-                ts = datetime.now(timezone.utc)
-        except Exception:
-            ts = datetime.now(timezone.utc)
+        ts = self._parse_timestamp(alert.get("timestamp", ""))
 
-        bh = self.time_config.get("business_hours", {})
-        is_business_hours = self._is_business_hours(ts, bh)
+        # Everything below is evaluated in the CONFIGURED timezone, not UTC,
+        # so business hours, maintenance windows and the weekend check all
+        # agree on what local day/hour it is (WO-H76).
+        ts = self._to_local(ts)
+
+        is_business_hours = self._is_business_hours(ts)
         is_maintenance = self._is_maintenance_window(ts)
         is_weekend = ts.strftime("%A").lower() in ("saturday", "sunday")
 
         # Calculate time multiplier
         multiplier = 1.0
-        adj = self.time_config.get("risk_adjustments", {})
+        adj = self._risk_adjustments
         if is_maintenance:
             multiplier *= adj.get("maintenance_window_multiplier", 0.3)
         elif not is_business_hours:
@@ -598,34 +1180,48 @@ class TimeContextEnricher:
             "time_risk_multiplier": multiplier
         }
 
-    def _is_business_hours(self, ts: datetime, bh: dict) -> bool:
-        try:
-            start = datetime.strptime(bh.get("start", "09:00"), "%H:%M").time()
-            end = datetime.strptime(bh.get("end", "18:00"), "%H:%M").time()
-            day_name = ts.strftime("%A").lower()
-            bh_days = [d.lower() for d in bh.get("days", [])]
-            return day_name in bh_days and start <= ts.time() <= end
-        except Exception:
-            return True  # Default to business hours
+    def _is_business_hours(self, ts: datetime) -> bool:
+        """Is ``ts`` (already converted to the business timezone) in-hours?
+
+        A missing business_hours block defaults to True (= business hours,
+        multiplier 1.0), which is the conservative direction: it does not
+        inflate risk on every alert. The old code intended this but never
+        reached it. Note the difference from an UNPARSABLE window, which now
+        falls back to the default 09:00-18:00 Mon-Fri instead of switching
+        out-of-hours risk off entirely — see ``_validate_business_hours``.
+        """
+        bh = self._business_hours
+        if not bh:
+            if not self._warned_missing_config:
+                self._warned_missing_config = True
+                logger.warning(
+                    "time_context_business_hours_undefined",
+                    msg="No business_hours configured — treating all alerts as "
+                        "business hours (time_risk_multiplier 1.0).")
+            return True
+        return (ts.strftime("%A").lower() in bh["days"]
+                and bh["start"] <= ts.time() <= bh["end"])
 
     def _is_maintenance_window(self, ts: datetime) -> bool:
-        windows = self.time_config.get("maintenance_windows", [])
+        """Is ``ts`` inside a configured maintenance window?
+
+        ``ts`` must already be in the configured business timezone (``enrich``
+        converts it) — a window written as "sunday 02:00-06:00" means 02:00
+        local, not 02:00 UTC. Windows are validated at construction, so
+        everything reaching here has real weekday names and parsed times.
+        """
         day_name = ts.strftime("%A").lower()
-        for window in windows:
-            w_days = window.get("days", [window.get("day", "")])
-            w_days = [d.lower() for d in w_days if d]
-            if day_name in w_days:
-                try:
-                    start = datetime.strptime(window["start"], "%H:%M").time()
-                    end = datetime.strptime(window["end"], "%H:%M").time()
-                    if start <= end:
-                        in_window = start <= ts.time() <= end
-                    else:  # Crosses midnight (e.g., 22:00-06:00)
-                        in_window = ts.time() >= start or ts.time() <= end
-                    if in_window:
-                        return True
-                except Exception:
-                    pass
+        now = ts.time()
+        for window in self._maintenance_windows:
+            if day_name not in window["days"]:
+                continue
+            start, end = window["start"], window["end"]
+            if start <= end:
+                in_window = start <= now <= end
+            else:  # Crosses midnight (e.g., 22:00-06:00)
+                in_window = now >= start or now <= end
+            if in_window:
+                return True
         return False
 
     @staticmethod
@@ -1377,31 +1973,13 @@ class HostIntegrityContextEnricher:
         """Parse a Wazuh timestamp string into an aware UTC datetime.
 
         Fail-safe: returns None for anything unparseable so the caller treats
-        the item as "not recent" rather than crashing."""
-        if not isinstance(val, str):
-            return None
-        s = val.strip()
-        if not s:
-            return None
-        dt = None
-        # ISO-8601 (Wazuh 4.x commonly emits this; normalize trailing Z).
-        try:
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        except ValueError:
-            dt = None
-        if dt is None:
-            for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
-                        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-                try:
-                    dt = datetime.strptime(s, fmt)
-                    break
-                except ValueError:
-                    continue
-        if dt is None:
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        the item as "not recent" rather than crashing.
+
+        WO-H116: this used to be a second hand-rolled copy of the ISO ladder.
+        It now delegates to ``src.timestamps`` so the ``+0000`` form Wazuh
+        actually emits parses on Python 3.10 too, where bare ``fromisoformat``
+        raises."""
+        return parse_iso8601_or_none(val)
 
     def _change_time(self, item: dict) -> Optional[datetime]:
         """Best-effort per-item ACTUAL file-change time.

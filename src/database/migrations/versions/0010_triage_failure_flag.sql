@@ -10,7 +10,7 @@
 --
 -- The defect is that the failure was invisible in the `verdict` column: on a
 -- dashboard, N dead LLM calls looked identical to N considered escalations.
--- Measured on the test server 2026-07-20: ~37 rows (rules 5402 sudo-to-root and
+-- Measured on a live install 2026-07-20: ~37 rows (rules 5402 sudo-to-root and
 -- 5501 PAM session) were logged as needs_investigation WITHOUT ever being
 -- analyzed, and sat in the escalation queue looking like real decisions. The
 -- only tells were confidence = 0.0 and a reasoning prefix — neither queryable
@@ -42,7 +42,7 @@
 -- Why: a literal '%' inside a SQL string handed to psycopg is parsed as a
 -- parameter placeholder ("only '%s', '%b', '%t' are allowed as placeholders,
 -- got '%''"). Shipped as one multi-statement blob on a live install
--- (2026-07-20, test server) the DDL applied, the trailing UPDATE did not,
+-- (2026-07-20) the DDL applied, the trailing UPDATE did not,
 -- alembic reported SUCCESS, and the backfill flagged 0 of 1398 matching rows.
 -- A migration that half-applies without raising is worse than one that fails.
 -- The .py now binds the pattern and logs the affected rowcount.

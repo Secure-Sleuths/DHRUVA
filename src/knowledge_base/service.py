@@ -359,5 +359,10 @@ def _safe_json(val) -> list:
             parsed = json.loads(val)
             return parsed if isinstance(parsed, list) else []
         except Exception:
+            # WO-H90 reviewed, left silent on purpose: `_safe_json` is a parse
+            # helper with a documented `[]` default (see the docstring), used on
+            # per-row KB columns. A malformed column yields an empty list, which
+            # is what every caller already handles, and logging it would fire
+            # once per row per search.
             return []
     return []

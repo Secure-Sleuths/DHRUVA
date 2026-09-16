@@ -16,10 +16,65 @@ from cachetools import TTLCache
 logger = structlog.get_logger(__name__)
 
 
+class WazuhRuleFileUnavailable(Exception):
+    """We could not establish what a rule file currently contains.
+
+    Raised to FAIL CLOSED, and deliberately distinct from a rule file that is
+    genuinely not there (``get_rule_file_content`` returns ``None`` for that,
+    and only when the manager positively said so).
+
+    The two used to collapse into the same ``None`` (WO-H92): a network
+    timeout, an auth failure or a 500 from the manager was indistinguishable
+    from a clean first-ever deploy. ``_merge_into_local_rules`` read that
+    ``None`` as "nothing is deployed yet", merged the new rule into an empty
+    baseline, and wrote the result back over ``ai-soc-tuned.xml`` — deleting
+    every previously approved and deployed tuned rule, with no error.
+
+    Callers that legitimately treat absence as "start fresh" keep doing that on
+    ``None``. They must NOT treat this exception the same way.
+    """
+
+
 class WazuhClient:
     """Client for the Wazuh Manager REST API."""
 
-    LOGTEST_TEMP_FILE = "/var/ossec/etc/rules/_ai_soc_validation_temp.xml"
+    # ── the rule-validation probe file ───────────────────────────────────
+    # ONE definition. ``LOGTEST_TEMP_FILE`` used to sit here as a full path and
+    # be referenced by NOTHING, while the code that actually validates rules
+    # hardcoded the bare filename 60 lines further down. Two spellings of one
+    # fact is how a second probe filename appears, and a second filename is not
+    # cosmetic here — see below.
+    #
+    # WHY THE NAME MATTERS OUTSIDE THIS FILE (WO-H97). Writing this file into
+    # the manager's live rules directory trips the estate's own
+    # ``SIEM TAMPERING: detection rule/decoder file changed on the manager``
+    # detection (rule 110128, level 12). Measured on the live tenant
+    # 2026-08-24, 152 of 176 such alerts — 86% — are DHRUVA writing and
+    # deleting its OWN probe files, and 6 of those escaped the estate's
+    # suppression rule because they carried a SECOND filename
+    # (``_dhruva_logtest_probe.xml``, added by a local patch) that the
+    # suppression did not know about. Anything that suppresses, excludes or
+    # explains this noise is keyed on the name, so the name has to come from
+    # here and nowhere else.
+    #
+    # THE DIRECTORY IS NOT A CHOICE. Both validation layers require the probe
+    # to be inside the manager's loaded ruleset:
+    #   * layer 1 uploads via ``PUT /rules/files/{filename}``, which defaults to
+    #     /var/ossec/etc/rules/. Wazuh 4.3+ DOES accept a ``relative_dirname``
+    #     parameter — the earlier claim here that no path parameter exists was
+    #     wrong — but it is constrained to a directory already declared as a
+    #     ``<rule_dir>`` in ossec.conf. Using it means adding a rule_dir to
+    #     every customer's manager config, which is a deployment change and its
+    #     own work order, not a severity fix.
+    #   * layer 2 runs ``wazuh-logtest``, which only exercises rules that
+    #     analysisd has LOADED. A probe outside the ruleset is not loaded, so
+    #     logtest cannot test it — which is the whole point of layer 2.
+    # Moving the file therefore means giving up the two-layer validation that
+    # stops the Detection Agent writing broken XML into a live shared ruleset
+    # (WO-H62, WO-H64). If that trade is ever made, it is its own work order.
+    LOGTEST_TEMP_FILENAME = "_ai_soc_validation_temp.xml"
+    LOGTEST_RULES_DIR = "/var/ossec/etc/rules"
+    LOGTEST_TEMP_FILE = f"{LOGTEST_RULES_DIR}/{LOGTEST_TEMP_FILENAME}"
     LOGTEST_BIN = "/var/ossec/bin/wazuh-logtest"
 
     def __init__(self, host: str, port: int = 55000, username: str = "",
@@ -27,11 +82,12 @@ class WazuhClient:
                  ssh_user: str = "", ssh_password: str = "",
                  ssh_key_path: str = "", ssh_key_passphrase: str = "",
                  ssh_sudo_nopasswd: bool = False,
-                 tls_insecure_hostname: bool = False):
+                 tls_insecure_hostname: bool = False,
+                 ssh_host: str = ""):
         # Belt-and-suspenders: if the operator (or wizard) supplied a host
         # that already contains an explicit ":<port>" suffix, do not
         # duplicate it — that produced "https://10.0.0.5:55000:55000" and
-        # a "Failed to parse URL" on the client install.
+        # a "Failed to parse URL" on a client install.
         self.base_url = self._build_base_url(host, port)
         self.username = username
         self.password = password
@@ -42,9 +98,32 @@ class WazuhClient:
         self._token_expiry: float = 0
         self._agent_cache = TTLCache(maxsize=500, ttl=300)
 
-        # SSH config for wazuh-logtest validation
-        # Extract hostname from base_url (strip https:// and port)
-        self._ssh_host = re.sub(r'^https?://', '', host).split(':')[0]
+        # SSH config for wazuh-logtest validation.
+        #
+        # `ssh_host` wins when set; otherwise fall back to the API host, which
+        # is correct on a single-box install where the API and the manager are
+        # the same machine.
+        #
+        # The fallback used to be the ONLY behaviour, and `config.yaml`'s
+        # `ssh_host` was read by nothing (WO-H83). On a live tenant the API
+        # is reached at localhost while the manager is a separate host, so every
+        # rule validation SSH'd into the box it was already running on:
+        # `wazuh_logtest_ssh_error error="Server 'localhost' not found in
+        # known_hosts"`, 122 times in 3 days. `service.py` passed every OTHER
+        # ssh_* setting through and omitted this one, so the key looked
+        # supported, parsed fine, and did nothing.
+        #
+        # That mattered beyond the error count: wazuh-logtest is the LAYER-2
+        # check that stops the Detection Agent writing broken XML into a live
+        # shared ruleset (WO-H62, WO-H64). Unreachable, the agent spent five LLM
+        # auto-fix rounds per proposal rewriting XML to satisfy a validator it
+        # never reached, then parked the result as "manual tuning required" —
+        # indistinguishable from a genuinely bad rule.
+        _api_derived = re.sub(r'^https?://', '', host).split(':')[0]
+        self._ssh_host = (ssh_host or "").strip() or _api_derived
+        if ssh_host and self._ssh_host != _api_derived:
+            logger.info("wazuh_logtest_ssh_host_override",
+                        ssh_host=self._ssh_host, api_host=_api_derived)
         self._ssh_user = ssh_user
         self._ssh_password = ssh_password
         self._ssh_key_path = ssh_key_path
@@ -62,7 +141,7 @@ class WazuhClient:
 
         When tls_insecure_hostname is set, mount an adapter that disables
         hostname matching while keeping chain verification. This addresses
-        the client failure mode: Wazuh's default API cert ships with
+        a failure mode seen on a client install: Wazuh's default API cert ships with
         SAN=DNS:localhost only, so connecting via the manager's IP fails
         Python 3.10+'s strict hostname check (RFC 6125) even when the chain
         is valid. Skipping hostname validation is still defensible because
@@ -215,6 +294,73 @@ class WazuhClient:
             logger.error("wazuh_agents_fetch_failed", error=str(e))
             return []
 
+    # ----- Manager Statistics -----
+
+    def get_analysisd_stats(self) -> Optional[dict]:
+        """Live ``wazuh-analysisd`` counters, or ``None`` when unreadable.
+
+        WO-H109. This is the only place in the stack that can answer "did an
+        event fail to decode". The alerts index cannot: a document only exists
+        there because a RULE matched, so an event that no decoder parsed and
+        no rule matched never lands in it at all. analysisd counts the events
+        it received and the events it decoded, and the gap between them is the
+        real figure.
+
+        Returns the counter dict verbatim (``events_received``,
+        ``total_events_decoded``, ``events_dropped``, the per-type
+        ``*_events_decoded``, and the ``*_queue_usage`` / ``*_queue_size``
+        gauges). Every value Wazuh sends is a float; callers coerce.
+
+        ``None`` means "we could not read it" and must NEVER be read as
+        "healthy" — that is the WO-H105 lesson applied to a second data
+        source. An empty ``affected_items`` is the same thing: the API
+        answered, but not with a measurement.
+
+        Counters are CUMULATIVE since analysisd last started, not windowed,
+        and they reset to zero on restart. Anything deriving a rate from them
+        has to difference consecutive readings and cope with the reset.
+
+        Single node only: ``/manager/...`` reports the node this API serves.
+        A clustered install would need ``/cluster/{node}/stats/analysisd`` per
+        worker; no current deployment is clustered, so that is not built.
+        """
+        try:
+            result = self._get("/manager/stats/analysisd")
+            items = result.get("data", {}).get("affected_items", [])
+            if not items or not isinstance(items[0], dict):
+                logger.warning("wazuh_analysisd_stats_empty",
+                               total_affected=result.get("data", {})
+                               .get("total_affected_items"))
+                return None
+            return items[0]
+        except Exception as e:                       # noqa: BLE001
+            logger.error("wazuh_analysisd_stats_failed", error=str(e)[:300],
+                         error_type=type(e).__name__)
+            return None
+
+    def get_cluster_status(self) -> Optional[dict]:
+        """``{"enabled": "yes"/"no", "running": ...}``, or ``None``.
+
+        WO-H109 audit. ``/manager/stats/analysisd`` reports the node this API
+        serves and nothing else, so on a clustered manager one worker's
+        counters would be presented as the whole estate's decode rate with no
+        indication that the other workers were never asked. This exists so
+        the health monitor can SAY so rather than quietly under-reporting.
+
+        ``None`` means we could not tell — which is not "not clustered", and
+        callers must not treat it as such.
+        """
+        try:
+            result = self._get("/cluster/status")
+            data = result.get("data", {})
+            if not isinstance(data, dict) or not data:
+                return None
+            return data
+        except Exception as e:                       # noqa: BLE001
+            logger.warning("wazuh_cluster_status_failed", error=str(e)[:200],
+                           error_type=type(e).__name__)
+            return None
+
     # ----- Rules -----
 
     def get_rule(self, rule_id: int) -> Optional[dict]:
@@ -241,10 +387,59 @@ class WazuhClient:
             logger.error("wazuh_rules_fetch_failed", filename=filename, error=str(e))
             return []
 
+    def get_used_rule_ids(self) -> set[int]:
+        """Every rule ID currently defined on the manager (WO-H65).
+
+        Used to keep a generated tuning rule from claiming an ID that is
+        already live. A duplicate ID makes the Wazuh ruleset fail to compile,
+        which can stop ``wazuh-analysisd`` loading — i.e. alert processing
+        stops. Observed twice on a live install, 2026-08-03/04.
+
+        Returns an EMPTY set on failure. Callers must treat that as "unknown"
+        and NOT as "nothing is taken" — see
+        ``DetectionAgent._reassign_colliding_rule_ids``, which skips
+        reassignment entirely rather than risk renumbering against a phantom
+        empty ruleset.
+        """
+        ids: set[int] = set()
+        try:
+            offset, limit = 0, 500
+            while True:
+                result = self._get("/rules", params={
+                    "limit": limit, "offset": offset, "select": "id",
+                })
+                items = result.get("data", {}).get("affected_items", [])
+                for item in items:
+                    try:
+                        ids.add(int(item["id"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                total = result.get("data", {}).get("total_affected_items", 0)
+                offset += limit
+                if offset >= total or not items:
+                    break
+            logger.info("wazuh_rule_ids_loaded", count=len(ids))
+        except Exception as e:
+            logger.warning("wazuh_rule_ids_fetch_failed", error=str(e))
+            return set()
+        return ids
+
     # ----- Rule Files (for detection engineering) -----
 
     def get_rule_file_content(self, filename: str) -> Optional[str]:
-        """Get raw XML content of a rule file."""
+        """Get raw XML content of a rule file.
+
+        Returns:
+            ``str`` — the file's contents, or
+            ``None`` — the manager answered and the file is NOT THERE.
+
+        Raises:
+            WazuhRuleFileUnavailable — we could not find out what the file
+            contains (timeout, auth failure, 5xx, unreadable response). This is
+            never the same answer as ``None``: see WO-H92. A caller about to
+            rewrite a rule file must abort on this, not treat it as an empty
+            starting point.
+        """
         try:
             # Use raw=true to get the actual XML string, not parsed dict
             resp = self._session.get(
@@ -254,16 +449,29 @@ class WazuhClient:
                 verify=self.verify_ssl,
                 timeout=30
             )
+            # A 404 is the manager telling us the file is absent — an answer,
+            # not a failure. Checked before raise_for_status, which would
+            # otherwise turn it into an indistinguishable transport error.
+            if getattr(resp, "status_code", None) == 404:
+                logger.info("wazuh_rulefile_not_found", filename=filename,
+                            status_code=404)
+                return None
             resp.raise_for_status()
             text = resp.text
-            # Wazuh may return JSON error body even with raw=true for missing files
+            # Wazuh may return JSON error body even with raw=true for missing
+            # files. Reached only on a 2xx, so the manager answered: absent.
             if text.lstrip().startswith('{'):
                 logger.info("wazuh_rulefile_not_found", filename=filename)
                 return None
             return text
         except Exception as e:
-            logger.error("wazuh_rulefile_fetch_failed", filename=filename, error=str(e))
-            return None
+            logger.error("wazuh_rulefile_fetch_failed", filename=filename,
+                         error=str(e)[:200],
+                         detail="could not establish the file's current "
+                                "contents; raising rather than reporting it "
+                                "as absent")
+            raise WazuhRuleFileUnavailable(
+                f"could not read rule file {filename}: {str(e)[:200]}") from e
 
     def update_rule_file(self, filename: str, content: str) -> bool:
         """Update a custom rule file (requires manager restart)."""
@@ -363,30 +571,82 @@ class WazuhClient:
 
             client.connect(**connect_kwargs)
 
-            # Build the logtest command — use shlex.quote to prevent injection
+            # WO-H64: feed the test event over STDIN, never inside a shell
+            # string.
+            #
+            # This used to build `sudo bash -c 'echo <shlex.quote(log)> | ...'`.
+            # shlex.quote wraps the log in SINGLE quotes, which then collide
+            # with the single quotes of `bash -c '...'` — the nesting collapses
+            # and bash receives only `echo Apr`. The pipe to wazuh-logtest was
+            # severed, so this function returned the literal string "Apr\n"
+            # every single time.
+            #
+            # "Apr\n" contains none of the error keywords the caller greps for,
+            # so layer-2 validation ALWAYS reported success. It has therefore
+            # never actually validated anything: every rule was checked by the
+            # Wazuh API alone (layer 1), whose only verdict is the generic
+            # "XML syntax error". Confirmed on a live install 2026-08-04 —
+            # `_ssh_run_logtest()` returned `'Apr\n'` (4 bytes) for a rule that
+            # logtest, run by hand, rejects with
+            # `Invalid option 'frequency' for rule '100998'`.
+            #
+            # Passing the event on stdin removes shell quoting from the picture
+            # entirely, so there is nothing left to escape or to inject through.
             test_log = "Apr 1 00:00:00 test sshd[1]: test"
-            safe_log = shlex.quote(test_log)
-            if self._ssh_sudo_nopasswd:
-                # NOPASSWD sudoers entry — no password piped via stdin
-                cmd = (
-                    f"sudo bash -c 'echo {safe_log} "
-                    f"| {self.LOGTEST_BIN} -q' 2>&1"
-                )
-                stdin, stdout, stderr = client.exec_command(cmd, timeout=30)
-            else:
-                # Pipe password via stdin (never embed in command string)
-                cmd = (
-                    f"sudo -S bash -c 'echo {safe_log} "
-                    f"| {self.LOGTEST_BIN} -q' 2>&1"
-                )
-                stdin, stdout, stderr = client.exec_command(cmd, timeout=30)
+            sudo_flag = "-n" if self._ssh_sudo_nopasswd else "-S"
+            cmd = f"sudo {sudo_flag} {self.LOGTEST_BIN} -q 2>&1"
+            stdin, stdout, stderr = client.exec_command(cmd, timeout=30)
+            if not self._ssh_sudo_nopasswd:
+                # `sudo -S` consumes the FIRST stdin line as the password;
+                # logtest then reads the event from what follows.
                 stdin.write(self._ssh_password + "\n")
-                stdin.flush()
+            stdin.write(test_log + "\n")
+            stdin.flush()
+            try:
+                stdin.channel.shutdown_write()
+            except Exception:
+                # WO-H90 reviewed, left silent on purpose: cleanup on an SSH
+                # channel we are done writing to and that `finally: client.close()`
+                # below is about to tear down anyway. Nothing is lost if this
+                # fails, and the real logtest result is still read and returned.
+                pass
 
             stdout.channel.recv_exit_status()
             return stdout.read().decode()
         finally:
             client.close()
+
+    def _logtest_error_detail(self) -> str:
+        """Best-effort: ask wazuh-logtest for the SPECIFIC rule error (WO-H62).
+
+        The Wazuh API reports a generic "XML syntax error" for anything it
+        rejects, including rule-LOGIC faults on well-formed XML. logtest gives
+        the real reason (e.g. ``Invalid option 'frequency' for rule '100502'``),
+        which is what the self-repair loop actually needs to fix anything.
+
+        Never raises: this runs on an error path, and losing the fallback
+        message would be worse than losing the detail.
+        """
+        if not self._ssh_user:
+            return ""
+        try:
+            return self._extract_logtest_errors(self._ssh_run_logtest())
+        except Exception as e:
+            logger.debug("logtest_detail_unavailable", error=str(e))
+            return ""
+
+    @staticmethod
+    def _extract_logtest_errors(output: str) -> str:
+        """Pull the error lines out of wazuh-logtest output. Pure; never raises."""
+        lines = [
+            line.strip() for line in (output or "").splitlines()
+            if any(kw in line for kw in (
+                'ERROR:', 'CRITICAL:', 'XMLERR:', 'is duplicated',
+                'Invalid configuration', 'Invalid option',
+                'Invalid day format', 'Configuration error',
+            ))
+        ]
+        return '; '.join(lines[:5])
 
     def _upload_temp_rule(self, filename: str, content: str) -> tuple[bool, str]:
         """Upload a rule file and check the Wazuh API response for errors.
@@ -413,6 +673,10 @@ class WazuhClient:
                 return False, error_msg
             return True, ""
         except Exception as e:
+            # WO-H90 reviewed, left silent on purpose: the (False, error) tuple
+            # is consumed by validate_rule_with_logtest(), which logs it as
+            # `wazuh_rule_validation_failed` with the recovered detail. Logging
+            # here as well would double-report every rejected rule proposal.
             return False, str(e)
 
     def validate_rule_with_logtest(self, rule_xml: str) -> tuple[bool, str]:
@@ -438,7 +702,9 @@ class WazuhClient:
                 '</group>'
             )
 
-        temp_filename = "_ai_soc_validation_temp.xml"
+        # From the class constant — see LOGTEST_TEMP_FILENAME for why there is
+        # exactly one spelling of this name in the codebase.
+        temp_filename = self.LOGTEST_TEMP_FILENAME
 
         try:
             # Layer 1: Upload via Wazuh API (catches XML syntax errors)
@@ -450,9 +716,28 @@ class WazuhClient:
 
             if not uploaded:
                 if api_error:
+                    # WO-H62: the Wazuh API's message is GENERIC — it says
+                    # "XML syntax error" for anything it dislikes, including
+                    # rule-LOGIC errors where the XML is perfectly well-formed.
+                    # Returning that verbatim is what stalled the self-repair
+                    # loop: the fix-agent was told "XML syntax error" for a rule
+                    # whose real fault was `Invalid option 'frequency' for rule
+                    # '100502'` (frequency requires if_matched_sid, not if_sid).
+                    # It cannot fix what it cannot see, so it burned all 5
+                    # attempts and the proposal was parked as
+                    # needs_manual_tuning. Five proposals sat that way for weeks.
+                    #
+                    # Wazuh WRITES the file even when it reports the error, so
+                    # wazuh-logtest can still be asked for the specific reason.
+                    # Best-effort: if it yields nothing, fall back to the
+                    # generic message rather than losing the error entirely.
+                    detailed = self._logtest_error_detail()
+                    error_out = detailed or api_error
                     logger.warning("wazuh_rule_validation_failed",
-                                   layer="api", error=api_error)
-                    return False, api_error
+                                   layer="api", error=error_out,
+                                   api_error=api_error,
+                                   detail_recovered=bool(detailed))
+                    return False, error_out
                 if _dev_mode:
                     logger.warning("wazuh_validation_upload_error",
                                    detail="Validation skipped (fail-open, DEV_MODE)")
@@ -461,50 +746,54 @@ class WazuhClient:
                                detail="Validation skipped — routing to manual review (fail-closed)")
                 return False, "Wazuh API unavailable for validation — manual review required"
 
-            try:
-                # Layer 2: Run wazuh-logtest via SSH (catches rule logic errors)
-                if self._ssh_user:
-                    output = self._ssh_run_logtest()
-                    error_lines = [
-                        line.strip() for line in output.splitlines()
-                        if any(kw in line for kw in (
-                            'ERROR:', 'CRITICAL:', 'XMLERR:',
-                            'is duplicated', 'Invalid configuration',
-                            'Invalid day format', 'Configuration error',
-                        ))
-                    ]
-                    if error_lines:
-                        error_msg = '; '.join(error_lines[:5])
-                        logger.warning("wazuh_rule_validation_failed",
-                                       layer="logtest", error=error_msg)
-                        return False, error_msg
+            # Layer 2: wazuh-logtest via SSH (catches rule LOGIC errors that
+            # only surface when analysisd loads the ruleset). Cleanup now lives
+            # on the outer finally, so this no longer needs its own try.
+            #
+            # Calls SSH DIRECTLY rather than via _logtest_error_detail(): that
+            # helper deliberately swallows exceptions because it runs on an
+            # error path, and swallowing here would turn a genuine SSH failure
+            # into a silent PASS. SSH validation must fail CLOSED.
+            error_msg = ""
+            if self._ssh_user:
+                error_msg = self._extract_logtest_errors(self._ssh_run_logtest())
+            if error_msg:
+                logger.warning("wazuh_rule_validation_failed",
+                               layer="logtest", error=error_msg)
+                return False, error_msg
 
-                logger.info("wazuh_rule_validation_passed")
-                return True, ""
-
-            finally:
-                # ALWAYS clean up temp file
-                self._delete_rule_file(temp_filename)
+            logger.info("wazuh_rule_validation_passed")
+            return True, ""
 
         except (paramiko.SSHException, OSError, TimeoutError) as e:
             logger.warning("wazuh_logtest_ssh_error", error=str(e))
-            try:
-                self._delete_rule_file(temp_filename)
-            except Exception:
-                pass
             if _dev_mode:
                 logger.warning("ssh_validation_skipped_dev_mode")
                 return True, ""
             return False, f"SSH validation unavailable — manual review required: {e}"
         except Exception as e:
             logger.warning("wazuh_validation_unexpected_error", error=str(e))
-            try:
-                self._delete_rule_file(temp_filename)
-            except Exception:
-                pass
             if _dev_mode:
                 return True, ""
             return False, f"Validation error — manual review required: {e}"
+        finally:
+            # WO-H62: ALWAYS remove the probe file, on EVERY path out.
+            #
+            # The cleanup used to sit on the INNER try, which is only entered
+            # when the API upload succeeded. On an upload FAILURE the function
+            # returned early and never cleaned up — and Wazuh writes the file
+            # even when it reports an error. So a failed validation left broken
+            # XML in the LIVE ruleset, which then broke every SUBSEQUENT
+            # validation and would have broken analysisd on the next restart.
+            # Observed exactly that on a live install, 2026-08-03.
+            try:
+                self._delete_rule_file(temp_filename)
+            except Exception as _cleanup_err:
+                logger.error("wazuh_validation_temp_cleanup_failed",
+                             filename=temp_filename, error=str(_cleanup_err),
+                             detail="A broken probe rule may remain in the LIVE "
+                                    "ruleset — remove it before restarting the "
+                                    "manager.")
 
     # ----- Vulnerability & SCA -----
 
@@ -586,6 +875,90 @@ class WazuhClient:
             if p.get("name", "").lower() == package_name.lower():
                 return p.get("version")
         return None
+
+    # WO-H69 phase 3: the directory active-response scripts must live in, and a
+    # script Wazuh ships on EVERY agent. The stock script is the probe for "is
+    # this directory monitored by FIM at all" — without it we cannot tell a
+    # genuinely absent script from one we simply cannot see, and reporting those
+    # two the same way is how a missing script becomes a phantom success.
+    AR_BIN_DIR = "/var/ossec/active-response/bin"
+    AR_STOCK_PROBE = "firewall-drop"
+
+    def get_agent_file_hash(self, agent_id: str, path: str) -> str | None:
+        """SHA-256 of one file on an agent, as last recorded by FIM (syscheck).
+
+        Returns None when the file is not in the agent's FIM inventory — which
+        means EITHER it is absent OR the path is not monitored. The caller must
+        disambiguate (see ``ar_script_state``); they are not the same thing.
+
+        Read-only: this needs `syscheck:read` and adds no privilege. Note the
+        reading is as fresh as the agent's last FIM scan (default every 12h
+        unless the directory is configured ``realtime="yes"``).
+        """
+        try:
+            result = self._get(f"/syscheck/{agent_id}",
+                               params={"file": path, "select": "file,sha256",
+                                       "limit": 1})
+            for item in result.get("data", {}).get("affected_items", []):
+                if item.get("file") == path:
+                    return item.get("sha256") or None
+        except Exception as e:
+            logger.warning("syscheck_file_hash_failed",
+                           agent_id=agent_id, path=path, error=str(e))
+        return None
+
+    def ar_script_state(self, agent_id: str, script_name: str,
+                        expected_sha256: str | None) -> dict:
+        """Whether an agent is running the AR script we expect it to.
+
+        States, and why each exists:
+          * ``current``    — hash matches what we ship.
+          * ``stale``      — present but a DIFFERENT build. A remediation will
+                             run the old script and can report a phantom success.
+          * ``missing``    — the directory IS monitored and the script is not
+                             there. A remediation dispatches and does nothing.
+          * ``unmonitored``— FIM does not cover the AR directory, so we cannot
+                             see anything. Reported honestly as "cannot tell",
+                             never folded into ``current``.
+          * ``unknown``    — we ship no reference hash to compare against.
+        """
+        path = f"{self.AR_BIN_DIR}/{script_name}"
+        observed = self.get_agent_file_hash(agent_id, path)
+
+        if observed and expected_sha256:
+            state = "current" if observed == expected_sha256 else "stale"
+            return {"agent_id": agent_id, "state": state,
+                    "observed_sha256": observed,
+                    "expected_sha256": expected_sha256, "path": path}
+
+        if observed and not expected_sha256:
+            return {"agent_id": agent_id, "state": "unknown",
+                    "observed_sha256": observed, "expected_sha256": None,
+                    "path": path,
+                    "detail": "the script is present but DHRUVA has no "
+                              "reference copy to compare it against"}
+
+        # Nothing came back. Absent, or invisible? Probe with a script Wazuh
+        # puts on every agent: if THAT is not in FIM either, the directory is
+        # simply not monitored and we know nothing about this agent.
+        probe = self.get_agent_file_hash(
+            agent_id, f"{self.AR_BIN_DIR}/{self.AR_STOCK_PROBE}")
+        if probe is None:
+            return {"agent_id": agent_id, "state": "unmonitored",
+                    "observed_sha256": None,
+                    "expected_sha256": expected_sha256, "path": path,
+                    "detail": (
+                        f"{self.AR_BIN_DIR} is not covered by file integrity "
+                        f"monitoring on this agent, so DHRUVA cannot tell "
+                        f"whether the script is installed. This is NOT a "
+                        f"statement that it is fine.")}
+
+        return {"agent_id": agent_id, "state": "missing",
+                "observed_sha256": None,
+                "expected_sha256": expected_sha256, "path": path,
+                "detail": ("the active-response directory is monitored and this "
+                           "script is not in it — a remediation dispatched to "
+                           "this agent will not apply anything")}
 
     def get_agent_os(self, agent_id: str) -> dict:
         """Get OS information for an agent."""
@@ -803,7 +1176,14 @@ class WazuhClient:
         try:
             result = self._put(f"/agents/{agent_id}/restart")
             return {"success": True, "data": result.get("data", {})}
-        except Exception as e:
+        except Exception as e:                           # noqa: BLE001
+            # WO-H90: was a silent `return {"success": False, ...}`. `_put()`
+            # does not log, so an agent restart that never happened left no
+            # trace in the log at all — only a row in the AR audit table that
+            # nobody reads until an incident review. On-call could not tell a
+            # restarted agent from an unreachable manager.
+            logger.warning("wazuh_agent_restart_failed",
+                           agent_id=agent_id, error=str(e)[:200])
             return {"success": False, "error": str(e)}
 
     def _send_active_response(self, agent_id: str, command: str,

@@ -9,7 +9,7 @@ pydantic-settings==2.7.1
 # Wazuh & OpenSearch
 opensearch-py==2.8.0
 requests==2.33.1
-urllib3==2.6.3
+urllib3==2.7.0
 paramiko==3.5.1
 
 # Claude API
@@ -21,14 +21,23 @@ openai==1.55.3
 
 # Async & Scheduling
 apscheduler==3.10.4
-aiohttp==3.13.4
+# aiohttp was REMOVED in WO-H133 (2026-09-16), not bumped. It was a direct pin
+# that nothing imported — `grep -rI aiohttp` found it only here — and nothing
+# required it transitively either: the sole requirer is opensearch-py's `async`
+# extra, and we pin plain `opensearch-py==2.8.0`. It had 14 open advisories, so
+# removing it retires them permanently instead of resetting the clock. Verified:
+# with the line gone, aiohttp does not appear in the resolved set on 3.10-3.13,
+# and 9 distributions leave the install (aiohttp + aiohappyeyeballs, aiosignal,
+# async-timeout, attrs, frozenlist, multidict, propcache, yarl). If you need an
+# async HTTP client, add it back WITH the code that uses it -- see
+# tests/test_dependency_floors_h133.py.
 
 # API Server
 fastapi==0.136.1
 starlette==0.49.1
 uvicorn[standard]==0.34.0
-PyJWT==2.12.0
-python-multipart==0.0.27
+PyJWT==2.13.0
+python-multipart==0.0.31
 slowapi==0.1.9
 
 # Database (Postgres — v4.9.0+ requires Postgres; SQLite was removed)
@@ -38,7 +47,7 @@ alembic==1.14.0
 SQLAlchemy==2.0.36
 
 # Licensing
-cryptography==46.0.7
+cryptography==50.0.0
 
 # Utilities
 jinja2==3.1.6
@@ -50,7 +59,7 @@ jinja2==3.1.6
 structlog==25.1.0
 tenacity==9.0.0
 cachetools==5.5.2
-gitpython==3.1.44
+gitpython==3.1.59
 xmltodict==0.14.1
 defusedxml==0.7.1
 
@@ -69,5 +78,5 @@ OTXv2==1.5.12
 # session so the suite never touches a real database. Docker must be on
 # PATH; CI runners need the docker socket available.
 testcontainers[postgres]==4.13.1
-pytest==9.0.2
+pytest==9.0.3
 pytest-cov==7.1.0

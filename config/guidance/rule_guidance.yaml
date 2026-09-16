@@ -1,0 +1,353 @@
+# Per-rule triage guidance — WO-H111
+#
+# WHY THIS FILE EXISTS
+#
+# A kernel driver whose service name was eight random lowercase letters was
+# registered on a workstation as a SYSTEM START service, 31 seconds after
+# Microsoft Defender quarantined Trojan:Win32/Kepavll!rfn (Severe) on the same
+# host. DHRUVA raised rule 61138 at level 5 with a risk score of 20.83.
+#
+# Every WinRing0 alert on that same host also scores 20.83. There had been 80 of
+# them since April — CPUID HWMonitor's own driver, entirely benign.
+#
+# The score could not tell them apart. The field that does was in the alert the
+# whole time: `startType`. Across 100 service installations on that host, the two
+# malicious ones were the ONLY system-start kernel drivers.
+#
+# This file is where that knowledge lives. It is read at runtime and hot-reloaded
+# by /api/guidance/reload — editing it changes behaviour without a code change,
+# exactly like the other guidance YAMLs.
+#
+# SCHEMA
+#   rules:
+#     <wazuh rule id>:
+#       name:     short human name for the rule
+#       summary:  what normally causes this rule to fire on this estate
+#       signals:  ordered list of deterministic checks (see below)
+#       analyst_note: free text appended to the triage prompt
+#
+#   A signal is:
+#     id:      stable identifier, appears in logs and in the decision record
+#     signal:  escalate | expected | note
+#     because: WHY — this text is shown to the analyst and to the model
+#     when:    { all: [condition, ...] }  or  { any: [condition, ...] }
+#
+#   A condition is a `field` (dotted path into the normalised alert) plus ONE
+#   operator: equals, equals_ignore_case, not_equals, contains, matches (regex),
+#   in, not_in, exists.
+#
+#   `not_in` is CASE-INSENSITIVE and FAILS CLOSED on a missing field: if the
+#   field is absent the condition is False, so the signal does not fire. That
+#   matches `not_equals`, and it is the safe direction for an exclusion, but it
+#   is the opposite of what "not in this list" reads like — so a signal whose
+#   only guard is `not_in` will go silent on alerts missing that field.
+#
+# ⚠ THE EXCLUSION LISTS BELOW WILL ROT.
+#   They are a denylist of known-good names inside a signal about unknown-bad
+#   names, which is self-refuting by construction. They go stale in three
+#   directions: new Windows builds, new GPU/storage/EDR vendors, and whatever
+#   third-party software a given estate runs. Every stale entry is a FALSE
+#   POSITIVE that pushes the model toward escalation.
+#   OWNER: SOC lead. REVIEW: quarterly, and after any fleet driver rollout.
+#
+#   ⚠ NOTE FOR THE FIRST REVIEW. `signal: escalate` is still live on
+#   `system_start_random_name_driver` — that is the entry this cadence exists
+#   for. Four names were found by audit AFTER the first list was written and are
+#   now excluded: vmmemctl, vmrawdsk (VMware Tools), speedfan, hcmonitr.
+#   `vmmemctl` is the one that mattered — on a VMware estate that is every
+#   single VM. It has NOT been verified against a real host whether VMware Tools
+#   registers it as `system start`; check that before the next release.
+#   Assume more exist. That assumption is the reason WO-H120 is filed.
+#   The structural replacement — key on first-seen-on-estate rarity, or on a
+#   corroborating signal such as an AV detection on the same host in the same
+#   minute — is filed as WO-H120. What actually separated that driver from 80
+#   WinRing0 installs was the 31 seconds between it and a Severe Defender
+#   quarantine, not the letter count.
+#
+#   `escalate` always beats `expected` when both match. Safety wins ties.
+
+version: 1
+
+rules:
+
+  "61138":
+    name: "New Windows Service Created (Windows Event 7045)"
+    summary: >
+      Service installation. On this estate the overwhelming majority are benign
+      and recurring: CPUID HWMonitor reinstalling WinRing0, Google Updater,
+      Mozilla Maintenance Service, Defender's own KslD/WdAiNisDrv, and FTDI USB
+      serial drivers. The rule therefore carries a high baseline false-positive
+      rate — which is exactly why the rare dangerous case must be separated on
+      fields rather than on volume.
+    signals:
+
+      - id: system_start_random_name_driver
+        signal: escalate
+        because: >
+          A kernel-mode driver set to SYSTEM START (loads at boot, before most
+          security software) whose service name is exactly eight lowercase
+          letters, and which is not one of the stock/vendor drivers listed
+          below. NOTE: plenty of legitimate drivers are named this way —
+          nvlddmkm, atikmdag, wdfilter, intelppm — which is why the exclusion
+          list exists and why this is a WEAK signal on its own. This is the
+          shape of stealth persistence and bring-your-own-vulnerable-driver
+          tooling (MITRE T1543.003). Two alerts matched this pattern on one
+          live estate, eight days apart, and they were the ONLY system-start
+          kernel drivers among 100 service installations since April.
+        when:
+          all:
+            - field: data.win.eventdata.serviceType
+              contains: "kernel mode driver"
+            - field: data.win.eventdata.startType
+              equals_ignore_case: "system start"
+            - field: data.win.eventdata.serviceName
+              matches: "^[a-z]{8}$"
+            # ⚠ WITHOUT THIS EXCLUSION THE SIGNAL FIRES ON THE OPERATING
+            # SYSTEM. Verified: 24 of 24 driver names read off the affected
+            # host's own system32\drivers listing match "^[a-z]{8}$", and
+            # intelppm/mssmbios/nsiproxy are themselves SYSTEM START KERNEL
+            # MODE drivers — so the other two conditions do not discriminate.
+            # Seeded from that real inventory; extend per estate.
+            - field: data.win.eventdata.serviceName
+              not_in:
+                - acpipagr
+                - hcmonitr
+                - speedfan
+                - vmmemctl
+                - vmrawdsk
+                - amdkmdag
+                - atikmdag
+                - cbfsfilt
+                - iastorac
+                - netwlanx
+                - nvlddmkm
+                - tsusbflt
+                - vmbushid
+                - vsockdrv
+                - wdfilter
+                - acpitime
+                - agilevpn
+                - asyncmac
+                - bthmodem
+                - circlass
+                - cmimcext
+                - cplspcon
+                - crashdmp
+                - devauthe
+                - ewserver
+                - fileinfo
+                - flpydisk
+                - hdaudbus
+                - hidclass
+                - hidparse
+                - hvsocket
+                - hwpolicy
+                - hyperkbd
+                - inetaccs
+                - intelide
+                - intelpep
+                - intelppm
+                - ipfltdrv
+                - iphlpsvc
+                - kbdclass
+                - kbldfltr
+                - mouclass
+                - mountmgr
+                - mshwnclx
+                - msisadrv
+                - mspclock
+                - mssecflt
+                - mssecwfp
+                - mssmbios
+                - napagent
+                - ndistapi
+                - netprofm
+                - nsiproxy
+                - nvmedisk
+                - processr
+                - quavedrv
+                - raspppoe
+                - rdyboost
+                - scfilter
+                - scsiport
+                - seclogon
+                - sermouse
+                - shpamsvc
+                - stexstor
+                - storahci
+                - stornvme
+                - storport
+                - tcpipreg
+                - terminpt
+                - tsusbhub
+                - uaspstor
+                - upnphost
+                - usbaudio
+                - usbprint
+                - vdrvroot
+                - vmswitch
+                - vwifibus
+                - vwififlt
+                - wbengine
+                - wdrvroot
+                - wimmount
+                - workerdd
+                - wuauserv
+
+      # DEMOTED to `note` (QA re-audit H-3). As `escalate` it made the prompt
+      # tell the model "do not return a benign verdict without addressing why
+      # this does not apply" — on NVIDIA and AMD driver updates. A name-shape
+      # check with no start-type constraint is not strong enough to carry that
+      # instruction. It still reaches the analyst and the model as context.
+      - id: driver_in_drivers_dir_random_name
+        signal: note
+        because: >
+          A driver image written into system32\drivers with a pseudo-random
+          eight-lowercase-letter filename. Same reasoning as above; kept as a
+          separate signal so it still fires if startType is absent from the
+          event.
+        when:
+          all:
+            # SCOPED case-insensitivity. `(?i)` on the whole pattern let
+            # `Xyzabcde.sys` through, so the first fix deleted the flag — and
+            # that made the DIRECTORY case-sensitive too, so the canonical
+            # `C:\Windows\System32\drivers\` stopped matching entirely.
+            # Both castings occur on the same host: this repo's own fixture has
+            # `...\WINDOWS\system32\drivers\<random8>.sys` alongside
+            # `...\Windows\System32\WinRing0x64.sys`. `(?i:...)` applies the
+            # flag to the path only; the filename stays lowercase-anchored.
+            - field: data.win.eventdata.imagePath
+              matches: "(?i:system32\\\\+drivers\\\\+)[a-z]{8}\\.sys$"
+            # NO serviceType condition here, deliberately. Requiring it cost
+            # this signal the independence that is its whole reason to exist:
+            # "kernel mode driver" is the English-locale rendering of event
+            # 7045's ServiceType, so on a non-English host — or any decoder
+            # emitting `0x1` — both signals went dead at once, including on the
+            # real rootkit alert. The exclusion below is keyed on serviceName,
+            # which `not_in` fails closed on when absent; that is accepted here
+            # because signal 1 still covers the system-start case.
+            - field: data.win.eventdata.serviceName
+              not_in:
+                - acpipagr
+                - hcmonitr
+                - speedfan
+                - vmmemctl
+                - vmrawdsk
+                - amdkmdag
+                - atikmdag
+                - cbfsfilt
+                - iastorac
+                - netwlanx
+                - nvlddmkm
+                - tsusbflt
+                - vmbushid
+                - vsockdrv
+                - wdfilter
+                - acpitime
+                - agilevpn
+                - asyncmac
+                - bthmodem
+                - circlass
+                - cmimcext
+                - cplspcon
+                - crashdmp
+                - devauthe
+                - ewserver
+                - fileinfo
+                - flpydisk
+                - hdaudbus
+                - hidclass
+                - hidparse
+                - hvsocket
+                - hwpolicy
+                - hyperkbd
+                - inetaccs
+                - intelide
+                - intelpep
+                - intelppm
+                - ipfltdrv
+                - iphlpsvc
+                - kbdclass
+                - kbldfltr
+                - mouclass
+                - mountmgr
+                - mshwnclx
+                - msisadrv
+                - mspclock
+                - mssecflt
+                - mssecwfp
+                - mssmbios
+                - napagent
+                - ndistapi
+                - netprofm
+                - nsiproxy
+                - nvmedisk
+                - processr
+                - quavedrv
+                - raspppoe
+                - rdyboost
+                - scfilter
+                - scsiport
+                - seclogon
+                - sermouse
+                - shpamsvc
+                - stexstor
+                - storahci
+                - stornvme
+                - storport
+                - tcpipreg
+                - terminpt
+                - tsusbhub
+                - uaspstor
+                - upnphost
+                - usbaudio
+                - usbprint
+                - vdrvroot
+                - vmswitch
+                - vwifibus
+                - vwififlt
+                - wbengine
+                - wdrvroot
+                - wimmount
+                - workerdd
+                - wuauserv
+
+      - id: winring0_demand_start
+        signal: expected
+        because: >
+          WinRing0x64.sys is CPUID HWMonitor's kernel driver. It is installed
+          demand-start, used, and removed on each run, so Event 7045 repeats
+          roughly every 36 hours on any host running HWMonitor. Confirm CPUID
+          HWMonitor is present in the host's package inventory before treating
+          this as routine; if it is NOT installed, WinRing0 is a blocklisted
+          vulnerable driver (CVE-2020-14979 / CVE-2020-14980) and this is not
+          expected at all.
+        when:
+          all:
+            - field: data.win.eventdata.serviceName
+              matches: "^WinRing0"
+            - field: data.win.eventdata.startType
+              equals_ignore_case: "demand start"
+
+      - id: known_vendor_service
+        signal: expected
+        because: >
+          Recognised vendor service installer seen repeatedly on this estate.
+        when:
+          any:
+            - field: data.win.eventdata.serviceName
+              matches: "^GoogleUpdater"
+            - field: data.win.eventdata.serviceName
+              equals: "MozillaMaintenance"
+            - field: data.win.eventdata.imagePath
+              matches: "(?i)system32\\\\+drivers\\\\+wd\\\\+"
+
+    analyst_note: >
+      Decide this alert on startType and on the shape of the service name, not
+      on how often rule 61138 fires. A demand-start driver from a named vendor
+      path is routine. A system-start kernel driver with a random-looking name
+      is the one case on this rule that has ever mattered, and when it happened
+      the case was closed in 41 minutes as "normal action". If this signal
+      escalates, ask for the file hash BEFORE anything reboots or cleans the
+      host — on the one occasion this happened the driver was gone within
+      ten days and had never been hashed.

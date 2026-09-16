@@ -4,7 +4,7 @@ Pydantic request models and constants shared across API route modules.
 
 import html as _html_mod
 import re as _re_mod
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -16,6 +16,32 @@ def sanitize_user_text(text: str, max_len: int = 5000) -> str:
     return _html_mod.escape(text[:max_len])
 
 
+# Single source of truth for the platform password complexity policy. Returns
+# an error message string when the password is non-compliant, else None. Used
+# by the Pydantic user models (which raise ValueError -> 422) and by the
+# self-service change-password route (which raises HTTPException(400)).
+_PASSWORD_SPECIAL_CHARS = "!@#$%^&*()-_=+[]{}|;:',.<>?/`~"
+
+
+def password_policy_error(v: str) -> Optional[str]:
+    """Validate a password against the platform policy.
+
+    Returns None if compliant, otherwise a human-readable reason. Do not weaken
+    these rules — they are shared by admin user-management and self-service.
+    """
+    if len(v) < 12:
+        return "password must be at least 12 characters"
+    if not any(c.isupper() for c in v):
+        return "password must contain at least one uppercase letter"
+    if not any(c.islower() for c in v):
+        return "password must contain at least one lowercase letter"
+    if not any(c.isdigit() for c in v):
+        return "password must contain at least one digit"
+    if not any(c in _PASSWORD_SPECIAL_CHARS for c in v):
+        return "password must contain at least one special character"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -23,6 +49,24 @@ def sanitize_user_text(text: str, max_len: int = 5000) -> str:
 ALLOWED_VERDICTS = {"true_positive", "false_positive", "needs_investigation", "auto_close"}
 ALLOWED_ACTIONS = {"approve", "reject"}
 ALLOWED_INCIDENT_STATUSES = {"open", "investigating", "resolved", "closed"}
+
+#: WO-H112 — the constrained closure reason. Kept in lockstep with `_REASONS`
+#: in migration 0017, which enforces the same set as a CHECK constraint.
+#:
+#: These are the five answers that can be counted. "normal action" — the string
+#: an analyst actually used to close the one real intrusion of August — is not
+#: among them, and that is the entire point.
+ALLOWED_CLOSURE_REASONS = {
+    "true_positive",       # real, and acted on
+    "benign_positive",     # the rule fired correctly; the activity was authorised
+    "false_positive",      # the rule should not have fired
+    "duplicate",           # already covered by another case
+    "insufficient_data",   # could not be decided with what was available
+}
+
+#: The statuses that END an investigation, and therefore require a structured
+#: closure reason. Moving to `investigating` does not.
+CLOSING_STATUSES = {"resolved", "closed"}
 ALLOWED_AR_ACTIONS = {
     "block_ip", "unblock_ip", "isolate_host", "unisolate_host",
     "kill_process", "disable_user", "enable_user",
@@ -35,8 +79,19 @@ ALLOWED_KB_DOC_TYPES = {
     "hunt_finding", "incident_learning", "guidance",
 }
 
+from src.agents.prompts import PROMPT_INJECTION_GUARD as _PROMPT_INJECTION_GUARD
+
+# WO-S14: this prompt consumes incident titles, rule descriptions and triage
+# reasoning — all derived from ingested Wazuh alert content, which an attacker
+# on a monitored host controls (a failed SSH login puts the attacker's chosen
+# username into the incident title via IncidentEngine._generate_title). It
+# carried NONE of the injection protections the triage, hunt and query prompts
+# use, so the attacker could write the plain-English narrative a non-technical
+# stakeholder reads about their own intrusion — and the result is CACHED in the
+# incident timeline and re-served to every later viewer.
 PLAIN_SUMMARY_PROMPT = """You are a security advisor writing for a non-technical IT manager.
 Explain this security incident in plain, clear English.
+""" + _PROMPT_INJECTION_GUARD + """
 
 CRITICAL: Respond in PLAIN TEXT only. Do NOT use JSON, code blocks,
 markdown, or any structured format. Just write natural paragraphs
@@ -190,11 +245,84 @@ class IncidentStatusRequest(BaseModel):
     # not be recorded without a human-supplied justification.
     reason: str
 
+    # WO-H112. `reason` is prose for a human to read; `closure_reason` is the
+    # one field a metric can be computed from. Required only when the status
+    # actually ends the investigation — see CLOSING_STATUSES.
+    closure_reason: Optional[str] = None
+    #: The closer's explicit judgement on the AI. Optional: absent means "not
+    #: stated", which is NOT the same as "the AI was right", and nothing
+    #: downstream may read it as agreement.
+    ai_was_wrong: Optional[bool] = None
+    # QA L3: analyst-writable free text bound, like every other such field.
+    ai_wrong_detail: Optional[str] = Field(default=None, max_length=4000)
+
+    @field_validator("closure_reason")
+    @classmethod
+    def validate_closure_reason(cls, v):
+        if v is None:
+            return v
+        v = str(v).strip().lower()
+        if v not in ALLOWED_CLOSURE_REASONS:
+            raise ValueError(
+                "closure_reason must be one of %s"
+                % sorted(ALLOWED_CLOSURE_REASONS))
+        return v
+
+    @model_validator(mode="after")
+    def require_closure_reason_when_closing(self):
+        """A case may not be closed without a countable reason.
+
+        Free text alone is what produced "normal action" on the one alert this
+        month that mattered. It reads fine and it measures nothing.
+        """
+        if self.status in CLOSING_STATUSES and not self.closure_reason:
+            raise ValueError(
+                "closure_reason is required when status is %s — one of %s"
+                % (sorted(CLOSING_STATUSES), sorted(ALLOWED_CLOSURE_REASONS)))
+        return self
+
     @field_validator("status")
     @classmethod
     def validate_status(cls, v: str) -> str:
         if v not in ALLOWED_INCIDENT_STATUSES:
             raise ValueError(f"status must be one of {ALLOWED_INCIDENT_STATUSES}")
+        return v
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("reason is required and must not be empty")
+        if len(v) > 2000:
+            raise ValueError("reason must be under 2000 characters")
+        return v
+
+
+class IncidentVerdictPropagationRequest(BaseModel):
+    """WO-H85 — apply ONE human verdict to an incident's member alerts.
+
+    Deliberately SEPARATE from ``IncidentStatusRequest``. Closing an incident
+    cascades WORK-ITEM state (``resolved_at``) and nothing else; putting a
+    verdict on every alert an incident grouped is a different, far more
+    consequential claim — those alerts were correlated, not individually judged.
+
+    ``confirm`` is the opt-in: it DEFAULTS TO FALSE and the route refuses the
+    request without it, so the propagation can never be a side effect of a
+    client that simply omitted the flag. ``reason`` is mandatory and free text,
+    exactly like the verdict and status reasons — the value is the specific
+    finding, which no enum captures.
+    """
+
+    human_verdict: str
+    reason: str
+    confirm: bool = False
+
+    @field_validator("human_verdict")
+    @classmethod
+    def validate_verdict(cls, v: str) -> str:
+        if v not in ALLOWED_VERDICTS:
+            raise ValueError(f"verdict must be one of {ALLOWED_VERDICTS}")
         return v
 
     @field_validator("reason")
@@ -261,16 +389,9 @@ class CreateUserRequest(BaseModel):
     @field_validator("password")
     @classmethod
     def validate_password(cls, v):
-        if len(v) < 12:
-            raise ValueError("password must be at least 12 characters")
-        if not any(c.isupper() for c in v):
-            raise ValueError("password must contain at least one uppercase letter")
-        if not any(c.islower() for c in v):
-            raise ValueError("password must contain at least one lowercase letter")
-        if not any(c.isdigit() for c in v):
-            raise ValueError("password must contain at least one digit")
-        if not any(c in "!@#$%^&*()-_=+[]{}|;:',.<>?/`~" for c in v):
-            raise ValueError("password must contain at least one special character")
+        err = password_policy_error(v)
+        if err:
+            raise ValueError(err)
         return v
 
     @field_validator("role")
@@ -300,17 +421,22 @@ class UpdateUserRequest(BaseModel):
     def validate_password(cls, v):
         if v is None:
             return v
-        if len(v) < 12:
-            raise ValueError("password must be at least 12 characters")
-        if not any(c.isupper() for c in v):
-            raise ValueError("password must contain at least one uppercase letter")
-        if not any(c.islower() for c in v):
-            raise ValueError("password must contain at least one lowercase letter")
-        if not any(c.isdigit() for c in v):
-            raise ValueError("password must contain at least one digit")
-        if not any(c in "!@#$%^&*()-_=+[]{}|;:',.<>?/`~" for c in v):
-            raise ValueError("password must contain at least one special character")
+        err = password_policy_error(v)
+        if err:
+            raise ValueError(err)
         return v
+
+
+class ChangePasswordRequest(BaseModel):
+    """Self-service password change (POST /api/my/password).
+
+    Deliberately NO Pydantic complexity validator: the route enforces the
+    policy inline via ``password_policy_error`` so violations return 400
+    (per WO-H58 DoD) rather than Pydantic's 422, and so the ``new ==
+    current`` cross-field rule lives next to it.
+    """
+    current_password: str
+    new_password: str
 
 
 class RemediationRequest(BaseModel):
@@ -563,6 +689,94 @@ class FlagInterestingRequest(BaseModel):
 class HandoffRequest(BaseModel):
     shift_from: str = Field(..., min_length=1, max_length=100)
     shift_to: str = Field(..., min_length=1, max_length=100)
+
+
+# -- Shift SCHEDULE editing (WO-H79) ----------------------------------------
+# Shape-only validation lives here (types, lengths, weekday names). The
+# SEMANTIC rules — analysts must exist and be active in platform_users, every
+# shift must be staffed, the on-call primary must be on that shift, no analyst
+# on two overlapping shifts, and the day must tile 24 hours with no gap or
+# overlap — live in src/team/shift_manager.validate_shift_schedule, because
+# they need the user table and the runtime shift-matching rule. That module is
+# PAID (stripped in Community), so it is imported inside the route, never here.
+
+ALLOWED_WEEKDAYS = {"monday", "tuesday", "wednesday", "thursday", "friday",
+                    "saturday", "sunday"}
+
+
+class ShiftDefinitionRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    # A whole hour (14 — the original schema) or "HH:MM" (18:30). A SOC on a
+    # half-hour UTC offset cannot describe itself in whole hours (WO-H77).
+    start_utc: Any
+    end_utc: Any
+    days: list[str] = Field(default_factory=list, max_length=7)
+    analysts: list[str] = Field(default_factory=list, max_length=50)
+    on_call_primary: str = Field("", max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def sanitize_name(cls, v: str) -> str:
+        v = sanitize_user_text(v.strip(), max_len=100)
+        if not v:
+            raise ValueError("shift name is required")
+        return v
+
+    @field_validator("start_utc", "end_utc")
+    @classmethod
+    def time_is_scalar(cls, v):
+        """Only a shape check — the real parse is the shift manager's."""
+        if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+            raise ValueError(
+                'shift times must be a whole hour (0-24) or "HH:MM" UTC')
+        if isinstance(v, str) and len(v) > 5:
+            raise ValueError('shift times must be a whole hour (0-24) or "HH:MM" UTC')
+        return v
+
+    @field_validator("days")
+    @classmethod
+    def validate_days(cls, v: list[str]) -> list[str]:
+        out = []
+        for day in v:
+            day_norm = str(day).strip().lower()
+            if day_norm not in ALLOWED_WEEKDAYS:
+                raise ValueError(f"'{day}' is not a weekday name")
+            if day_norm not in out:
+                out.append(day_norm)
+        return out
+
+    @field_validator("analysts")
+    @classmethod
+    def validate_analysts(cls, v: list[str]) -> list[str]:
+        return [str(a).strip() for a in v]
+
+
+class ShiftScheduleRequest(BaseModel):
+    shifts: list[ShiftDefinitionRequest] = Field(default_factory=list,
+                                                 max_length=50)
+    # IANA zone (e.g. "Asia/Kolkata") the operator entered the times in. Used
+    # ONLY to regenerate the local-time comments beside each UTC boundary, so
+    # the file stays readable to the person who owns the rota. Never affects
+    # the stored values, which are always UTC.
+    timezone: Optional[str] = Field(None, max_length=64)
+    # Explicit confirmation that an EXISTING but unparseable schedule file may
+    # be replaced. Defaults to false: a file that failed to parse is a rota of
+    # unknown content, not an empty one, and overwriting it silently is the
+    # failure mode this whole feature exists to remove. The server 409s until
+    # the operator opts in.
+    overwrite_unreadable: bool = False
+
+    @field_validator("timezone")
+    @classmethod
+    def sanitize_timezone(cls, v):
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        if not _re_mod.fullmatch(r"[A-Za-z0-9_+\-/]{1,64}", v):
+            raise ValueError("timezone must be an IANA zone name")
+        return v
 
 
 # ---------------------------------------------------------------------------

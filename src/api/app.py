@@ -3,6 +3,7 @@ Central FastAPI application — creates app, middleware, rate limiter,
 and includes all route modules.
 """
 
+import contextlib
 import os
 import structlog
 from fastapi import FastAPI, Request
@@ -20,6 +21,114 @@ _BUILD_PROFILE = resolve_build_profile()
 _COMMUNITY_BUILD = _BUILD_PROFILE == "community"
 
 # ---------------------------------------------------------------------------
+# API threadpool cap (WO-H78 follow-up)
+# ---------------------------------------------------------------------------
+# anyio's default thread limiter is created lazily per event loop, so
+# ``current_default_thread_limiter()`` raises outside a running loop. main.py
+# tried to cap it from ``AISocPlatform.__init__`` — which runs before uvicorn
+# starts the loop — so the cap NEVER applied. It failed to a warning, and the
+# pool-budget check that followed then validated against the number we had
+# INTENDED to set rather than the 40 actually in force. Observed on a live
+# tenant, 2026-08-13:
+#
+#   api_threadpool_cap_failed  error='Not currently running on any
+#                                     asynchronous event loop'
+#   db_pool_budget_ok  api_threadpool=24 required_pool_size=40
+#                      configured_pool_size=50 sufficient=True
+#
+# Real arithmetic was 40 + 2 + 10 + 4 = 56 against a pool of 50. The guard
+# built to prevent pool saturation was reporting a surplus during a shortfall.
+#
+# Doing it in the lifespan puts it on the loop, which is also the only place it
+# CAN be done — and it still lands before the first request is served, so the
+# threadpool cannot have grown past the cap in the meantime.
+_ANYIO_DEFAULT_THREADS = 40    # anyio._backends._asyncio: CapacityLimiter(40)
+
+
+def _cap_thread_limiter(intended: int) -> int:
+    """Cap anyio's threadpool. Returns the count ACTUALLY in force.
+
+    Never raises: a platform that will not boot is worse than one with a
+    larger threadpool than we wanted. The return value is what the caller must
+    budget against — not what it asked for.
+    """
+    import anyio.to_thread
+    try:
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = intended
+        logger.info("api_threadpool_capped", threads=intended)
+        return intended
+    except Exception as exc:                       # noqa: BLE001 — never fatal
+        logger.error(
+            "api_threadpool_cap_failed",
+            error=str(exc)[:200], intended=intended,
+            effective=_ANYIO_DEFAULT_THREADS,
+            msg="Could not cap the anyio threadpool. Budgeting against "
+                "anyio's default instead of the configured value — the pool "
+                "may now be reported as insufficient, and that report is the "
+                "accurate one.",
+        )
+        return _ANYIO_DEFAULT_THREADS
+
+
+async def _run_event_handlers(app: FastAPI, phase: str) -> None:
+    """Run handlers registered via ``app.add_event_handler(phase, ...)``.
+
+    Supplying a custom ``lifespan=`` REPLACES Starlette's ``_DefaultLifespan``,
+    and that default is the only thing that runs the router's ``on_startup`` /
+    ``on_shutdown`` lists. Without this, adding a lifespan here would silently
+    unregister ``main.py``'s shutdown hook — the WO-H9 bounded drain of the
+    triage worker pool, whose absence previously cost alerts their decision and
+    their checkpoint, then had systemd SIGKILL the process on TimeoutStopSec.
+
+    Nothing would have failed loudly. The server would boot, serve, and lose
+    work only on the way out.
+    """
+    import inspect as _inspect
+
+    for handler in list(getattr(app.router, f"on_{phase}", []) or []):
+        try:
+            result = handler()
+            if _inspect.isawaitable(result):
+                await result
+        except Exception as exc:                   # noqa: BLE001
+            # Matches Starlette's own posture: one bad handler must not take
+            # down the others, and on shutdown there is nothing left to abort.
+            logger.error("lifespan_event_handler_failed", phase=phase,
+                         handler=getattr(handler, "__name__", repr(handler)),
+                         error=str(exc)[:200])
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Apply the threadpool cap, then re-check the DB pool against reality."""
+    from src.api import dependencies as deps
+
+    cfg = deps._config or {}
+    intended = int((cfg.get("api") or {}).get("threadpool_size", 24))
+    effective = _cap_thread_limiter(intended)
+
+    # Re-run the budget with the count actually in force. main.py checks this
+    # too, at boot, but only this one knows whether the cap took.
+    db = getattr(deps, "_db", None)
+    if db is not None and hasattr(db, "assert_pool_covers_threads"):
+        with contextlib.suppress(Exception):       # advisory, never fatal
+            db.assert_pool_covers_threads(
+                api_threadpool=effective,
+                triage_workers=int(((cfg.get("agents") or {})
+                                    .get("triage") or {}).get("max_workers", 4)),
+                scheduler_workers=int((cfg.get("scheduler") or {})
+                                      .get("max_workers", 10)),
+            )
+
+    await _run_event_handlers(app, "startup")
+    try:
+        yield
+    finally:
+        await _run_event_handlers(app, "shutdown")
+
+
+# ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 app = FastAPI(
@@ -28,6 +137,7 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
+    lifespan=_lifespan,
 )
 app.state.limiter = limiter
 
@@ -74,6 +184,29 @@ async def tenant_config_unavailable_handler(
     logger.error("tenant_config_unavailable",
                  tenant_id=getattr(exc, "tenant_id", None),
                  path=request.url.path)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Service temporarily unavailable"},
+    )
+
+
+from src.database.store import TenantRecordUnavailable
+
+
+@app.exception_handler(TenantRecordUnavailable)
+async def tenant_record_unavailable_handler(
+        request: Request, exc: TenantRecordUnavailable):
+    """The tenants table could not be read — fail closed at the API edge.
+
+    WO-H91. ``get_tenant`` used to return ``{}`` on a read failure, which the
+    routes turned into ``404 Tenant not found`` — "we could not find out"
+    presented to the operator as "it is not there". A generic 503 (no internal
+    detail leak, full context logged server-side) says the honest thing, and no
+    route proceeds to write tenant config on a read it never got.
+    """
+    # No tenant id on the line: the failing lookup knows it, but this is a
+    # shared log on a multi-tenant platform (same rule as the store).
+    logger.error("tenant_record_unavailable", path=request.url.path)
     return JSONResponse(
         status_code=503,
         content={"detail": "Service temporarily unavailable"},
@@ -345,6 +478,9 @@ def init_api(db, enrichment, triage_agent, detection_agent, feedback_engine,
     deps._pipeline_monitor = pipeline_monitor
     deps._alert_buffer = alert_buffer
     deps._tenant_registry = tenant_registry
+    # WO-H97: the incident engine owns the severity floors/ceilings, which
+    # POST /api/guidance/reload has to be able to reload in place.
+    deps._incident_engine = incident_engine
 
     # Initialize webhook system for real-time alert ingestion (optional module)
     if tenant_registry:

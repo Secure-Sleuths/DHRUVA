@@ -8,6 +8,8 @@ import structlog
 from datetime import datetime, timezone
 from collections import defaultdict
 
+from src.timestamps import parse_iso8601_or_none
+
 from src.mitre.matrix import (
     MITRE_MATRIX, MITRE_TACTICS, TACTIC_IDS,
     TECHNIQUE_NAMES, TECHNIQUE_TACTICS, ALL_TECHNIQUE_IDS, TOTAL_TECHNIQUES,
@@ -166,13 +168,13 @@ class MITRECoverageAnalyzer:
 
     @staticmethod
     def _days_ago(iso_str: str) -> int:
-        try:
-            dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return (datetime.now(timezone.utc) - dt).days
-        except (ValueError, TypeError):
+        # WO-H116: ``last_seen`` originates from Wazuh alert timestamps
+        # (``+0000``), so this must not depend on the interpreter version.
+        # 999 keeps the documented "assume stale when unknown" default.
+        dt = parse_iso8601_or_none(iso_str)
+        if dt is None:
             return 999
+        return (datetime.now(timezone.utc) - dt).days
 
     def get_heatmap_data(self) -> dict:
         """Return heatmap data organized by tactic for the dashboard."""

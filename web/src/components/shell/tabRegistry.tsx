@@ -16,6 +16,7 @@ import { MitreTab } from "./tabs/MitreTab";
 import { OverviewTab } from "./tabs/OverviewTab";
 import { ReportsTab } from "./tabs/ReportsTab";
 import { RespondTab } from "./tabs/RespondTab";
+import { ShiftHandoverTab } from "./tabs/ShiftHandoverTab";
 import { SoarTab } from "./tabs/SoarTab";
 import { ThreatIntelTab } from "./tabs/ThreatIntelTab";
 import { TicketsTab } from "./tabs/TicketsTab";
@@ -63,6 +64,8 @@ export const TAB_COMPONENTS: Record<string, ComponentType<TabProps>> = {
   triage: TriageTab,
   // WO-U4 — worst-first incident list → glass-box case (master-detail).
   incidents: IncidentsTab,
+  // Shift handover — outstanding work + a self-chosen look-back window.
+  handover: ShiftHandoverTab,
   // WO-U6 — grounded NL-Query copilot hero + evidence canvas (owns its own rail).
   investigate: InvestigateTab,
   // WO-U8 — MITRE coverage grid + live-campaign overlay + per-campaign chain coverage.

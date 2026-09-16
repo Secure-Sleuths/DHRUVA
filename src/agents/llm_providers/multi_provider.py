@@ -82,7 +82,17 @@ class ProviderUsageTracker:
             from datetime import datetime, timezone
 
             if real_usage and real_usage.get("input_tokens") is not None:
-                tokens_input = int(real_usage["input_tokens"])
+                # WO-H118 QA (M4): cache tokens are SEPARATE fields and are not
+                # included in `input_tokens`. Once prompt caching is on, a
+                # cached read moves ~3,400 tokens per call out of that field —
+                # so a dashboard reading it alone shows an ~80% drop and looks
+                # like usage fell rather than like caching started working.
+                # They are added back for the volume figure; cost is priced
+                # elsewhere and is unaffected.
+                _cache_read = int(real_usage.get("cache_read_input_tokens") or 0)
+                _cache_write = int(real_usage.get("cache_creation_input_tokens") or 0)
+                tokens_input = (int(real_usage["input_tokens"])
+                                + _cache_read + _cache_write)
                 tokens_output = int(real_usage.get("output_tokens") or 0)
                 estimated = False
                 cost = (real_usage.get("cost_usd")
@@ -541,7 +551,7 @@ class MultiProviderLLMBackend:
                 return extracted
 
             # Truncation heuristic — surfaced for operators triaging the
-            # a client "raw_preview=<empty>" symptom. If the response ends
+            # reported "raw_preview=<empty>" symptom. If the response ends
             # with no closing brace/bracket and the last char isn't a quote,
             # it almost certainly hit max_tokens. Log explicitly so the
             # operator knows to bump max_tokens rather than chase a parser

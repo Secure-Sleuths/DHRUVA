@@ -268,6 +268,37 @@ async def get_decision_audit_trail(
     return trail
 
 
+@router.get("/decisions/{decision_id}/reviews")
+async def get_decision_reviews(
+    decision_id: str,
+    user: dict = Depends(verify_jwt),
+):
+    """Every human review ever recorded on a decision, OLDEST FIRST (WO-H85).
+
+    Append-only history from ``decision_reviews``: who, when, the verdict they
+    recorded, their free-text reason, and the verdict it replaced. It exists so
+    the reviewer about to override someone can SEE they are disagreeing with a
+    colleague and read what that person said BEFORE they submit — the previous
+    reviewer's reasoning used to be destroyed by the next override.
+
+    READ-ONLY and gated by ``verify_jwt`` exactly like the audit trail beside
+    it: every role that can open the case can read its history. Writing a
+    verdict remains gated at ``POST /api/triage/review`` (analyst+ for a first
+    verdict, admin+ to override an existing one) — unchanged by this.
+
+    404s for an unknown decision or another tenant's (``get_decision`` is
+    tenant-scoped, so a foreign id is a no-match, never a leak). An empty
+    ``reviews`` list is a legitimate 200 — the decision exists but predates the
+    history table or was never human-reviewed.
+    """
+    _db = get_db()
+    if _db.get_decision(decision_id) is None:
+        raise HTTPException(status_code=404, detail="Decision not found")
+    reviews = _db.get_decision_reviews(decision_id)
+    return {"decision_id": decision_id, "reviews": reviews,
+            "count": len(reviews)}
+
+
 # ---------------------------------------------------------------------------
 # WO-H25 — alert-level claim. Ownership of the INDIVIDUAL triage decision so
 # two analysts working the queue don't double-work the same item. Mirrors the

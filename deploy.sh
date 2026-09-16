@@ -69,7 +69,14 @@ step() {
 info()    { echo -e "  ${CYAN}ℹ${NC}  $1"; }
 success() { echo -e "  ${GREEN}✓${NC}  $1"; }
 warn()    { echo -e "  ${YELLOW}⚠${NC}  $1"; }
-fail()    { echo -e "  ${RED}✗${NC}  $1"; }
+# fail() writes to STDERR, not stdout. Diagnostics on stdout are silently eaten
+# by any command substitution: `FLOOR=$(pg_required_major)` captured every
+# fail line into the variable and threw it away, so a package missing
+# src/database/pg_version.py aborted the installer with ZERO output — after
+# .env had already been written with freshly generated secrets. stderr is the
+# correct stream for an error anyway, and it makes every future
+# `x=$(some_function)` safe by construction.
+fail()    { echo -e "  ${RED}✗${NC}  $1" >&2; }
 
 ask() {
     local prompt="$1"
@@ -106,9 +113,40 @@ ask_yesno() {
     [[ "$answer" =~ ^[Yy] ]]
 }
 
+# WO-S2: .env holds JWT_SECRET (which alone permits minting an mssp_admin
+# token), TENANT_ENCRYPTION_KEY, SOC_ADMIN_PASSWORD, DATABASE_URL and every
+# Wazuh/OpenSearch/LLM/ticketing credential. This script builds .env from
+# scratch (it deliberately does not copy .env.template), so the file is first
+# created by the append below under the invoking shell's umask — 0022 on a
+# default install, i.e. world-readable 0644. Create it 0600 up front instead.
+ensure_env_file_secure() {
+    if [[ ! -f "$ENV_FILE" ]]; then
+        (umask 077 && : > "$ENV_FILE")
+    fi
+    chmod 600 "$ENV_FILE"
+}
+
+# WO-S8: generate a real inbound-webhook HMAC secret when a ticketing provider
+# is configured. Without this the operator gets `ticketing.enabled: true` with
+# *_WEBHOOK_SECRET unset, so config.yaml keeps the literal
+# "${JIRA_WEBHOOK_SECRET}" — a constant published in this repo — as the live
+# HMAC key on an UNAUTHENTICATED route. Never overwrites an existing value.
+ensure_webhook_secret() {
+    local key="$1"
+    if grep -q "^${key}=." "$ENV_FILE" 2>/dev/null; then
+        info "${key} already set — keeping the existing value"
+        return
+    fi
+    local generated
+    generated="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    update_env "$key" "$generated"
+    info "Generated ${key} (set the same value as the webhook secret in your provider)"
+}
+
 update_env() {
     local key="$1"
     local value="$2"
+    ensure_env_file_secure
     if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
         sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
     else
@@ -160,6 +198,29 @@ ensure_secret() {
     if [ "$key" = "ANONYMIZATION_SALT" ]    && [ "${ROTATE_SALT:-0}" = "1" ];       then rotate="yes"; fi
     if [ "$key" = "TENANT_ENCRYPTION_KEY" ] && [ "${ROTATE_TENANT_KEY:-0}" = "1" ]; then rotate="yes"; fi
 
+    # Duplicate-line guard (WO-H75). Three components disagree about what a
+    # repeated `KEY=` line means: this probe is FIRST-wins (grep | head -n1),
+    # update_env's `sed` rewrites EVERY matching line, and python-dotenv —
+    # which is what the platform actually reads — is LAST-wins. So a .env
+    # holding the template's blank `KEY=` line PLUS an appended real value
+    # (our own docs teach `cat >> .env`) reads as "unconfigured" here, and the
+    # generated replacement is then stamped over the real key too.
+    #
+    # For a master key that is unrecoverable. Refuse and let a human say which
+    # line is live rather than guessing: even last-wins would silently rewrite
+    # a line the operator did not expect us to touch.
+    if [ -f "$ENV_FILE" ]; then
+        local dupes=0
+        dupes=$(grep -c "^${key}=" "$ENV_FILE" 2>/dev/null || true)
+        if [ "${dupes:-0}" -gt 1 ]; then
+            fail "${ENV_FILE} has ${dupes} lines starting with '${key}=' (lines: $(grep -n "^${key}=" "$ENV_FILE" | cut -d: -f1 | tr '\n' ' '))."
+            fail "The platform reads the LAST one; this script would rewrite ALL of them,"
+            fail "destroying the others. For ${label} that is not recoverable."
+            fail "Leave exactly ONE ${key}= line in ${ENV_FILE}, then re-run."
+            exit 1
+        fi
+    fi
+
     # Existing non-empty value? (pipeline exit status is cut's, so a no-match
     # grep does not trip set -e)
     local existing=""
@@ -199,64 +260,383 @@ update_config() {
     sed -i "s|${key}:.*|${key}: ${value}|" "$file"
 }
 
-install_local_postgres() {
-    info "Installing Postgres locally on this server..."
+# ─── WO-H129: the PostgreSQL version floor ───────────────────────────────────
+# This script used to run `apt-get install postgresql postgresql-contrib` — the
+# UNVERSIONED meta-package. On Ubuntu 22.04 that resolves to PostgreSQL 14, and
+# on 14 migration 0018 cannot run its `agent_decisions.host` backfill (it needs
+# `pg_input_is_valid`, PostgreSQL 16+). The result is a client whose decision
+# history cannot be correlated by host, with nothing downstream saying so — the
+# same failure again, shipped to the next customer.
+#
+# The floor is NOT hardcoded here. It is read from src/database/pg_version.py,
+# the same constant the runtime enforces at boot, so the installer and the
+# platform cannot disagree.
 
-    if ! command -v apt-get &>/dev/null; then
-        fail "Same-server Postgres install currently supports Debian/Ubuntu only."
-        fail "On RHEL/CentOS/Rocky/Alma, install postgresql-server manually,"
-        fail "then re-run this script and choose option 1 (external Postgres)."
+# ONE resolution chain, used by EVERY consumer of the floor in this script.
+# src/ does not look the same in every build lane, so there are three ways to
+# reach the module and they are tried in order:
+#
+#   1. src/database/pg_version.py       — source tarball, a git checkout, and
+#      (since WO-H129 QA) the compiled client package, whose builder now
+#      exempts this one file from Cython/.pyc for exactly this reason.
+#   2. src/database/pg_version.pyc      — the DOCKER IMAGE (the Dockerfile
+#      compiles and deletes every .py outside src/database/migrations) and any
+#      client tarball built before that exemption. A .pyc can be executed
+#      directly, the same probe the wizard does for deployment_wizard.{py,pyc}.
+#      Docker never runs deploy.sh, but the shape is real and cheap to support.
+#   3. importing the module             — the only thing that works if the file
+#      was Cython-compiled to a .so, which cannot be run as a script at all.
+#
+# 2 and 3 need $PYTHON's bytecode magic / ABI to match the build box's.
+#
+# MEASURED, so nobody has to guess later: 3 already covers every ordinary .pyc
+# layout, including a namespace package with no __init__.py at all. 2 is NOT
+# redundant for one reason — importing src.database.pg_version executes
+# src/__init__.py first, and that is an ordinary file one `from src.something
+# import ...` away from needing a dependency the pre-venv interpreter does not
+# have. On that day 3 breaks on a fresh box and 2 is the only path left.
+# tests/test_pg_version_floor_h129.py pins exactly that shape
+# (test_bytecode_behind_a_broken_package_init_is_still_readable) so this branch
+# is not an untestable "just in case".
+#
+# Echoes the module's stdout. Returns non-zero ONLY when no form of the module
+# could be run — which is a DIFFERENT FACT from "the module answered no", and
+# keeping those two apart is the whole point (see --meets in pg_version.py).
+# Every caller must use `|| true`: this is invoked from command substitutions,
+# and under `set -e` a bare assignment would abort the installer with no
+# message at all.
+pg_version_cli() {
+    local mod="$INSTALL_DIR/src/database/pg_version" out
+
+    if [ -f "${mod}.py" ] && out=$("$PYTHON" "${mod}.py" "$@" 2>/dev/null) \
+       && [ -n "$out" ]; then
+        printf '%s\n' "$out"; return 0
+    fi
+    if [ -f "${mod}.pyc" ] && out=$("$PYTHON" "${mod}.pyc" "$@" 2>/dev/null) \
+       && [ -n "$out" ]; then
+        printf '%s\n' "$out"; return 0
+    fi
+    # Import form. Routed through the module's OWN _cli so all three paths
+    # answer with identical semantics instead of a hand-rolled third copy.
+    if out=$(cd "$INSTALL_DIR" && "$PYTHON" -c \
+        'import sys
+from src.database import pg_version as m
+sys.exit(m._cli(["pg_version.py"] + sys.argv[1:]))' "$@" 2>/dev/null) \
+       && [ -n "$out" ]; then
+        printf '%s\n' "$out"; return 0
+    fi
+    return 1
+}
+
+# The floor, as an integer, on stdout — or a loud abort. Never a guess.
+pg_required_major() {
+    local floor mod="$INSTALL_DIR/src/database/pg_version"
+    floor=$(pg_version_cli --floor || true)
+
+    if [[ ! "$floor" =~ ^[0-9]+$ ]]; then
+        # These go to STDERR (see fail() above). They used to go to stdout, and
+        # both call sites are command substitutions, so on a compiled package
+        # this aborted the installer with no output at all.
+        fail "Could not read the required PostgreSQL major version from"
+        fail "  ${mod}.py / ${mod}.pyc / importing src.database.pg_version"
+        fail "using PYTHON=$PYTHON. That module ships with every build lane, so"
+        fail "a missing copy means this package is incomplete — and a copy that"
+        fail "is present but unreadable usually means the compiled bytecode was"
+        fail "built for a different Python than $($PYTHON -V 2>&1)."
+        fail "Re-download the release and re-run, or set PYTHON= to the"
+        fail "interpreter the package was built for. Refusing to guess a"
+        fail "version: guessing is exactly how the wrong major got installed."
+        exit 1
+    fi
+    printf '%s\n' "$floor"
+}
+
+# Does VERSION meet the floor? Echoes "meets", "below", or "unknown".
+#
+# WO-H129 QA finding F2. The two sibling call sites below used to do
+#
+#     "$PYTHON" "$INSTALL_DIR/src/database/pg_version.py" --check "$v" \
+#         >/dev/null 2>&1
+#
+# — single hardcoded path, and both possible failures funnelled into one exit
+# code. On any lane that ships no .py (the Docker image, a client tarball built
+# before the exemption) that reported a perfectly supported 16.14 as BELOW
+# major 16, while $PG_FLOOR right next to it had already resolved 16 through
+# pg_version_cli's fallback chain. The installer contradicting itself is worse
+# than either answer on its own: on the same-server path it was a hard exit 1
+# telling the operator their PostgreSQL 16.14 was below major 16.
+#
+# So: same three-form resolution as the floor, and THREE outcomes. "unknown"
+# is a real answer and every caller handles it explicitly — refusing to guess
+# in either direction is the rule this whole work order exists to enforce.
+pg_version_verdict() {
+    local answer
+    answer=$(pg_version_cli --meets "$1" || true)
+    case "$answer" in
+        meets|below) printf '%s\n' "$answer" ;;
+        *)           printf 'unknown\n' ;;
+    esac
+}
+
+# Echo "<major> <port>" for the highest-version ONLINE cluster at or above $1.
+# Silent (empty) when there is none — including when postgresql-common is not
+# installed, which is the "nothing here yet" case.
+pg_pick_cluster() {
+    local floor="$1"
+    command -v pg_lsclusters &>/dev/null || return 0
+    pg_lsclusters -h 2>/dev/null | awk -v floor="$floor" '
+        $4 == "online" { v = $1 + 0; if (v >= floor && v > best) { best = v; port = $3 } }
+        END { if (best) print best, port }'
+}
+
+# `apt-get update` that EXPLAINS itself. Under `set -e` a bare
+# `sudo apt-get update -qq` aborts the whole installer the moment one apt source
+# is broken (an expired third-party key, an unreachable mirror, a stale
+# sources.list.d entry) and prints only apt's own output, which does not say
+# "your DHRUVA install just stopped". This names the step and what to do.
+apt_update() {
+    if ! sudo apt-get update -qq; then
+        echo ""
+        fail "\`apt-get update\` failed on this host, so no package can be"
+        fail "installed. This is almost always ONE broken entry in"
+        fail "/etc/apt/sources.list or /etc/apt/sources.list.d/ (an expired"
+        fail "signing key, or a mirror that is down) — apt's own output above"
+        fail "names it. Fix or remove that source and re-run ./deploy.sh."
+        fail "Alternatively, re-run and choose option 1 (external Postgres),"
+        fail "which needs no packages from this host at all."
+        exit 1
+    fi
+}
+
+# Install a PINNED major. Never the unversioned meta-package.
+install_pinned_postgres() {
+    local floor="$1"
+    info "Installing postgresql-${floor} via apt (pinned major, not the"
+    info "unversioned meta-package — see WO-H129)..."
+    apt_update
+
+    local candidate
+    candidate=$(apt-cache policy "postgresql-${floor}" 2>/dev/null \
+                | awk '/Candidate:/ {print $2}')
+    if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
+        echo ""
+        warn "This host's apt sources do not offer postgresql-${floor}."
+        warn "$(lsb_release -ds 2>/dev/null || echo 'This distribution') ships an"
+        warn "older PostgreSQL by default, and DHRUVA requires ${floor} or newer:"
+        warn "below ${floor}, migration 0018 cannot backfill agent_decisions.host,"
+        warn "so decision history silently loses host correlation."
+        echo ""
+        echo -e "  ${CYAN}Option A${NC}  Add the official PostgreSQL project apt repository"
+        echo "            (PGDG, apt.postgresql.org) and install postgresql-${floor}."
+        echo "            This adds a THIRD-PARTY package source and its signing"
+        echo "            key to this machine — a real trust decision, which is"
+        echo "            why this script will not make it for you."
+        echo ""
+        echo -e "  ${CYAN}Option B${NC}  Abort. Install PostgreSQL ${floor}+ yourself (or point"
+        echo "            DHRUVA at an external/managed one), then re-run."
+        echo ""
+        if ask_yesno "Add the official PostgreSQL (PGDG) apt repository now?" "n"; then
+            add_pgdg_repo
+            apt_update
+            candidate=$(apt-cache policy "postgresql-${floor}" 2>/dev/null \
+                        | awk '/Candidate:/ {print $2}')
+            if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
+                fail "postgresql-${floor} is still unavailable after adding PGDG."
+                fail "PGDG may not publish packages for this release"
+                fail "($(lsb_release -cs 2>/dev/null || echo 'unknown codename'))."
+                fail "Install PostgreSQL ${floor}+ manually or use an external"
+                fail "database (re-run and choose option 1)."
+                exit 1
+            fi
+        else
+            fail "Aborted — this host cannot install PostgreSQL ${floor} from its"
+            fail "own sources. To do it manually:"
+            fail "  sudo apt-get install -y curl ca-certificates gnupg"
+            fail "  curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \\"
+            fail "    | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/pgdg.gpg"
+            fail "  echo \"deb [signed-by=/usr/share/keyrings/pgdg.gpg] \\"
+            fail "    http://apt.postgresql.org/pub/repos/apt \$(lsb_release -cs)-pgdg main\" \\"
+            fail "    | sudo tee /etc/apt/sources.list.d/pgdg.list"
+            fail "  sudo apt-get update && sudo apt-get install -y postgresql-${floor}"
+            fail "Then re-run ./deploy.sh."
+            exit 1
+        fi
+    fi
+
+    # contrib is versioned on PGDG and on modern Ubuntu; on some releases only
+    # the transitional unversioned name exists. Install it only if a versioned
+    # candidate is really there — an unversioned `postgresql-contrib` can pull
+    # in a DIFFERENT major, which is the whole bug we are removing.
+    # Checked with an explicit string compare, not `grep -v`: on an unknown
+    # package `apt-cache policy` prints NOTHING, and `grep -qv` over empty input
+    # was measured returning 0 on this platform — i.e. "install it", for a
+    # package that does not exist. Same candidate test as above, same shape.
+    local contrib="" contrib_candidate
+    contrib_candidate=$(apt-cache policy "postgresql-contrib-${floor}" 2>/dev/null \
+                        | awk '/Candidate:/ {print $2}')
+    if [ -n "$contrib_candidate" ] && [ "$contrib_candidate" != "(none)" ]; then
+        contrib="postgresql-contrib-${floor}"
+    fi
+
+    if ! sudo apt-get install -y -qq "postgresql-${floor}" ${contrib}; then
+        fail "apt-get install postgresql-${floor} failed. Check network"
+        fail "reachability and apt sources, then re-run this script."
         exit 1
     fi
 
-    # Detect existing install — reuse if present, install if not.
-    if command -v psql &>/dev/null && \
-       sudo -u postgres pg_isready -q 2>/dev/null; then
-        info "Postgres already installed and running — reusing the existing instance."
-    else
-        info "Installing postgresql + postgresql-contrib via apt..."
-        sudo apt-get update -qq
-        if ! sudo apt-get install -y -qq postgresql postgresql-contrib; then
-            fail "apt-get install failed. Check network reachability and apt sources,"
-            fail "then re-run this script."
-            exit 1
-        fi
-        # Enable + start via systemd (best effort — non-systemd hosts will
-        # use the pg_ctlcluster fallback below).
-        sudo systemctl enable --now postgresql 2>/dev/null || true
+    # Enable + start via systemd (best effort — non-systemd hosts fall through
+    # to the pg_ctlcluster path below).
+    sudo systemctl enable --now "postgresql@${floor}-main" 2>/dev/null \
+        || sudo systemctl enable --now postgresql 2>/dev/null || true
 
-        # Verify Postgres is actually accepting connections. systemctl can
-        # exit 0 while the cluster fails to start, and silent failure here
-        # leaves the operator with a broken install + misleading success.
-        # Retry pg_isready a few times to allow the cluster to come up.
-        running=false
-        for attempt in 1 2 3 4 5 6 7 8 9 10; do
-            if sudo -u postgres pg_isready -q 2>/dev/null; then
+    # Verify the cluster is actually accepting connections. systemctl can exit 0
+    # while the cluster fails to start, and silent failure here leaves the
+    # operator with a broken install and a misleading success message.
+    local running=false attempt picked
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        picked=$(pg_pick_cluster "$floor")
+        if [ -n "$picked" ] && \
+           sudo -u postgres pg_isready -q -p "${picked##* }" 2>/dev/null; then
+            running=true; break
+        fi
+        sleep 1
+    done
+    # SysV/OpenRC/container path. NOTE: this used to start
+    # `$(ls /etc/postgresql/ | head -1)`, i.e. the LOWEST-numbered cluster on
+    # the box — on a host that already had 14, that started 14 and ignored the
+    # major we just installed. It starts the pinned major now.
+    if ! $running && command -v pg_ctlcluster &>/dev/null; then
+        warn "systemctl path did not start PostgreSQL ${floor} — falling back to pg_ctlcluster"
+        sudo pg_ctlcluster "$floor" main start 2>/dev/null || true
+        for attempt in 1 2 3 4 5; do
+            picked=$(pg_pick_cluster "$floor")
+            if [ -n "$picked" ] && \
+               sudo -u postgres pg_isready -q -p "${picked##* }" 2>/dev/null; then
                 running=true; break
             fi
             sleep 1
         done
-        # If systemd path didn't bring it up, try the SysV/init path
-        # (works on Debian/Ubuntu hosts running OpenRC or in containers).
-        if ! $running && command -v pg_ctlcluster &>/dev/null; then
-            warn "systemctl path did not start Postgres — falling back to pg_ctlcluster"
-            sudo pg_ctlcluster "$(ls /etc/postgresql/ | head -1)" main start 2>/dev/null || true
-            for attempt in 1 2 3 4 5; do
-                if sudo -u postgres pg_isready -q 2>/dev/null; then
-                    running=true; break
-                fi
-                sleep 1
-            done
-        fi
-        if ! $running; then
-            fail "Postgres installed but failed to start. Diagnose with:"
-            fail "  sudo systemctl status postgresql"
-            fail "  sudo journalctl -u postgresql --no-pager -n 50"
-            fail "  sudo -u postgres pg_isready -h /var/run/postgresql"
-            fail "Then re-run this script."
+    fi
+    if ! $running; then
+        fail "PostgreSQL ${floor} installed but failed to start. Diagnose with:"
+        fail "  sudo systemctl status postgresql@${floor}-main"
+        fail "  sudo journalctl -u postgresql@${floor}-main --no-pager -n 50"
+        fail "  pg_lsclusters"
+        fail "Then re-run this script."
+        exit 1
+    fi
+    success "PostgreSQL ${floor} installed and running"
+}
+
+add_pgdg_repo() {
+    local codename
+    codename=$(lsb_release -cs 2>/dev/null || true)
+    if [ -z "$codename" ]; then
+        fail "Cannot determine the distribution codename (lsb_release missing)."
+        fail "Install lsb-release, or add the PGDG repo manually, then re-run."
+        exit 1
+    fi
+    info "Adding the official PostgreSQL apt repository (PGDG) for ${codename}..."
+    sudo apt-get install -y -qq curl ca-certificates gnupg
+    # --batch --yes, and rm -f the target on failure. Without them this is a
+    # one-shot trap: if the fetch 404s, `gpg --dearmor -o F` still CREATES a
+    # 0-byte F before exiting 2, and on the next run `gpg --dearmor -o F` sees
+    # an existing F and asks "File exists. Overwrite?" on /dev/tty (or exits 2
+    # outright when there is no tty) — so every retry fails, and the script
+    # blames the network forever. --batch --yes overwrites without asking; the
+    # rm -f keeps a broken keyring from being left behind at all.
+    local keyring=/usr/share/keyrings/pgdg.gpg
+    if ! curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+         | sudo gpg --batch --yes --dearmor -o "$keyring"; then
+        sudo rm -f "$keyring"
+        fail "Failed to fetch or import the PostgreSQL signing key. Check"
+        fail "network access to www.postgresql.org (a proxy that returns an"
+        fail "HTML error page fails here too — gpg rejects the empty input)"
+        fail "and re-run. Nothing was left behind at $keyring."
+        exit 1
+    fi
+    echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt ${codename}-pgdg main" \
+        | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+    success "PGDG repository added (/etc/apt/sources.list.d/pgdg.list)"
+}
+
+install_local_postgres() {
+    local floor
+    floor=$(pg_required_major)
+    info "Installing Postgres locally on this server (PostgreSQL ${floor}+ required)..."
+
+    if ! command -v apt-get &>/dev/null; then
+        fail "Same-server Postgres install currently supports Debian/Ubuntu only."
+        fail "On RHEL/CentOS/Rocky/Alma, install postgresql-server (${floor} or"
+        fail "newer) manually, then re-run this script and choose option 1"
+        fail "(external Postgres)."
+        exit 1
+    fi
+
+    # ── Which cluster are we going to use? ───────────────────────────────────
+    # The old code reused ANY running Postgres it found. That is how a host with
+    # the OS default 14 already installed ended up serving DHRUVA from 14. A
+    # cluster is only reusable if it MEETS THE FLOOR.
+    PG_PORT=""
+    local picked reuse_ver
+    picked=$(pg_pick_cluster "$floor")
+    if [ -n "$picked" ]; then
+        reuse_ver=${picked%% *}
+        PG_PORT=${picked##* }
+        info "Postgres ${reuse_ver} already installed and running on port ${PG_PORT} — reusing it."
+    elif command -v pg_lsclusters &>/dev/null && \
+         [ -n "$(pg_lsclusters -h 2>/dev/null)" ]; then
+        warn "This host already runs PostgreSQL, but no cluster meets the"
+        warn "required major ${floor}:"
+        pg_lsclusters 2>/dev/null | sed 's/^/    /'
+        warn "Existing clusters are left untouched; PostgreSQL ${floor} will be"
+        warn "installed alongside them and DHRUVA will use that one."
+    elif command -v psql &>/dev/null && sudo -u postgres pg_isready -q 2>/dev/null; then
+        # A running Postgres with no Debian cluster tooling (custom build,
+        # container image). Interrogate it directly rather than assuming.
+        local running_ver
+        running_ver=$(sudo -u postgres psql -tAc "SHOW server_version" 2>/dev/null | head -1)
+        case "$(pg_version_verdict "$running_ver")" in
+            meets)
+                PG_PORT=$(sudo -u postgres psql -tAc "SHOW port" 2>/dev/null | head -1)
+                info "Reusing the running PostgreSQL ${running_ver} instance on port ${PG_PORT}."
+                ;;
+            below)
+                fail "The PostgreSQL running on this host is ${running_ver}, below the"
+                fail "required major ${floor}, and this host has no Debian cluster"
+                fail "tooling (pg_lsclusters) for installing a second major safely."
+                fail "Upgrade it to ${floor}+ (see docs/POSTGRES-VERSION.md), or use an"
+                fail "external database: re-run and choose option 1."
+                exit 1
+                ;;
+            *)
+                # "unknown" — the module could not be run in ANY form. Note we
+                # only get here because pg_required_major already succeeded, so
+                # this should be unreachable; if it ever fires, something moved
+                # under us mid-run. Do NOT reuse an unverified server (that is
+                # how a client ended up on PostgreSQL 14) and do NOT claim it is
+                # below the floor either (that is finding F2). Say what could
+                # not be determined, and stop.
+                fail "Could not determine whether the PostgreSQL running on this"
+                fail "host (${running_ver:-version unreadable}) meets the required"
+                fail "major ${floor}: src/database/pg_version.py could not be run in"
+                fail "any form (.py, .pyc, or imported) with PYTHON=$PYTHON."
+                fail "Refusing to guess in either direction. Re-download the"
+                fail "release, or re-run and choose option 1 (external Postgres)."
+                exit 1
+                ;;
+        esac
+    fi
+
+    if [ -z "$PG_PORT" ]; then
+        install_pinned_postgres "$floor"
+        picked=$(pg_pick_cluster "$floor")
+        if [ -z "$picked" ]; then
+            fail "PostgreSQL ${floor} was installed but no online cluster at or"
+            fail "above major ${floor} could be found. Check 'pg_lsclusters'."
             exit 1
         fi
-        success "Postgres installed and running"
+        PG_PORT=${picked##* }
     fi
 
     ask "Postgres role name" PG_USER "dhruva"
@@ -282,26 +662,41 @@ install_local_postgres() {
     # WO-H12-followup: the app role MUST be NOSUPERUSER NOBYPASSRLS or Postgres
     # Row-Level Security (the WO-H12 tenant backstop) is silently bypassed. Set it
     # explicitly on both create and re-run rather than relying on the PG default.
-    if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${PG_USER}'" 2>/dev/null | grep -q 1; then
-        sudo -u postgres psql -c "ALTER USER ${PG_USER} WITH PASSWORD '${PG_PASS}' NOSUPERUSER NOBYPASSRLS;" >/dev/null
+    # WO-S18: the role statement carries the DB password, so it goes over
+    # STDIN, never in argv. `psql -c "...PASSWORD '$PG_PASS'..."` put the
+    # plaintext database password in the process table, readable via
+    # /proc/<pid>/cmdline and `ps` by any local user for the duration of the
+    # call — the same exposure class as WO-S16. (Note the statement still
+    # reaches the Postgres server log if log_statement is on; that is inherent
+    # to CREATE/ALTER USER and outside this script's control.)
+    # WO-H129: every psql call below is pinned to ${PG_PORT} — the port of the
+    # cluster we actually chose. Without it these run against the DEFAULT
+    # cluster, which on a host that already had an older major is the OLD one:
+    # the role and database would be created on 14 while we advertise 16.
+    if sudo -u postgres psql -p "$PG_PORT" -tAc "SELECT 1 FROM pg_roles WHERE rolname='${PG_USER}'" 2>/dev/null | grep -q 1; then
+        printf "ALTER USER %s WITH PASSWORD '%s' NOSUPERUSER NOBYPASSRLS;\n" \
+            "${PG_USER}" "${PG_PASS}" | sudo -u postgres psql -p "$PG_PORT" -q -v ON_ERROR_STOP=1 >/dev/null
         info "Role ${PG_USER} already existed — password updated, NOSUPERUSER NOBYPASSRLS enforced"
     else
-        sudo -u postgres psql -c "CREATE USER ${PG_USER} WITH PASSWORD '${PG_PASS}' NOSUPERUSER NOBYPASSRLS;" >/dev/null
+        printf "CREATE USER %s WITH PASSWORD '%s' NOSUPERUSER NOBYPASSRLS;\n" \
+            "${PG_USER}" "${PG_PASS}" | sudo -u postgres psql -p "$PG_PORT" -q -v ON_ERROR_STOP=1 >/dev/null
         success "Role ${PG_USER} created (NOSUPERUSER NOBYPASSRLS — RLS can take effect)"
     fi
 
-    if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" 2>/dev/null | grep -q 1; then
+    if sudo -u postgres psql -p "$PG_PORT" -tAc "SELECT 1 FROM pg_database WHERE datname='${PG_DB}'" 2>/dev/null | grep -q 1; then
         info "Database ${PG_DB} already exists"
     else
-        sudo -u postgres psql -c "CREATE DATABASE ${PG_DB} OWNER ${PG_USER};" >/dev/null
+        sudo -u postgres psql -p "$PG_PORT" -c "CREATE DATABASE ${PG_DB} OWNER ${PG_USER};" >/dev/null
         success "Database ${PG_DB} created (owner: ${PG_USER})"
     fi
 
     # URL-encode the password to make the DSN safe for libpq parsing
-    PG_PASS_ENC=$($PYTHON -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$PG_PASS")
-    DB_DSN="postgresql://${PG_USER}:${PG_PASS_ENC}@localhost:5432/${PG_DB}"
+    # WO-S18: pass the password through the ENVIRONMENT, not argv — the same
+    # process-table exposure as the psql calls above.
+    PG_PASS_ENC=$(PG_PASS="$PG_PASS" $PYTHON -c "import os, urllib.parse; print(urllib.parse.quote(os.environ['PG_PASS'], safe=''))")
+    DB_DSN="postgresql://${PG_USER}:${PG_PASS_ENC}@localhost:${PG_PORT}/${PG_DB}"
     update_env "DATABASE_URL" "$DB_DSN"
-    success "DATABASE_URL configured for local Postgres"
+    success "DATABASE_URL configured for local Postgres (port ${PG_PORT})"
 }
 
 # ─── Pre-flight ──────────────────────────────────────────────────────────────
@@ -406,15 +801,52 @@ DEPLOY_MODE="single"
 step 1 "Checking system prerequisites"
 
 # Python
+#
+# WO-H116: the MINIMUM SUPPORTED interpreter is 3.10 — Ubuntu 22.04's system
+# python3, which is what a source-tarball install actually runs. This check used
+# to warn "3.11+ recommended, may still work" on exactly that interpreter, so
+# the wizard a client runs told them their supported, production-grade Python
+# was second-best. It also compared the majors and minors independently
+# (`major >= 3 && minor >= 11`), which would reject a hypothetical Python 4.0.
+PYTHON_MIN_MAJOR=3
+PYTHON_MIN_MINOR=10
+# qa-audit L3: there is a CEILING as well as a floor, and it is not caution.
+# requirements.txt pins psycopg[binary]==3.2.4 and pydantic-core==2.27.2;
+# neither publishes a cp314 wheel, so on 3.14 step 2's
+# `pip install -r requirements.txt` FAILS outright rather than building from
+# source. Warning here costs the operator nothing; finding out at step 2 costs
+# them a half-finished install and an unreadable resolver error.
+PYTHON_MAX_MAJOR=3
+PYTHON_MAX_MINOR=13
+
+# Pure predicate: 0 (true) if <version-string> is inside the supported window.
+# Extracted so tests/test_python_floor_h116.py can execute the REAL comparison
+# rather than assert on the text of this file.
+python_version_supported() {
+    local maj min
+    maj=$(echo "$1" | cut -d. -f1)
+    min=$(echo "$1" | cut -d. -f2)
+    case "$maj$min" in *[!0-9]*|"") return 1 ;; esac
+    # Below the floor?
+    [ "$maj" -lt "$PYTHON_MIN_MAJOR" ] && return 1
+    [ "$maj" -eq "$PYTHON_MIN_MAJOR" ] && [ "$min" -lt "$PYTHON_MIN_MINOR" ] \
+        && return 1
+    # Above the ceiling?
+    [ "$maj" -gt "$PYTHON_MAX_MAJOR" ] && return 1
+    [ "$maj" -eq "$PYTHON_MAX_MAJOR" ] && [ "$min" -gt "$PYTHON_MAX_MINOR" ] \
+        && return 1
+    return 0
+}
+
+PYTHON_WINDOW="${PYTHON_MIN_MAJOR}.${PYTHON_MIN_MINOR} to ${PYTHON_MAX_MAJOR}.${PYTHON_MAX_MINOR}"
+
 if command -v python3 &>/dev/null; then
     PYTHON="${PYTHON:-python3}"
     py_version=$($PYTHON --version 2>&1 | awk '{print $2}')
-    py_major=$(echo "$py_version" | cut -d. -f1)
-    py_minor=$(echo "$py_version" | cut -d. -f2)
-    if [ "$py_major" -ge 3 ] && [ "$py_minor" -ge 11 ]; then
+    if python_version_supported "$py_version"; then
         success "Python $py_version found"
     else
-        warn "Python $py_version found (3.11+ recommended, may still work)"
+        warn "Python $py_version found (DHRUVA supports Python ${PYTHON_WINDOW}; outside that window the pinned dependencies may not install)"
     fi
 else
     fail "Python 3 not found. Install with: sudo apt install python3 python3-venv python3-pip"
@@ -424,7 +856,10 @@ fi
 # pip / venv
 if ! $PYTHON -m venv --help &>/dev/null; then
     warn "python3-venv not installed. Installing..."
-    sudo apt-get update && sudo apt-get install -y python3-venv
+    # apt_update, not a bare `apt-get update`: same L2 reasoning as the
+    # Postgres step — under `set -e` one broken apt source aborts the installer
+    # here with only apt's own output to explain it.
+    apt_update && sudo apt-get install -y python3-venv
     success "python3-venv installed"
 fi
 
@@ -536,14 +971,30 @@ echo "     server is destroyed, your DHRUVA data survives."
 echo "     See docs/DEPLOYMENT-SPLIT-HOST.md for the recommended topology."
 echo ""
 echo -e "  ${CYAN}2) Install Postgres on THIS SERVER${NC}  (single-box, convenient)"
-echo "     The script installs postgresql via apt, creates the role and"
-echo "     database, and wires DATABASE_URL automatically."
+echo "     The script installs a PINNED postgresql-<major> via apt, creates"
+echo "     the role and database, and wires DATABASE_URL automatically."
 echo ""
+
+# WO-H129: resolve the floor ONCE, as its own statement so `set -e` aborts if
+# pg_required_major fails (its `exit 1` only leaves the subshell). Its
+# diagnostics survive this substitution because fail() writes to stderr — the
+# first cut of this wrote them to stdout, where they were captured into
+# PG_FLOOR and discarded, and a compiled client package aborted here in total
+# silence. Reached AFTER .env exists, so silence is the worst possible failure:
+# the operator is left with a half-configured box and no idea why.
+PG_FLOOR=$(pg_required_major)
 
 ask "Enter 1 or 2" PG_CHOICE "1"
 
 case "$PG_CHOICE" in
     1)
+        echo ""
+        echo -e "  ${CYAN}ℹ${NC}  DHRUVA requires PostgreSQL ${PG_FLOOR} or newer."
+        echo "     Below that, migration 0018 cannot backfill agent_decisions.host"
+        echo "     (it needs pg_input_is_valid, PostgreSQL 16+) and host correlation"
+        echo "     over your decision history is silently incomplete. The platform"
+        echo "     enforces this at startup — see docs/POSTGRES-VERSION.md."
+        echo ""
         ask "Postgres DSN (libpq URI)" DB_DSN \
             "postgresql://dhruva:CHANGE_ME@db-host.internal:5432/dhruva"
         if [[ ! "$DB_DSN" =~ ^postgres(ql)?:// ]]; then
@@ -594,6 +1045,43 @@ if [[ -x "$VENV_DIR/bin/python" ]] && \
             "import psycopg; psycopg.connect('$DB_DSN', connect_timeout=5).close()" \
             2>/dev/null; then
             success "Postgres reachable"
+            # WO-H129: reachable is not the same as supported. Ask the server
+            # what it is while we have a connection — this is the ONLY check an
+            # external/managed database gets before the platform boots.
+            REMOTE_PG_VER=$("$VENV_DIR/bin/python" -c \
+                "import psycopg
+with psycopg.connect('$DB_DSN', connect_timeout=5) as c:
+    print(c.execute(\"SHOW server_version\").fetchone()[0])" 2>/dev/null | head -1)
+            if [ -n "$REMOTE_PG_VER" ]; then
+                case "$(pg_version_verdict "$REMOTE_PG_VER")" in
+                    meets)
+                        success "Postgres ${REMOTE_PG_VER} meets the required major ${PG_FLOOR}"
+                        ;;
+                    below)
+                        warn "Postgres ${REMOTE_PG_VER} is BELOW the required major ${PG_FLOOR}."
+                        warn "On this server migration 0018 cannot backfill"
+                        warn "agent_decisions.host, so decision history loses host"
+                        warn "correlation with nothing downstream saying so."
+                        warn "DHRUVA will REFUSE TO START against an empty database on"
+                        warn "this version. Upgrade the server, or point DATABASE_URL"
+                        warn "at a PostgreSQL ${PG_FLOOR}+ instance."
+                        warn "See docs/POSTGRES-VERSION.md."
+                        ;;
+                    *)
+                        # "unknown". This is a PRE-FLIGHT, not the gate: the
+                        # platform itself enforces the floor at boot. So warn
+                        # and continue rather than exiting — but never print the
+                        # BELOW text, which is what the old single-path form did
+                        # to a perfectly supported managed database (F2).
+                        warn "Could not verify whether Postgres ${REMOTE_PG_VER} meets"
+                        warn "the required major ${PG_FLOOR}: src/database/pg_version.py"
+                        warn "could not be run in any form with PYTHON=$PYTHON."
+                        warn "NOT treating that as a failure — this is a pre-flight,"
+                        warn "and the platform enforces the floor itself at startup."
+                        warn "See docs/POSTGRES-VERSION.md."
+                        ;;
+                esac
+            fi
         else
             warn "Postgres unreachable at the given DSN. The schema apply step"
             warn "(later in this script) will retry — fix DATABASE_URL or PG"
@@ -881,6 +1369,15 @@ ensure_secret "JWT_SECRET" '$PYTHON -c "import secrets; print(secrets.token_hex(
 # with --rotate-salt. See docs/KEY-ROTATION.md.
 ensure_secret "ANONYMIZATION_SALT" '$PYTHON -c "import secrets; print(secrets.token_hex(32))"' "anonymization salt"
 
+# Tenant master encryption key — needed in EVERY mode, not just multi-tenant
+# (WO-H75). A single-tenant install still writes an encrypted tenant row on
+# first boot (main.py::_seed_default_tenant) and whenever the Admin tab edits
+# the tenant config. Without a persisted key those writes now fail closed
+# instead of being stored under a process-local key nothing can decrypt after
+# a restart. Generate only if absent; rotate deliberately with
+# --rotate-tenant-key (or, safely, tools/rotate_tenant_key.py).
+ensure_secret "TENANT_ENCRYPTION_KEY" '$PYTHON -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"' "tenant encryption key"
+
 if [ "$DEPLOY_MODE" = "multi" ]; then
     update_env "SOC_ADMIN_ROLE" "mssp_admin"
     success "Master admin account configured (role: mssp_admin)"
@@ -901,7 +1398,9 @@ if [ "$DEPLOY_MODE" = "multi" ]; then
     # makes ALL existing tenant configs undecryptable, so a re-run must PRESERVE
     # it. Rotate safely with tools/rotate_tenant_key.py (docs/KEY-ROTATION.md);
     # --rotate-tenant-key here is a destructive last resort.
-    ensure_secret "TENANT_ENCRYPTION_KEY" '$PYTHON -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"' "tenant encryption key"
+    # (WO-H75: the generate/preserve call now runs for EVERY mode in step 7
+    # above — this branch keeps the multi-tenant explanation and backup
+    # warning, where the blast radius is every client at once.)
     warn "Back up your .env file securely — if this key is lost, client configs cannot be decrypted."
     echo ""
 
@@ -1220,6 +1719,7 @@ case "$TICKET_CHOICE" in
 
         update_env "JIRA_EMAIL" "$JIRA_EMAIL_VAL"
         update_env "JIRA_API_TOKEN" "$JIRA_TOKEN"
+        ensure_webhook_secret "JIRA_WEBHOOK_SECRET"
         sed -i "s|provider: \"\".*# \"jira\"|provider: \"jira\"     # \"jira\"|" "$CONFIG_FILE"
         sed -i "s|base_url: \"\".*# e.g.|base_url: \"${JIRA_URL}\"   # e.g.|" "$CONFIG_FILE"
         sed -i "s|project_key: \"SOC\"|project_key: \"${JIRA_PROJECT}\"|" "$CONFIG_FILE"
@@ -1236,6 +1736,7 @@ case "$TICKET_CHOICE" in
 
         update_env "SERVICENOW_USER" "$SNOW_USER"
         update_env "SERVICENOW_PASSWORD" "$SNOW_PASS"
+        ensure_webhook_secret "SERVICENOW_WEBHOOK_SECRET"
         sed -i "s|provider: \"\".*# \"jira\"|provider: \"servicenow\" # \"jira\"|" "$CONFIG_FILE"
         sed -i "s|instance_url: \"\".*# e.g.|instance_url: \"${SNOW_URL}\" # e.g.|" "$CONFIG_FILE"
         if [ -n "$SNOW_GROUP" ]; then
@@ -1252,6 +1753,7 @@ case "$TICKET_CHOICE" in
 
         update_env "PAGERDUTY_ROUTING_KEY" "$PD_ROUTING"
         update_env "PAGERDUTY_API_TOKEN" "$PD_TOKEN"
+        ensure_webhook_secret "PAGERDUTY_WEBHOOK_SECRET"
         sed -i "s|provider: \"\".*# \"jira\"|provider: \"pagerduty\" # \"jira\"|" "$CONFIG_FILE"
         if [ -n "$PD_SVC" ]; then
             sed -i "s|service_id: \"\"|service_id: \"${PD_SVC}\"|" "$CONFIG_FILE"

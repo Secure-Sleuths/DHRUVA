@@ -17,6 +17,25 @@ if [ -z "$ANONYMIZATION_SALT" ]; then
     echo "[entrypoint] Generated ephemeral ANONYMIZATION_SALT (set ANONYMIZATION_SALT in .env for persistence)"
 fi
 
+# Tenant config master key. Unlike JWT_SECRET/ANONYMIZATION_SALT this one may
+# NOT be ephemeral: tenant configs are written encrypted to Postgres on first
+# boot and from the Admin tab, and a per-container key makes those rows
+# permanently undecryptable (the platform now refuses such writes outright —
+# WO-H75). So generate it ONCE into the persistent data volume (same pattern
+# as the self-signed dashboard cert below) and reuse it on every boot.
+if [ -z "$TENANT_ENCRYPTION_KEY" ]; then
+    TENANT_KEY_FILE=/var/lib/ai-soc/tenant_encryption.key
+    mkdir -p /var/lib/ai-soc
+    if [ ! -s "$TENANT_KEY_FILE" ]; then
+        (umask 077 && python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" > "$TENANT_KEY_FILE")
+        chmod 600 "$TENANT_KEY_FILE"
+        echo "[entrypoint] Generated TENANT_ENCRYPTION_KEY into $TENANT_KEY_FILE (soc-data volume)."
+        echo "[entrypoint]   BACK IT UP — losing this file makes every stored tenant config"
+        echo "[entrypoint]   undecryptable. Set TENANT_ENCRYPTION_KEY in .env to manage it yourself."
+    fi
+    export TENANT_ENCRYPTION_KEY="$(cat "$TENANT_KEY_FILE")"
+fi
+
 # Default build profile to auto so Community mode is selected automatically
 # when no license file is present.
 if [ -z "$DHRUVA_BUILD_PROFILE" ]; then

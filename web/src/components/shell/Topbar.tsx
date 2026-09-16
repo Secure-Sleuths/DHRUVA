@@ -1,6 +1,7 @@
 "use client";
 
-import { Building2, EyeOff, LogOut, Sparkles } from "lucide-react";
+import { useState } from "react";
+import { Building2, EyeOff, KeyRound, LogOut, Sparkles } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { clearToken } from "@/lib/token";
 import { cn, focusRing } from "@/lib/ui";
@@ -8,6 +9,7 @@ import { Chip } from "@/components";
 import type { LicenseTierInfo, Role } from "@/lib/types";
 import { showUpgradeAffordance } from "@/lib/rbac";
 import { DevSwitcher } from "./DevSwitcher";
+import { ChangePasswordDialog } from "./ChangePasswordDialog";
 
 /**
  * Topbar — the mockup's `<header>`.
@@ -56,6 +58,7 @@ export function Topbar({
   const upgrade = showUpgradeAffordance(tier);
   const upgradeUrl = tier?.upgrade_url ?? "https://securesleuths.in/pricing";
   const router = useRouter();
+  const [pwOpen, setPwOpen] = useState(false);
   const onLogout = () => {
     clearToken();
     router.replace("/login");
@@ -135,6 +138,26 @@ export function Topbar({
             )}
           </div>
         </div>
+        {/*
+          Self-service "Change password" (WO-H58) — available to EVERY
+          authenticated role (the account menu, not the admin tab). It only
+          appears with a real session because it needs the caller's live token;
+          in dev-preview (no token) there is nothing to change.
+        */}
+        {authenticated && (
+          <button
+            type="button"
+            onClick={() => setPwOpen(true)}
+            aria-label="Change password"
+            title="Change password"
+            className={cn(
+              "ml-1 flex h-[26px] w-[26px] items-center justify-center rounded-md text-dim hover:bg-hover hover:text-ink",
+              focusRing,
+            )}
+          >
+            <KeyRound className="h-[15px] w-[15px]" />
+          </button>
+        )}
         {authenticated && (
           <button
             type="button"
@@ -142,7 +165,7 @@ export function Topbar({
             aria-label="Sign out"
             title="Sign out"
             className={cn(
-              "ml-1 flex h-[26px] w-[26px] items-center justify-center rounded-md text-dim hover:bg-hover hover:text-ink",
+              "flex h-[26px] w-[26px] items-center justify-center rounded-md text-dim hover:bg-hover hover:text-ink",
               focusRing,
             )}
           >
@@ -150,6 +173,14 @@ export function Topbar({
           </button>
         )}
       </div>
+
+      {authenticated && (
+        <ChangePasswordDialog
+          open={pwOpen}
+          onClose={() => setPwOpen(false)}
+          onSignOut={onLogout}
+        />
+      )}
     </header>
   );
 }

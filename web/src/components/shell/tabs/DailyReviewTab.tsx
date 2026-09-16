@@ -75,6 +75,10 @@ import { roleAtLeast } from "@/lib/rbac";
 import { apiSeverity, parseJsonArray, sortIncidentsWorstFirst } from "@/lib/incident";
 import { isLowGrounding } from "@/lib/grounding";
 import { riskSeverity, type Severity } from "@/lib/severity";
+import {
+  decisionRiskBreakdown,
+  scorePresentation,
+} from "@/lib/incident";
 import { decisionPresentation } from "@/lib/triage";
 import { DASH, fmtInt, fmtDateTime } from "@/lib/format";
 import type { TabProps } from "../tabRegistry";
@@ -909,7 +913,14 @@ function OvernightDecisions({
         <Table className="mt-2">
           <THead>
             <TR>
-              <TH>Concern level</TH>
+              {/* WO-H97 QA (D7): this column used to read "Concern level" and
+                  was computed from the risk score alone, so a public crawler
+                  getting a 404 was reported to a non-technical reader as
+                  "Needs urgent attention". Under the bounded scorer that number
+                  is the RULE's track record. Rows that record one now say so;
+                  rows that do not keep the old wording rather than claim a
+                  precision the record cannot support. */}
+              <TH>How reliable this rule is</TH>
               <TH>What the AI concluded</TH>
               <TH>Machine</TH>
               <TH>When</TH>
@@ -922,10 +933,18 @@ function OvernightDecisions({
                 llm_failed: d.llm_failed,
               });
               const plain = plainSeverity(riskSeverity(d.risk_score));
+              const score = scorePresentation(
+                d.risk_score,
+                decisionRiskBreakdown(d),
+              );
               return (
                 <TR key={d.id}>
                   <TD>
-                    <span className="text-meta text-dim">{plain.label}</span>
+                    <span className="text-meta text-dim" title={score.caption}>
+                      {score.tinted
+                        ? plain.label
+                        : `${score.label}: ${score.figure}`}
+                    </span>
                   </TD>
                   <TD>
                     <span className={`text-meta font-semibold ${vp.className}`}>

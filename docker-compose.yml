@@ -93,6 +93,14 @@ services:
     volumes:
       # User-editable configuration (survives upgrades)
       - ./config/config.yaml:/opt/ai-soc/config/config.yaml:ro
+      # READ-ONLY on purpose: guidance/governance YAMLs are institutional
+      # knowledge edited on the HOST, and the container has no business
+      # rewriting them. Consequence (WO-H79): the in-app Shift schedule editor
+      # (Admin -> Shift schedule) cannot save here — it reports the mount and
+      # refuses (503) rather than failing obscurely. To author the rota from
+      # the UI, drop `:ro` from THIS line and restart; every guidance file then
+      # becomes writable by the container, so it is a deliberate trade-off, not
+      # a default we make for you.
       - ./config/guidance:/opt/ai-soc/config/guidance:ro
       # Persistent data (baselines, local IOCs, certs)
       - soc-data:/var/lib/ai-soc

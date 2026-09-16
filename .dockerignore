@@ -26,3 +26,77 @@ web/node_modules/
 web/.next/
 web/out/
 web/*-screenshot.png
+
+# ── WO-H132: parity with .gitignore ──────────────────────────────────────────
+# The Docker build context is governed by THIS file and nothing else. `docker
+# build` has never read .gitignore, so every pattern that lives only there is a
+# path an ignored local file can take into the image — and `COPY src/ src/`,
+# `COPY config/ config/` and stage 0's `COPY web/ ./` all copy directories.
+#
+# Measured: web/src/app/shotharness is git-ignored, was NOT listed here, and the
+# Next stage compiled its pages into out/_next/static/chunks/app/shotharness/
+# — carrying a live client's hostname into the image.
+#
+# tests/test_publish_tracked_files_only_h132.py asserts this parity, so a new
+# .gitignore entry fails the suite until it is mirrored here. Keep the two in
+# step; this file is the one Docker actually obeys.
+# Note the `**/` prefixes. A bare `foo/` in .dockerignore matches ONLY the
+# context root, where the same line in .gitignore matches at every depth — so
+# the existing `__pycache__/`, `*.db` and `.DS_Store` lines above never
+# excluded src/agents/__pycache__ or config/x.db at all. The `**/` forms below
+# give the two files the same reach.
+**/__pycache__/
+# NOT `**/*.pyc`: the Cython client tarball ships .pyc WITHOUT the .py, and it
+# ships this file, so a client running `docker compose build` from that tarball
+# would build an image with an empty src/. __pycache__/ covers the local-junk
+# case; a loose .pyc next to its .py only exists in a packaged tree.
+**/*.pyo
+**/*.db
+**/*.sqlite
+**/*.pem
+**/.DS_Store
+**/venv/
+**/node_modules/
+**/.pytest_cache/
+**/.pytest_run.log
+**/.coverage
+**/.coverage.*
+**/htmlcov/
+**/coverage.xml
+**/*.tsbuildinfo
+**/*.spec.bak
+**/dist/
+**/build/
+**/site/
+**/keys/
+**/license.key
+# .env at ANY depth, not just the context root. config/.env is the realistic
+# one: a client's credentials pasted in during a support call. The template is
+# re-included after, because the image ships it.
+**/.env
+**/.env.*
+!**/.env.template
+# The SPA export. Git-ignored (built at release time) and the image must use
+# stage 0's FRESH export, which arrives as `COPY --from=web`. Sending a stale
+# local export in the context meant `COPY src/ src/` laid it down first and the
+# fresh one merged on top, leaving orphaned chunks from an older build.
+src/api/static/app/
+tools/license-manager/ledger.json
+tools/license-manager/licenses/
+tools/license-manager/*.key
+sales/*.pptx
+sales/*.pdf
+# web/ (the Next stage's context). shotharness is the one that actually leaked.
+web/src/app/shotharness/
+**/.pnp
+**/.pnp.js
+**/next-env.d.ts
+**/*-screenshot.png
+**/npm-debug.log*
+**/yarn-debug.log*
+**/yarn-error.log*
+**/test-results/
+**/playwright-report/
+**/playwright/.cache/
+**/.env*.local
+web/scripts/shot*.mjs

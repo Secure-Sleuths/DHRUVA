@@ -123,3 +123,65 @@ composite_risk_formula: |
   # 70-89:  HIGH     - Agent triage with human verification
   # 40-69:  MEDIUM   - Agent triage, auto-close if high confidence
   # 0-39:   LOW      - Agent auto-triage, batch review
+
+
+# =============================================================================
+# scoring — how a rule's track record becomes a number (WO-H71, WO-H115)
+# -----------------------------------------------------------------------------
+# THE COLD-START PROBLEM, WHICH EVERY NEW DEPLOYMENT HAS
+#
+# The risk score asks one question: how often has a PERSON agreed this rule
+# fired correctly? On day one nobody has agreed anything, so every rule is
+# unlearned, every alert takes `unknown_rule_tp_rate`, and the whole queue sits
+# in `high`. That is deliberate — see the long comment in
+# src/enrichment/service.py::_compute_risk_score_bounded. "Unknown" resolves
+# UPWARD, because a real intrusion scoring its way out of the queue on a fresh
+# install costs far more than an extra review.
+#
+# The way out is for analysts to label alerts, and the rule goes quiet on its
+# own. The trap is the shortcut: letting the platform label its own backlog to
+# make the noise stop. Do that and the machine's opinion becomes
+# indistinguishable from a person's — it can make a rule QUIET with exactly the
+# authority of an analyst who looked at it.
+#
+# So machine review is supported, and bounded:
+#   * name the machine identities in `machine_reviewers`;
+#   * their labels count at `machine_label_weight` each;
+#   * and no matter how many there are, they are worth at most
+#     `machine_label_cap` observations in total — because 5,000 machine labels
+#     are one model's opinion repeated, not 5,000 independent judgements;
+#   * and they NEVER make a score `confident`. Confidence stays human-only, so
+#     the case view keeps saying "no track record for this rule yet" until a
+#     person has actually looked.
+#
+# `machine_reviewers` is EMPTY by default. A deployment that has never used
+# machine review scores exactly as it did before this block existed.
+# =============================================================================
+scoring:
+  # Estate-wide prior for how often a rule fires correctly. Used to smooth a
+  # rule with few labels toward the middle rather than letting 1/1 read as 100%.
+  base_tp_rate: 0.5
+
+  # What an UNLEARNED rule scores. 0.75 -> a score of exactly 75.00, which the
+  # severity ladder places in `high` (escalated, 60-minute SLA, shown as "no
+  # track record yet") and NOT in `critical`.
+  #
+  # ⚠ If you change this, re-read src/incidents/severity.py first. A band
+  # boundary must never sit on the score the model emits when it knows nothing
+  # — that collision made every unlearned alert a critical incident once
+  # already.
+  unknown_rule_tp_rate: 0.75
+
+  # How many labels FROM PEOPLE a rule needs before its own record is trusted.
+  min_human_labels: 3
+
+  # Identities that are not people: the platform's own reviewer account, any
+  # bulk-import or backfill account, any integration that writes verdicts.
+  # Per client. Example:
+  #   machine_reviewers: ["dhruva-ai-analyst", "servicenow-sync"]
+  machine_reviewers: []
+
+  # Each machine label is worth this much of a human one...
+  machine_label_weight: 0.25
+  # ...and all of them together are worth at most this many observations.
+  machine_label_cap: 10

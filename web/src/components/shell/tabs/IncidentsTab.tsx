@@ -64,7 +64,9 @@ import { DASH, fmtDateTime } from "@/lib/format";
 import { SEVERITY, riskSeverity, severityLabel } from "@/lib/severity";
 import {
   apiSeverity,
+  decisionRiskBreakdown,
   parseJsonArray,
+  scorePresentation,
   sortIncidentsWorstFirst,
 } from "@/lib/incident";
 import { cn, focusRing } from "@/lib/ui";
@@ -605,8 +607,14 @@ function CaseBody({
   const alerts = [...(detail.alerts ?? [])].sort(
     (a, b) => (b.risk_score ?? 0) - (a.risk_score ?? 0),
   );
-  // The incident risk = the worst member alert's risk (the campaign's driver).
-  const incidentRisk = alerts.length ? Math.round(alerts[0].risk_score) : null;
+  // The incident's headline number = the worst member alert's score (the
+  // campaign's driver), labelled by what that score actually measures.
+  const incidentScore = alerts.length
+    ? scorePresentation(
+        alerts[0].risk_score,
+        decisionRiskBreakdown(alerts[0]),
+      )
+    : null;
 
   return (
     <>
@@ -634,18 +642,28 @@ function CaseBody({
           </Chip>
         )}
         <span className="flex-1" />
-        {incidentRisk !== null && (
-          <div className="text-right">
+        {incidentScore !== null && (
+          /* WO-H97 QA (D7): this number used to be painted on the severity ramp
+             right next to `sev` — the incident's AUTHORITATIVE stored severity,
+             which the backend computes from the risk band plus the guidance
+             floors and ceilings. A capped incident therefore showed a MEDIUM
+             badge beside a critical-red 99 labelled "Risk": the exact display
+             this work order was filed about, sitting next to its own
+             correction. The severity badge is the danger judgement; this is the
+             rule's track record, and it says so. */
+          <div className="text-right" title={incidentScore.caption}>
             <div className="text-micro uppercase tracking-wide text-dim2">
-              Risk
+              {incidentScore.label}
             </div>
             <div
               className={cn(
                 "font-mono text-[22px] font-extrabold tabular",
-                SEVERITY[riskSeverity(incidentRisk)].textClass,
+                incidentScore.tinted
+                  ? SEVERITY[riskSeverity(alerts[0].risk_score)].textClass
+                  : "text-ink",
               )}
             >
-              {incidentRisk}
+              {incidentScore.figure}
             </div>
           </div>
         )}
@@ -667,6 +685,21 @@ function CaseBody({
         {alerts.length} correlated alert{alerts.length === 1 ? "" : "s"} ·
         kill-chain-ordered{detail.summary ? ` · ${detail.summary}` : ""}
       </div>
+
+      {/* WO-H85 — why the incident is in its current state. `status_reason` has
+          been written on every status change since WO-B3 and reached no
+          component, so the next shift could not see why anything was closed.
+          The full history of prior reasons is in the Timeline sub-view. */}
+      {detail.status_reason && (
+        <div className="mb-3 rounded-lg border border-line bg-panel2 px-3 py-2">
+          <div className="text-micro uppercase tracking-wide text-dim2">
+            Why it is {humanStatus(detail.status).toLowerCase()}
+          </div>
+          <div className="mt-0.5 text-data leading-relaxed text-ink">
+            {detail.status_reason}
+          </div>
+        </div>
+      )}
 
       {/* tactic tiles */}
       {tactics.length > 0 && (

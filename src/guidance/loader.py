@@ -47,6 +47,9 @@ def _decrypt_guidance(enc_path: Path) -> dict:
     return json.loads(plaintext)
 
 
+from src.guidance.rule_guidance import RuleGuidance
+
+
 class GuidanceLoader:
     """
     Loads guidance documents (playbooks, risk criteria, escalation logic)
@@ -59,11 +62,17 @@ class GuidanceLoader:
         self.risk_criteria_file = guidance_cfg.get("risk_criteria", "risk_criteria.yaml")
         self.escalation_file = guidance_cfg.get("escalation_logic", "escalation_logic.yaml")
         self.playbooks_dir = guidance_cfg.get("playbooks_dir", "playbooks")
+        # WO-H111: per-rule triage guidance. Optional — the platform ran
+        # without it for its whole life and must behave identically when
+        # the file is absent.
+        self.rule_guidance_file = guidance_cfg.get(
+            "rule_guidance", "rule_guidance.yaml")
 
         self._cache = TTLCache(maxsize=50, ttl=300)  # 5-min cache
         self._playbooks: dict = {}
         self._risk_criteria: dict = {}
         self._escalation_logic: dict = {}
+        self._rule_guidance = None
 
         self._load_all()
 
@@ -72,11 +81,31 @@ class GuidanceLoader:
         self._load_risk_criteria()
         self._load_escalation_logic()
         self._load_playbooks()
+        self._load_rule_guidance()
         self._compute_guidance_hashes()
         logger.info("guidance_loaded",
                      playbooks=len(self._playbooks),
                      risk_criteria=bool(self._risk_criteria),
-                     escalation_logic=bool(self._escalation_logic))
+                     escalation_logic=bool(self._escalation_logic),
+                     rule_guidance_state=getattr(
+                         self._rule_guidance, "state", "absent"),
+                     rule_guidance_rules=len(
+                         getattr(self._rule_guidance, "rules", {}) or {}))
+
+    def _load_rule_guidance(self):
+        """WO-H111. Never raises: guidance must not be able to stop startup.
+
+        NOTE the state is carried, not flattened. ``RuleGuidance`` distinguishes
+        ``absent`` from ``failed`` precisely because ``_load_yaml`` above does
+        NOT — it returns ``{}`` for both — and for per-rule guidance those two
+        cannot mean the same thing.
+        """
+        try:
+            self._rule_guidance = RuleGuidance(
+                self.base_path / self.rule_guidance_file)
+        except Exception as e:                                  # noqa: BLE001
+            logger.error("rule_guidance_init_failed", error=str(e)[:200])
+            self._rule_guidance = None
 
     def _load_yaml(self, path: Path, required: bool = False) -> dict:
         """Load a guidance file. Tries encrypted (.enc) first, then plaintext YAML.
@@ -200,8 +229,14 @@ class GuidanceLoader:
             for pb_file in sorted(pb_dir.glob("*.yaml")):
                 try:
                     combined += pb_file.read_bytes()
-                except Exception:
-                    pass
+                except Exception as e:                   # noqa: BLE001
+                    # WO-H90: was a bare `except: pass`. A failure here silently
+                    # EXCLUDES a playbook from the guidance hash, so the decision
+                    # audit trail reports "guidance unchanged" while a playbook
+                    # the agents rely on is actually missing or unreadable.
+                    # Bounded loop (one pass over the playbook dir per load).
+                    logger.warning("guidance_playbook_hash_read_failed",
+                                   playbook=pb_file.name, error=str(e)[:200])
             if combined:
                 self._guidance_hashes["playbooks"] = hashlib.sha256(combined).hexdigest()[:16]
 
@@ -219,6 +254,11 @@ class GuidanceLoader:
         self._load_all()
 
     # ----- Formatted Output for Prompts -----
+
+    def get_rule_guidance(self):
+        """The per-rule guidance object, or ``None`` if it could not be
+        constructed at all. Callers must check ``.state`` — see WO-H111."""
+        return self._rule_guidance
 
     def get_risk_criteria(self) -> dict:
         """Get raw risk criteria dict."""
@@ -264,6 +304,17 @@ class GuidanceLoader:
         text = "\n".join(lines)
         self._cache[cache_key] = text
         return text
+
+    def get_severity_policy(self) -> dict:
+        """WO-H97: the raw ``severity_policy`` block (floors + ceilings).
+
+        Returned unparsed — ``src/incidents/severity.py::SeverityPolicy`` owns
+        the validation, so a malformed entry is rejected in ONE place and is
+        logged there. Returns ``{}`` when the block is absent, which the policy
+        treats as "pure risk bands, no floors or ceilings".
+        """
+        block = (self._escalation_logic or {}).get("severity_policy")
+        return block if isinstance(block, dict) else {}
 
     def get_escalation_logic_text(self) -> str:
         """Format escalation logic for inclusion in agent prompts."""

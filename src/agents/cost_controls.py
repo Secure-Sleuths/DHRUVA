@@ -47,12 +47,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import structlog
+
+# Single source of truth for "hard evidence forbids an automated dismissal".
+# verdict_guard imports nothing from this module, so there is no cycle.
+from src.agents.verdict_guard import (
+    blocking_evidence,
+    degraded_evidence_sources,
+    evidence_unavailable,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -356,6 +365,28 @@ class AlertDeduplicator:
             return ""
         return str(value).strip().lower()
 
+    # WO-H66 — volatile tokens stripped from full_log before fingerprinting.
+    # Kept narrow ON PURPOSE: each pattern matches something that cannot carry
+    # detection meaning. See _event_discriminator for the measurements and for
+    # why bare integers are deliberately NOT included.
+    _SYSLOG_TS_RE = re.compile(
+        r'^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+')      # "Aug 04 14:38:15 "
+    _ISO_TS_RE = re.compile(
+        r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\s+')
+    _BRACKET_PID_RE = re.compile(r'\[\d+\]')                        # "sshd[1466859]"
+
+    @classmethod
+    def _normalize_event_text(cls, text: str) -> str:
+        """Strip clock and PID from a raw log line (WO-H66).
+
+        Only the LEADING timestamp is removed — a timestamp appearing mid-line
+        may be content (e.g. a filename or a quoted log excerpt) and is left
+        alone.
+        """
+        out = cls._SYSLOG_TS_RE.sub("", text)
+        out = cls._ISO_TS_RE.sub("", out)
+        return cls._BRACKET_PID_RE.sub("[PID]", out)
+
     @classmethod
     def _event_discriminator(cls, alert: dict) -> str:
         """Stable short hash of the salient RAW event content (WO-H29 NEW-4).
@@ -374,11 +405,38 @@ class AlertDeduplicator:
         Deliberately hashes ONLY the raw event (never ``enrichment``, which can
         vary run-to-run and would break legitimate retry dedup). Empty/absent
         body → '' so the fingerprint degrades to the pre-H29 key (no behaviour
-        change for events carrying neither field)."""
+        change for events carrying neither field).
+
+        WO-H66: ``full_log`` is normalised for VOLATILE tokens before hashing —
+        the leading syslog timestamp and the bracketed PID. Without this the
+        discriminator was so strict that nothing ever repeated: measured on the
+        live install, 53 alerts for rule 100013 produced 53 distinct
+        fingerprints while sharing a SINGLE rule+entity key, because the lines
+        differ only by clock and PID::
+
+            Aug 04 14:38:15 host-01 sshd[1466859]: pam_unix(sshd:session): session opened for user root
+            Aug 04 14:17:44 host-01 sshd[1463214]: pam_unix(sshd:session): session opened for user root
+
+        The persistent decision cache therefore held ONE entry and ZERO hits
+        after 1,497 LLM calls. Over a 500-alert sample this normalisation takes
+        496 distinct fingerprints down to 232 — 53% of triage LLM calls avoided
+        — while rules whose events genuinely differ (100702, 510) still do not
+        collapse at all, which is the check that it is not over-merging.
+
+        A timestamp and a PID can never be what distinguishes a threat, so
+        removing them costs no detection fidelity.
+
+        DELIBERATELY NOT normalised: bare long integers. Stripping those merges
+        commands that differ only in a numeric ARGUMENT — measured on rule 5402,
+        it collapsed ``grep -q 'rule id="100501"'`` with ``…"100502"`` and
+        ``…"100730"`` into one event. Generalised, that is ``kill -9 <pid>`` or
+        a command targeting one port versus another. It bought 2 further calls
+        out of 500 (0.4%, about $0.38) — not a trade worth making against the
+        ability to tell two commands apart."""
         parts = []
         full_log = alert.get("full_log")
         if full_log:
-            parts.append(str(full_log))
+            parts.append(cls._normalize_event_text(str(full_log)))
         data = alert.get("data")
         if isinstance(data, dict) and data:
             try:
@@ -427,8 +485,19 @@ class AlertDeduplicator:
                 return None
             return rep
 
-    def register(self, tenant_id: str, fingerprint: str, decision) -> None:
-        """Record ``decision`` as the representative for its fingerprint."""
+    def register(self, tenant_id: str, fingerprint: str, decision,
+                 evidence_degraded: bool = False) -> None:
+        """Record ``decision`` as the representative for its fingerprint.
+
+        ``evidence_degraded`` records whether the evidence enrichers were
+        UNAVAILABLE when this verdict was formed. A representative judged with
+        full evidence must not be replayed onto a duplicate arriving during an
+        outage: the indicator may have appeared on a feed since, and we cannot
+        currently check. That is the same reasoning that blocks the durable
+        cache under degradation — the only reason in-memory dedup stays enabled
+        at all is that duplicates arriving DURING an outage are equally unknown
+        to each other, which is not true of one registered before it began.
+        """
         snapshot = {
             "alert_id": decision.alert_id,
             "verdict": decision.verdict,
@@ -439,6 +508,7 @@ class AlertDeduplicator:
             "escalated": decision.escalated,
             "grounding": getattr(decision, "grounding", None),
             "fingerprint": fingerprint,
+            "evidence_degraded": bool(evidence_degraded),
         }
         with self._lock:
             self._seen[(tenant_id, fingerprint)] = (time.monotonic(), snapshot)
@@ -580,9 +650,29 @@ class NoisePreFilter:
         enrichment = enrichment or {}
         # Hard safety guards — any positive signal disqualifies dismissal.
         # These apply to EVERY path below, including the category skip.
-        if enrichment.get("threat_intel_hits", 0):
+        #
+        # The evidence conditions come from the deterministic verdict guard so
+        # this path and the LLM path enforce ONE policy. Previously they were
+        # duplicated here by hand and had already drifted: the guard forbids
+        # dismissing a tier_1_critical asset, and this filter did not check
+        # asset tier at all, so a tier-1 alert could be auto-closed here without
+        # ever reaching the guard. Returning False routes the alert to normal
+        # triage, where the guard applies.
+        _blocking = blocking_evidence(enrichment)
+        if _blocking:
+            logger.info("prefilter_blocked_by_evidence",
+                        rule_id=alert.get("rule_id"), triggers=_blocking)
             return False
-        if enrichment.get("is_known_malicious"):
+        # Degradation blocks the prefilter too: this path auto-closes an alert
+        # with no model and no human ever seeing it, so it must not fire while
+        # the evidence that would contradict it is unavailable.
+        if evidence_unavailable(enrichment):
+            logger.warning("prefilter_blocked_by_degraded_enrichment",
+                           rule_id=alert.get("rule_id"),
+                           sources=degraded_evidence_sources(enrichment),
+                           detail="Noise pre-filter suppressed while evidence "
+                                  "enrichers are degraded; alerts route to "
+                                  "normal triage until they recover.")
             return False
         if enrichment.get("baseline_anomaly"):
             return False

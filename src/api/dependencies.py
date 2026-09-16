@@ -40,6 +40,7 @@ _platform_roles: dict = {}
 _pipeline_monitor = None
 _alert_buffer = None
 _tenant_registry = None
+_incident_engine = None
 
 
 def get_db():
@@ -104,6 +105,9 @@ def get_pipeline_monitor():
 
 def get_alert_buffer():
     return _alert_buffer
+
+def get_incident_engine():
+    return _incident_engine
 
 def get_tenant_registry():
     return _tenant_registry

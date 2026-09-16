@@ -16,7 +16,7 @@ from collections import defaultdict
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
-from src.database.store import _tenant_ctx
+from src.database.store import _tenant_ctx, TenantRecordUnavailable
 
 logger = structlog.get_logger(__name__)
 
@@ -42,8 +42,21 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
         self.db = db
 
     async def dispatch(self, request: Request, call_next):
-        # Skip tenant context for unauthenticated paths
-        path = request.url.path
+        # Skip tenant context for unauthenticated paths.
+        #
+        # WO-H135: this MUST read the routed path from the ASGI scope, never
+        # ``request.url.path``. ``request.url`` is *reconstructed* from the
+        # attacker-controlled ``Host`` header — on the pinned starlette 0.49.1
+        # (GHSA-86qp-5c8j-p5mr) it is built as f"{scheme}://{host_header}{path}"
+        # with no validation of the header, so a Host of "dhruva.local/api/health?"
+        # makes ``url.path`` report "/api/health" for a request that actually
+        # routes to "/api/incidents" — skipping tenant scoping on a protected
+        # route. ``scope["path"]`` is the path the router dispatches on and is
+        # not derived from any header, so the two can never disagree.
+        #
+        # Defaulting to "" is deliberate: an absent path matches no skip rule,
+        # so the middleware falls through and applies tenant context (fail-closed).
+        path = request.scope.get("path", "")
         if path in ("/api/auth/login", "/api/health", "/health") or \
                 path.startswith("/static") or path == "/" or \
                 path.startswith("/api/webhooks/"):
@@ -111,7 +124,18 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
                         _tenant_switch_log[last_override_key] = override
 
                     if self.db:
-                        tenant = self.db.get_tenant(override)
+                        # WO-H91: a failed tenant read now raises instead of
+                        # coming back as {}. Fail closed — the override is NOT
+                        # applied and the request stays on the caller's own
+                        # tenant. Caught explicitly (rather than left to the
+                        # blanket handler below) so the refusal is auditable.
+                        try:
+                            tenant = self.db.get_tenant(override)
+                        except TenantRecordUnavailable as e:
+                            logger.warning("tenant_override_read_failed",
+                                           requested=override, actor=actor,
+                                           error=str(e)[:200])
+                            tenant = None
                         if tenant and tenant.get("active"):
                             if is_new_switch:
                                 logger.info("tenant_override_applied",

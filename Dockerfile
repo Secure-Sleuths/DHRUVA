@@ -102,6 +102,34 @@ RUN if find . -name "*.py" -not -name "__init__.py" | grep -q .; then \
           'if [ -f "${1}c" ]; then rm "$1"; fi' _ {} \; ; \
     fi
 
+# Stage the remaining files the RUNTIME stage ships. They used to be COPY'd
+# into stage 2 straight from the build context, which meant they never passed
+# through /build — and therefore never through the WO-H130 guard below.
+# `config/` is not an incidental omission: three of the leaks this work order
+# found were in config/guidance/*.yaml and config/wazuh/*.xml, and a poisoned
+# config/ built green while the name shipped inside the image. Everything the
+# image contains now goes through /build, and stage 2 copies ONLY
+# `--from=builder` — `tests/test_client_name_leak_h130.py` asserts that
+# invariant so a future `COPY foo ./` in stage 2 cannot re-open the hole.
+#
+# Placed AFTER the compileall block on purpose: backfill_incidents.py must ship
+# as readable .py (operators run it by hand), and compileall would have turned
+# it into a .pyc and deleted the source.
+COPY config/ config/
+COPY alembic.ini VERSION docker-entrypoint.sh ./
+COPY scripts/backfill_incidents.py scripts/
+
+# WO-H130: no client/tenant/install identifier may reach the image.
+#
+# Copied to /usr/local/bin rather than into /build ON PURPOSE, for two reasons:
+# the guard would otherwise scan itself (its term list is literally the list of
+# names) and it must not end up in the runtime layer. Runs AFTER compileall,
+# because .pyc is what this stage actually ships and compileall preserves
+# docstrings verbatim — a name in a module docstring survives into the
+# bytecode. Non-zero exit fails `docker build`.
+COPY scripts/check_no_client_names.py /usr/local/bin/check_no_client_names.py
+RUN python3 /usr/local/bin/check_no_client_names.py /build
+
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM python:3.13-slim
 ARG BUILD_TIER=full
@@ -135,14 +163,14 @@ COPY --from=builder /build/src/ src/
 # inside the container (status checks, manual revisions). Boot-time
 # --migrate sets script_location programmatically and does NOT depend
 # on this file being present.
-COPY alembic.ini ./
+COPY --from=builder /build/alembic.ini ./
 # VERSION file — src/__version__.py reads it as a fallback when DHRUVA_VERSION
 # env is unset. Cheap belt-and-suspenders alongside the ENV below.
-COPY VERSION ./
+COPY --from=builder /build/VERSION ./
 
 # Copy scripts and entrypoint
-COPY scripts/backfill_incidents.py scripts/
-COPY docker-entrypoint.sh .
+COPY --from=builder /build/scripts/backfill_incidents.py scripts/
+COPY --from=builder /build/docker-entrypoint.sh .
 
 # Create directories for mounted volumes
 RUN mkdir -p /opt/ai-soc/config/guidance/playbooks \
@@ -150,8 +178,10 @@ RUN mkdir -p /opt/ai-soc/config/guidance/playbooks \
              /var/lib/ai-soc && \
     chown -R soc:soc /opt/ai-soc /var/lib/ai-soc
 
-# Default config — will be overridden by volume mount
-COPY config/ config/
+# Default config — will be overridden by volume mount. `--from=builder`, not
+# from the build context: config/ carried three of the WO-H130 leaks and a
+# direct context copy bypasses the guard entirely.
+COPY --from=builder /build/config/ config/
 
 EXPOSE 8443
 

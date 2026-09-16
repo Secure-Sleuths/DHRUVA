@@ -27,6 +27,56 @@ INDEX_DOWN = "down"      # Transport/connection/auth/429/5xx. Transient —
 logger = structlog.get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# WO-S9 (widened after QA, 2026-08-03) — DSL constructs that escape tenant scoping
+# ---------------------------------------------------------------------------
+#
+# Tenant isolation on every LLM-generated-query path rests on
+# ``_inject_tenant_filter`` / ``_add_query_filter``, which mutate
+# ``body["query"]``. Anything that reads documents WITHOUT going through the
+# search query therefore escapes the boundary entirely. In an MSSP all tenants
+# share one cluster and one indexer account with no document-level security.
+#
+#   global          — by DEFINITION ignores the search query and aggregates over
+#                     the whole index; with a top_hits sub-aggregation it returns
+#                     other tenants' raw _source. This is the F9 bug.
+#   script / script_score / script_fields / runtime_mappings / scripted_metric
+#                   — arbitrary Painless execution, unconstrained by the filter.
+#
+# This lives HERE, on the one method all three LLM-query callers funnel through
+# (QueryAgent._execute_opensearch_query, the /api/hunt route, and
+# HuntAgent._execute_hypothesis), rather than being re-implemented per caller.
+# The first version of WO-S9 guarded only the query agent, so the same `global`
+# aggregation still escaped via either hunt path.
+FORBIDDEN_DSL_KEYS = frozenset([
+    "global", "script", "script_score", "script_fields",
+    "runtime_mappings", "scripted_metric",
+])
+
+MAX_DSL_DEPTH = 12
+
+
+def validate_dsl(body, _depth: int = 0) -> str | None:
+    """Return a rejection reason for an LLM-generated DSL body, else None."""
+    if _depth > MAX_DSL_DEPTH:
+        return f"query nesting exceeds {MAX_DSL_DEPTH} levels"
+    if isinstance(body, dict):
+        for key, value in body.items():
+            if isinstance(key, str) and key.lower() in FORBIDDEN_DSL_KEYS:
+                return (f"'{key}' is not permitted — it bypasses the tenant "
+                        "filter")
+            reason = validate_dsl(value, _depth + 1)
+            if reason:
+                return reason
+    elif isinstance(body, list):
+        for item in body:
+            reason = validate_dsl(item, _depth + 1)
+            if reason:
+                return reason
+    return None
+
+
+
 class OpenSearchClient:
     """Client for the Wazuh OpenSearch indexer."""
 
@@ -35,7 +85,7 @@ class OpenSearchClient:
                  indices: dict = None):
         # Build the OpenSearch client kwargs explicitly. opensearch-py treats
         # `verify_certs` as a bool: passing a string path through it would
-        # be truthy but ignored, falling back to system CAs (the client
+        # be truthy but ignored, falling back to system CAs (the reported
         # symptom: "[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local
         # issuer certificate" despite a working bundle on disk). When a
         # ca_certs path is supplied we keep verify_certs=True and pass the
@@ -69,7 +119,7 @@ class OpenSearchClient:
     #   mixed audit strings) and then atomically rejecting subsequent docs
     #   where other entries can't be coerced. The atomic rejection prevents
     #   the mapping from ever persisting, so the error is invisible to
-    #   `_mapping` queries — exactly the client 2026-05-13 freeze.
+    #   `_mapping` queries — exactly the 2026-05-13 ingestion freeze.
     # all_strings_keyword: any string field we haven't explicitly mapped
     #   defaults to keyword (aggregatable, sortable) rather than text. Wazuh
     #   relays raw cloud-audit payloads (M365/AWS/Azure) under `data.*` which
@@ -282,8 +332,8 @@ class OpenSearchClient:
         can distinguish a permanent document-level failure (quarantine)
         from a transient cluster-level failure (retry). Prior versions
         returned a bare bool which conflated the two and let a single
-        poison-pill document wedge the buffer indefinitely (a client,
-        2026-05-13).
+        poison-pill document wedge the buffer indefinitely (a client
+        install, 2026-05-13).
         """
         self._lazy_ensure_indices()
         alert = self._sanitize_ip_fields(alert)
@@ -391,6 +441,16 @@ class OpenSearchClient:
         mode, omitting this parameter fails closed (empty result).
         For enriched indices, tenant filter is injected automatically.
         """
+        # WO-S9: reject filter-escaping DSL before ANY scoping is applied.
+        # Enforced here so every caller — query agent, hunt route, hunt agent —
+        # gets it, instead of each re-implementing its own denylist.
+        _dsl_reason = validate_dsl(body)
+        if _dsl_reason:
+            logger.warning("tenant_scoped_search_dsl_blocked",
+                           index=index, reason=_dsl_reason)
+            return {"hits": {"hits": [], "total": {"value": 0}},
+                    "error": f"Query rejected: {_dsl_reason}"}
+
         _is_wazuh_native = ("wazuh-alerts" in index or "wazuh-states" in index)
         if not _is_wazuh_native:
             self._inject_tenant_filter(body)

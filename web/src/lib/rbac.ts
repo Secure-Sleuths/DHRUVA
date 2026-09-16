@@ -75,6 +75,7 @@ export const GROUPS: readonly NavGroup[] = [
       { id: "overview", label: "Overview", icon: LayoutDashboard },
       { id: "triage", label: "Triage", icon: ScanEye },
       { id: "incidents", label: "Incidents", icon: AlertTriangle },
+      { id: "handover", label: "Handover", icon: RefreshCcw },
     ],
   ],
   [
@@ -124,6 +125,8 @@ export const TAB_ACCESS: Record<string, readonly Role[]> = {
   overview: ["mssp_admin", "admin", "senior_analyst", "analyst", "read_only"],
   triage: ["mssp_admin", "admin", "senior_analyst", "analyst"],
   incidents: ["mssp_admin", "admin", "senior_analyst", "analyst", "read_only"],
+  // mirrors require_role("admin", "senior_analyst") on the endpoint
+  handover: ["mssp_admin", "admin", "senior_analyst"],
   detection: ["mssp_admin", "admin", "senior_analyst"],
   hunt: ["mssp_admin", "admin", "senior_analyst"],
   feedback: ["mssp_admin", "admin", "senior_analyst"],
@@ -313,6 +316,13 @@ export function triageClaimGate(
  *     NOT the plain `incidentActionGate` canSubmit boolean.
  *   - merge / review            → `require_role("admin","senior_analyst")`.
  *   - merge ALSO needs the `incidents_merge` LICENSE feature (see `mergeLicensed`).
+ *   - propagate_verdict         → `require_role("admin","senior_analyst","analyst")`
+ *     PLUS `_check_incident_access` — i.e. IDENTICAL to `status` (WO-H85). It is
+ *     modelled as its own action only so the control can be shown separately; it
+ *     does NOT widen anything. It can only ever set a FIRST verdict (the server
+ *     refuses any member that already carries a human one), so the admin-only
+ *     rule for OVERRIDING an existing verdict — `triageReviewGate` / WO-B10 —
+ *     is untouched by it.
  *
  * `read_only` has no write path for any of these (excluded by `require_role`),
  * so every action is hidden from it.
@@ -325,7 +335,8 @@ export type IncidentAction =
   | "assign"
   | "escalate"
   | "merge"
-  | "review";
+  | "review"
+  | "propagate_verdict";
 
 /**
  * Actions the server restricts to senior_analyst+ (no ownership check applies).
@@ -342,6 +353,8 @@ const OWNERSHIP_ACTIONS: ReadonlySet<IncidentAction> = new Set([
   "status",
   "note",
   "evidence",
+  // WO-H85 — same `_check_incident_access` gate the server applies to it.
+  "propagate_verdict",
 ]);
 
 export interface IncidentActionGate {
@@ -944,13 +957,20 @@ export function tiCollectGate(role: Role): TICollectGate {
 //   - reload enrichers ............ POST /api/admin/settings/reload-enrichers  require_role("admin")
 //   - guidance reload ............. POST /api/guidance/reload           require_admin
 //   - shift handoff ............... POST /api/admin/shifts/handoff      require_role("admin","senior_analyst") + "sla" license
+//   - shift SCHEDULE read/write ... GET|PUT /api/admin/shifts/schedule  require_role("admin") + "sla" license
 //   - tenant create/edit/agents ... /api/admin/tenants*                require_role("mssp_admin") (+ multi_tenant on create)
+//
+// NOTE the deliberate asymmetry between the last two shift entries (WO-H79):
+// READING a handover is analyst work (senior_analyst+), but EDITING the rota is
+// an administrative act — the schedule decides who incidents are auto-assigned
+// to — so the server gates it to admin+. Mirror that split; never widen it.
 // =============================================================================
 export type AdminAction =
   | "user_manage" // create / edit / role-change / deactivate — admin+
   | "settings_crud" // assets / identities / local-IOCs — admin+
   | "reload" // guidance reload + reload-enrichers — admin+
   | "handoff" // shift handoff — senior_analyst+ (server also needs the "sla" license)
+  | "shift_schedule" // shift SCHEDULE read/write — admin+ (also "sla" license)
   | "tenant_manage"; // tenant create / edit / agent-mapping — mssp_admin ONLY
 
 export interface AdminActionGate {

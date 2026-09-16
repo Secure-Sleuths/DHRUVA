@@ -10,7 +10,7 @@ offline. What was wrong is that the failure was **invisible in the `verdict`
 column**: on a dashboard, N dead LLM calls were indistinguishable from N
 considered escalations.
 
-Measured on the test server (2026-07-20), a clean split at the service restart
+Measured on a live install (2026-07-20), a clean split at the service restart
 that fixed the backend: 17:04-17:10 produced 4-5 failures/min and 0 real
 verdicts; 17:12-17:16 produced 0 failures and 3-7 real verdicts/min. ~37 rows
 (rules 5402 sudo-to-root, 5501 PAM session) were logged as
@@ -62,7 +62,7 @@ def upgrade() -> None:
     #
     # Each statement is issued SEPARATELY rather than as one multi-statement
     # string. Shipping them as a single op.execute() blob silently applied only
-    # the DDL on a live install (2026-07-20, test server): the column and index
+    # the DDL on a live install (2026-07-20): the column and index
     # appeared, the trailing UPDATE did not run, and the backfill flagged 0 of
     # 1398 matching rows — with no error raised anywhere. A migration that
     # half-applies without failing is worse than one that fails, so the DML now

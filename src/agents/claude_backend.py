@@ -23,6 +23,9 @@ from src.agents.llm_providers.base import BaseLLMProvider
 
 logger = structlog.get_logger(__name__)
 
+# Distinguishes "caller did not capture usage" from "caller captured None".
+_UNSET = object()
+
 # Provider registry — maps config name to class
 PROVIDER_REGISTRY = {}
 
@@ -53,7 +56,7 @@ class LLMBackend:
         provider: "anthropic"    # "anthropic", "openai", "ollama", "groq"
         model: "..."
         max_tokens: 4096
-        temperature: 0.1
+        temperature: 0.0
         rate_limit:
           cooldown_seconds: 5
         anthropic:
@@ -90,7 +93,7 @@ class LLMBackend:
         # Global settings (can be overridden per-provider)
         self.model = llm_cfg.get("model", "")
         self.max_tokens = llm_cfg.get("max_tokens", 4096)
-        self.temperature = llm_cfg.get("temperature", 0.1)
+        self.temperature = llm_cfg.get("temperature", 0.0)  # WO-H104: classification, not generation
 
         # Rate limiting. WO-H32: the dispatcher runs N triage workers against
         # this ONE backend instance, so the cooldown must be thread-safe (the
@@ -159,7 +162,7 @@ class LLMBackend:
             time.sleep(wait)
 
     def _track(self, request_type, input_len, output_len, latency,
-               success, error_type=None):
+               success, error_type=None, usage=_UNSET):
         """Record usage metrics if DB is available.
 
         WO-H50: prefer the provider's REAL token counts (``last_usage``, set by
@@ -174,7 +177,17 @@ class LLMBackend:
             from src.agents.llm_providers.multi_provider import ProviderUsageTracker
             from src.database.store import _tenant_ctx
             tid = _tenant_ctx.get() or "default"
-            usage = getattr(self.provider, "last_usage", None) if success else None
+            # ``usage`` is captured by the CALLER while it still holds the
+            # concurrency semaphore. Reading provider.last_usage here instead
+            # races: one provider instance serves N concurrent triage workers
+            # (WO-H32), so another thread's call can overwrite it between this
+            # thread's request finishing and its metrics being written — landing
+            # token counts and the estimated=False flag on the wrong request,
+            # and in multi-tenant on the wrong tenant's usage row.
+            if usage is _UNSET:
+                usage = getattr(self.provider, "last_usage", None)
+            if not success:
+                usage = None
             tracker = ProviderUsageTracker(tid, self._usage_db)
             tracker.track_usage(
                 provider=self.mode, model=self.provider.model,
@@ -205,14 +218,36 @@ class LLMBackend:
             # already built + anonymized by the caller — this gates transport
             # only, never touches content).
             with self._call_sem:
-                raw_text = self.provider.call_text(system_prompt, user_message)
+                raw_text = self._provider_call_json(system_prompt, user_message)
+                # Snapshot under the lock — see _track().
+                usage = getattr(self.provider, "last_usage", None)
             self._track(request_type, input_len, len(raw_text),
-                        time.time() - t0, True)
+                        time.time() - t0, True, usage=usage)
             return self._parse_json_response(raw_text)
         except Exception as e:
             self._track(request_type, input_len, 0,
                         time.time() - t0, False, type(e).__name__)
             raise
+
+    def _provider_call_json(self, system_prompt: str, user_message: str) -> str:
+        """Provider call for the JSON-expecting path.
+
+        A provider may offer ``call_text_json`` to constrain decoding to valid
+        JSON server-side (Ollama's ``format: "json"``). When it does, use it —
+        the parser's markdown-fence stripping then becomes a fallback rather
+        than the mechanism the platform depends on.
+
+        Only ``call()`` routes here. ``call_raw()`` deliberately does NOT: it
+        serves prose (plain-language incident summaries via
+        ``PLAIN_SUMMARY_PROMPT``), and JSON-constraining those would turn an
+        analyst-facing summary into a JSON blob.
+
+        Providers without the hook keep their existing behaviour untouched.
+        """
+        fn = getattr(self.provider, "call_text_json", None)
+        if callable(fn):
+            return fn(system_prompt, user_message)
+        return self.provider.call_text(system_prompt, user_message)
 
     def call_raw(self, system_prompt: str, user_message: str,
                  request_type: str = "raw") -> str:
@@ -223,8 +258,10 @@ class LLMBackend:
         try:
             with self._call_sem:  # WO-H32: transport-level concurrency cap
                 raw_text = self.provider.call_text(system_prompt, user_message)
+                # Snapshot under the lock — same race as the JSON path.
+                usage = getattr(self.provider, "last_usage", None)
             self._track(request_type, input_len, len(raw_text),
-                        time.time() - t0, True)
+                        time.time() - t0, True, usage=usage)
             return raw_text
         except Exception as e:
             self._track(request_type, input_len, 0,

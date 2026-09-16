@@ -26,7 +26,8 @@ You need three things ready before setup:
 - Ubuntu 20.04+, Debian 11+, or similar
 - 4 GB RAM minimum (8 GB recommended)
 - 10 GB free disk space
-- Python 3.11 or newer installed
+- Python **3.10 to 3.13** installed (3.10 is Ubuntu 22.04's system
+  Python and is the minimum DHRUVA supports — see `docs/TESTING.md`)
 - Can reach your Wazuh Manager over the network
 
 ### 2. Your Wazuh Credentials
@@ -732,13 +733,128 @@ alert in the dashboard's decision detail (`playbook_used`).
 
 ### Slack
 
+There are two ways to reach Slack. **If both are configured, the bot token
+wins** — its endpoint (`https://slack.com/api/chat.postMessage`) is a constant
+compiled into DHRUVA rather than a URL taken from configuration, and Slack
+reports per-message delivery failures in the response body, which an incoming
+webhook does not.
+
+#### Option 1 — Bot token (preferred)
+
+1. Create a Slack app, give its **bot token** the `chat:write` scope, and
+   install it to the workspace.
+2. **Invite the bot to the channel**: run `/invite @your-bot-name` in it.
+   Without this, Slack rejects every send with `not_in_channel` and DHRUVA logs
+   `slack_notification_failed slack_error=not_in_channel` with that instruction.
+3. Make `SLACK_BOT_TOKEN` and `SLACK_CHANNEL` visible to the process. Either
+   put them in `.env`, or — preferred on a systemd host, and required if the
+   token is already deployed elsewhere on the box — use a **drop-in** so the
+   secret is not copied into a second file:
+
+   ```bash
+   # The token lives in one place, readable only by root:
+   install -m 0600 -o root -g root /dev/null /etc/dhruva-slack.env
+   cat > /etc/dhruva-slack.env <<'EOF'
+   SLACK_BOT_TOKEN=xoxb-...
+   SLACK_CHANNEL=#notifications
+   EOF
+
+   # Point the service at it. `ai-soc` is the unit name on tarball installs;
+   # use `ai-soc-platform` if that is the unit you installed.
+   mkdir -p /etc/systemd/system/ai-soc.service.d
+   cp systemd/ai-soc.service.d/10-slack-bot-token.conf \
+      /etc/systemd/system/ai-soc.service.d/
+   systemctl daemon-reload && systemctl restart ai-soc
+   ```
+
+   The drop-in is one line — `EnvironmentFile=-/etc/dhruva-slack.env`. systemd
+   reads it **as root, before dropping to the service user**, so a `0600
+   root:root` file works even when the service runs unprivileged. The leading
+   `-` makes the file optional, so a host without it still boots.
+
+4. Set `notifications.enabled: true` in `config/config.yaml` (already the
+   shipped default). A **fresh install** already has `slack.bot_token` /
+   `slack.channel` reading `${SLACK_BOT_TOKEN}` / `${SLACK_CHANNEL}`.
+
+   > **On a host upgraded with `scripts/upgrade.sh`, those keys will NOT be in
+   > your `config.yaml`.** The upgrade merges only top-level sections that are
+   > *missing* from your config, and `notifications:` already exists, so newly
+   > added keys inside it are never merged in. You do not have to do anything
+   > about this: DHRUVA reads `SLACK_BOT_TOKEN` and `SLACK_CHANNEL` straight
+   > from the environment when the config keys are absent. Adding them to
+   > `config.yaml` is optional and only needed if you want the value to come
+   > from config rather than the environment.
+5. Restart the platform and confirm:
+
+   ```bash
+   journalctl -u ai-soc | grep notification_service_initialized
+   #  -> channels=['slack'] slack_transport='bot'
+   curl -sk https://127.0.0.1:8443/api/health | jq .notifications
+   #  -> "ok"
+   ```
+
+**`SLACK_CHANNEL` is required with a bot token** — `chat.postMessage` has no
+default destination. A token with no channel is refused and logged as
+`slack_bot_token_unusable reason=no_channel`.
+
+#### Option 2 — Incoming webhook (legacy, still supported)
+
 1. Create a Slack webhook at [api.slack.com/messaging/webhooks](https://api.slack.com/messaging/webhooks)
 2. Add it to your `.env` file:
    ```
    SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T.../B.../xxx
    ```
+   The hostname is allow-listed: anything other than
+   `https://hooks.slack.com/services/...` is rejected at startup
+   (`slack_webhook_rejected`).
 3. Set `notifications.enabled: true` in `config/config.yaml`
 4. Restart the platform
+
+#### Checking that notifications actually go somewhere
+
+`GET /api/health` carries a `notifications` field:
+
+| Value | Meaning |
+|---|---|
+| `ok` | Enabled, a channel is usable, and sends are landing |
+| `misconfigured` | **Enabled but NO usable channel — every alert, SLA breach and escalation is being discarded.** Alarm on this. |
+| `failing` | **A channel is configured but its last 3 sends all failed.** Usually `not_in_channel` — the bot was never invited. Alarm on this too. |
+| `disabled` | `notifications.enabled: false` — a deliberate choice |
+| `unavailable` | No notification service (Community build, or a license without `notifications_full`) |
+| `unknown` | The check itself failed |
+
+Alarm on **`misconfigured` and `failing`**. `misconfigured` is what an empty
+`SLACK_WEBHOOK_URL` plus an empty `SMTP_HOST` produces, and it used to be
+visible only as a single INFO line at boot. `failing` is the state you are most
+likely to hit right after enabling this — invite the bot to the channel.
+
+#### What to expect on the first run after enabling Slack
+
+Breach notifications are announced **until a channel accepts them**, and the
+delivery is recorded in `sla_breaches.notified`. Every existing row on an
+upgraded install has `notified = 0`, so the first cycle after you enable Slack
+announces the currently-breached, still-open incidents — including any that have
+been sitting unseen. That is intended.
+
+It is capped at **20 announcements per tenant per 5-minute cycle** (the SLA
+checker runs once per tenant). When there are more than that, the rest are
+announced on following cycles, **least-tried first** — so a breach that has
+never been attempted is always served before one that has, and the tail of a
+large backlog is reached on the next cycle rather than waiting behind the head.
+The log line `sla_breach_notifications_deferred` tells you the remainder is
+still coming.
+
+If a send keeps failing, each breach is retried up to 5 times and then
+abandoned with an `sla_breach_notification_abandoned` ERROR naming the incident.
+Abandoned breaches stop consuming the per-cycle budget, so they cannot crowd
+out breaches that have not been tried yet. Their rows keep `notified = 0`, so
+**restarting the platform retries them** — do that after fixing the channel.
+
+To see what was never delivered at any time:
+
+```sql
+SELECT incident_id, sla_type, breached_at FROM sla_breaches WHERE notified = 0;
+```
 
 ### Email
 

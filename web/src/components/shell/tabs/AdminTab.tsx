@@ -48,6 +48,7 @@ import {
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { roleAtLeast } from "@/lib/rbac";
+import { ShiftScheduleEditor } from "./ShiftScheduleEditor";
 import {
   AssetsSection,
   IdentitiesSection,
@@ -92,6 +93,7 @@ type AdminSection =
   | "governance"
   | "settings"
   | "operations"
+  | "shifts"
   | "anon"
   | "pipeline"
   | "tenants";
@@ -179,6 +181,10 @@ export function AdminTab(_props: TabProps) {
     { id: "governance", label: "Governance" },
     { id: "settings", label: "Assets & IOCs" },
     { id: "operations", label: "Operations" },
+    // WO-H79 — the rota editor. The Admin tab is already admin+ (TAB_ACCESS),
+    // which mirrors the server's require_role("admin") on the schedule
+    // endpoints; the editor itself re-checks via adminActionGate.
+    { id: "shifts", label: "Shift schedule" },
     { id: "anon", label: "Anonymization" },
     // Pipeline Health + Tenants are mssp_admin-only (mirror the server's
     // require_role("mssp_admin") — a plain admin never sees the entry, so never
@@ -196,7 +202,7 @@ export function AdminTab(_props: TabProps) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <PageHeading
           title="Administration"
-          sub="Manage users, tenants (MSSP), assets/identities/local-IOCs, runtime reloads, and shift handoff."
+          sub="Manage users, tenants (MSSP), assets/identities/local-IOCs, runtime reloads, the shift schedule, and shift handoff."
         />
         {section === "overview" && (
           <PollingStatus
@@ -264,6 +270,7 @@ export function AdminTab(_props: TabProps) {
         </div>
       )}
       {section === "operations" && <OperationsSection />}
+      {section === "shifts" && <ShiftScheduleEditor />}
       {section === "anon" && <AnonMappingsSection />}
 
       {section === "pipeline" &&
@@ -586,7 +593,7 @@ function AnonMappingsSection() {
  * otherwise), so it never fires a request the server would 403 on the ROLE gate;
  * a runtime 402/403 from the LICENSE gate degrades to FeatureLockedState
  * (fail-closed to locked). Shows heartbeats / silent agents, EPS + anomaly,
- * parser fail-rate, automation KPIs, and the Log Sources inventory — nothing is
+ * decode fail-rate, automation KPIs, and the Log Sources inventory — nothing is
  * fabricated (every field is what the endpoint returned; sub-status error/
  * insufficient variants are surfaced honestly).
  */
@@ -677,7 +684,7 @@ function PipelineHealthSection() {
     <div className="flex flex-col gap-3">
       <div className="rounded-lg border border-line bg-panel2 px-3.5 py-2.5 text-kbd text-dim2">
         Global infrastructure telemetry — log-source heartbeats, ingest-rate
-        anomaly, parser failure-rate, and automation health. mssp_admin-only,
+        anomaly, analysisd decode-failure rate, and automation health. mssp_admin-only,
         read-only. Figures are exactly what the pipeline monitor reported; empty or error sub-checks are shown as such.
       </div>
 
@@ -694,7 +701,7 @@ function PipelineHealthSection() {
         title="Agent heartbeats"
         note={
           hb.window_minutes != null
-            ? `Silent = no events within the last ${hb.window_minutes} min window.`
+            ? `Silent = disconnected from the Wazuh manager, or no keepalive for ${hb.window_minutes} min. A healthy host that raises no alerts is NOT silent.`
             : undefined
         }
       >
@@ -706,17 +713,52 @@ function PipelineHealthSection() {
           </div>
         ) : (
           <>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            {hb.clock_skew_suspected && (
+              <div className="mb-3 text-data text-sev-high">
+                Clock skew suspected: {fmtInt(hb.stale_keepalive_agents)} of{" "}
+                {fmtInt(hb.known_active_agents)} agents went stale at once, which is
+                far more likely to be NTP drift between DHRUVA and the Wazuh manager
+                than a site-wide outage. Per-agent alerts are SUPPRESSED and those
+                hosts are shown as unknown, not healthy. Check NTP on both.
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
               <Tile label="Known active" value={fmtInt(hb.known_active_agents)} sub="agents" />
-              <Tile label="Reporting" value={fmtInt(hb.reporting_agents)} sub="sending events" />
+              <Tile label="Reporting" value={fmtInt(hb.reporting_agents)} sub="keepalive fresh" />
               <Tile
                 label="Silent"
                 value={fmtInt(hb.silent_agents)}
-                sub="no recent events"
+                sub="no keepalive"
                 valueSeverity={(hb.silent_agents ?? 0) > 0 ? "med" : undefined}
+              />
+              <Tile
+                label="Unknown"
+                value={fmtInt(hb.unknown_state_agents)}
+                sub="state not claimed"
+                valueSeverity={(hb.unknown_state_agents ?? 0) > 0 ? "med" : undefined}
               />
               <Tile label="Window" value={hb.window_minutes != null ? `${hb.window_minutes}m` : DASH} sub="heartbeat" />
             </div>
+            {hb.stale === true && (
+              <div className="mt-2 text-data text-dim2">
+                These numbers are the last known picture — this cycle could not
+                reach the Wazuh manager.
+              </div>
+            )}
+            {hb.unknown_agent_names && hb.unknown_agent_names.length > 0 && (
+              <div className="mt-3">
+                <div className="mb-1.5 text-kbd uppercase tracking-wider text-dim2">
+                  Unknown state
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {hb.unknown_agent_names.map((n) => (
+                    <Chip key={n} mono variant="gated">
+                      {n}
+                    </Chip>
+                  ))}
+                </div>
+              </div>
+            )}
             {hb.silent_agent_names && hb.silent_agent_names.length > 0 && (
               <div className="mt-3">
                 <div className="mb-1.5 text-kbd uppercase tracking-wider text-dim2">
@@ -761,30 +803,111 @@ function PipelineHealthSection() {
         )}
       </SectionShell>
 
-      {/* Parser failure rate */}
-      <SectionShell title="Parser failure rate (last hour)">
+      {/* Decode failure rate — WO-H109. Read from wazuh-analysisd counters
+          differenced between checks, so the window is the gap between checks
+          (~5 min), not a fixed hour.
+
+          Audit NEW-3: the rate is only ONE of the two things this block
+          reports, and it is the only one that needs a measurable window.
+          Dropped events are evaluated by the backend even when no rate
+          exists — deliberately, because a quiet estate losing events is
+          exactly when that matters — so they are rendered OUTSIDE the rate's
+          status branch. Nesting them inside it meant an accumulating estate
+          with an open data-loss condition rendered one reassuring line about
+          the 500-event floor. */}
+      <SectionShell
+        title="Decode failure rate (wazuh-analysisd)"
+        note={
+          parser.cluster_single_node_warning
+            ? "Clustered manager: these counters describe ONE node, not the estate."
+            : undefined
+        }
+      >
         {parser.error ? (
-          <div className="text-data text-sev-med">Parser check error: {parser.error}</div>
-        ) : parser.status === "no_events" ? (
-          <div className="text-data text-dim2">No events in the last hour to assess.</div>
+          <div className="text-data text-sev-med">Decode check error: {parser.error}</div>
+        ) : parser.status === "unknown" ? (
+          <div className="text-data text-sev-med">
+            Unknown — {parser.reason ?? "analysisd statistics could not be read"}. Not the same as healthy.
+          </div>
+        ) : parser.status === "priming" ? (
+          <div className="text-data text-dim2">
+            Priming — a rate needs two readings; the first has landed.
+          </div>
+        ) : parser.status === "counter_reset" ? (
+          <div className="text-data text-dim2">
+            analysisd restarted and its counters reset. Re-baselined; no rate for this window.
+          </div>
+        ) : parser.status === "accumulating" || parser.status === "insufficient_events" ? (
+          <div className="text-data text-dim2">
+            {parser.reason ?? "Too few events in this window for a meaningful rate."}
+          </div>
         ) : parser.failure_rate == null ? (
-          <div className="text-data text-dim2">No parser check has run yet.</div>
+          <div className="text-data text-dim2">No decode check has run yet.</div>
         ) : (
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
             <Tile
               label="Failure rate"
               value={fmtPct(parser.failure_rate, { fraction: true })}
               sub={`threshold ${parser.threshold != null ? fmtPct(parser.threshold, { fraction: true }) : DASH}`}
               valueSeverity={parser.is_above_threshold ? "high" : undefined}
             />
-            <Tile label="Events (1h)" value={fmtInt(parser.total_events_1h)} sub="total" />
-            <Tile label="Unparsed (1h)" value={fmtInt(parser.unparsed_events_1h)} sub="failed to parse" />
+            {/* Audit Finding 2: this bound to `events_received`, the raw
+                single-cycle delta INCLUDING dropped events, while the rate is
+                computed over `rate_window_events` accumulated across cycles.
+                The three tiles then did not reconcile — 100 undecoded of a
+                displayed 2,000 is 5%, next to a headline rate of 9.09% whose
+                real denominator was 1,100 — and an analyst checking the
+                arithmetic concludes the rate is wrong. Bind to the
+                denominator the rate actually used. */}
             <Tile
-              label="Above threshold"
-              value={parser.is_above_threshold ? "Yes" : "No"}
-              sub="parser health"
-              valueSeverity={parser.is_above_threshold ? "high" : undefined}
+              label="Decodable events"
+              value={fmtInt(parser.rate_window_events ?? parser.events_received)}
+              sub={
+                parser.rate_window_cycles != null && parser.rate_window_cycles > 1
+                  ? `${parser.rate_window_cycles} checks, drops excluded`
+                  : parser.rate_window_seconds != null
+                    ? `last ${Math.round(parser.rate_window_seconds)}s, drops excluded`
+                    : "this window, drops excluded"
+              }
             />
+            <Tile label="Undecoded" value={fmtInt(parser.events_undecoded)} sub="no decoder matched" />
+          </div>
+        )}
+
+        {/* Always rendered when the backend measured it, whatever the rate
+            did. Dropped events are LOSS, not degradation, and the backend
+            evaluates them below the volume floor on purpose — a quiet estate
+            losing events is exactly when that matters. Nesting this inside
+            the rate's status branch is what made this tab reassure an analyst
+            while a data-loss condition was open (audit NEW-3). */}
+        {parser.events_dropped != null && (
+          <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-2">
+            <Tile
+              label="Dropped"
+              value={fmtInt(parser.events_dropped)}
+              sub={
+                (parser.events_dropped ?? 0) > 0
+                  ? "queue full — lost, not recoverable"
+                  : "queue full — lost"
+              }
+              valueSeverity={(parser.events_dropped ?? 0) > 0 ? "high" : undefined}
+            />
+            <Tile
+              label="Dropped since analysisd start"
+              value={fmtInt(parser.events_dropped_total)}
+              sub="lifetime"
+              valueSeverity={(parser.events_dropped_total ?? 0) > 0 ? "med" : undefined}
+            />
+          </div>
+        )}
+
+        {/* The open condition, said in words. A tile shows a number; this
+            says what a human has actually been paged about. Mirrored in
+            app.js so the two dashboards report the same facts. */}
+        {parser.events_dropped_condition_open && (
+          <div className="mt-3 text-data text-sev-high">
+            Open: analysisd is DROPPING events — they were discarded at a full
+            queue, never analysed, and are not recoverable.
           </div>
         )}
       </SectionShell>

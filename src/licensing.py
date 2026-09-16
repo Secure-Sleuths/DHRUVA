@@ -18,6 +18,8 @@ from typing import Optional
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
 
+from src.timestamps import parse_iso8601
+
 logger = structlog.get_logger(__name__)
 
 # Ed25519 public key — split to avoid single-string extraction from binaries.
@@ -132,6 +134,27 @@ ALL_DASHBOARD_TABS = [
     "threat_intel", "knowledge_base", "tickets", "admin",
     # M6 host-integrity read views (paid: host_integrity feature)
     "fim", "rootcheck", "registry", "groups",
+    # WO-H57 persistent decision cache tab. The feature is role-gated only
+    # (senior_analyst+ on /api/admin/decision-cache*), not licence-gated — this
+    # entry is what lets the "all" tab expansion surface it in the SPA, so it is
+    # no longer (incorrectly) shown locked on Team/Enterprise licences.
+    "decisioncache",
+    # Shift handover. The endpoints are gated on the `sla` FEATURE and
+    # require_role("admin", "senior_analyst"); this entry is separately
+    # required for the "all" expansion to surface the tab in the SPA.
+    #
+    # Missing it made handover show "not in your Enterprise tier" on a licence
+    # that DID carry `sla` — the frontend locks on `tier.tabs`, not on
+    # `tier.features`, so a feature can be fully granted and still be invisible.
+    # Observed on a live tenant (enterprise, sla present, endpoint
+    # returning HTTP 200 with data) while the UI showed a padlock, and the
+    # lock modal contradicted itself by adding "Admin is never locked" to an
+    # admin session that was locked.
+    #
+    # This is the second occurrence of exactly this defect — see the
+    # decisioncache note above. The guard in
+    # tests/test_license_tab_registration.py is what makes it the last.
+    "handover",
 ]
 
 
@@ -219,7 +242,7 @@ class LicenseInfo:
         However, both the CLI license generator and the license-manager
         UI have shipped licenses with `features=["full"]` in the past.
         Rather than silently downgrading these to no-features (which is
-        what v4.8.4 did and what bricked a client's first license), we
+        what v4.8.4 did and what bricked the first client license issued), we
         expand "full" to the tier's preset feature list at check time.
         Behavior is therefore:
           - v1 licenses: "full" is the legacy wildcard, all features pass.
@@ -248,8 +271,8 @@ class LicenseInfo:
     # -- Capacity checks -------------------------------------------------------
     #
     # Treat None and 0 identically: both mean "unlimited". An incomplete or
-    # hand-edited license payload that has `max_users: null` (a client's
-    # reissued v4.8.4 license is the case that surfaced this) previously
+    # hand-edited license payload that has `max_users: null` (a reissued
+    # v4.8.4 client license is the case that surfaced this) previously
     # tripped a TypeError on `int < None` inside require_user_quota — which
     # FastAPI rendered as a confusing 403 with a quota-exceeded message even
     # though the operator had set no quota at all.
@@ -402,12 +425,14 @@ class LicenseValidator:
 
         # Step 5: Parse dates
         try:
-            expires_at = datetime.fromisoformat(
-                payload["expires_at"].replace("Z", "+00:00")
-            )
-            issued_at = datetime.fromisoformat(
-                payload.get("issued_at", payload["expires_at"]).replace("Z", "+00:00")
-            )
+            # WO-H116: a licence file is an EXTERNAL artefact - it is generated
+            # by the licence tooling, possibly a different version, and handed
+            # to us on disk. Parsing it with the version-independent parser
+            # means a licence never fails to validate because of which
+            # interpreter the client happens to run.
+            expires_at = parse_iso8601(payload["expires_at"])
+            issued_at = parse_iso8601(
+                payload.get("issued_at", payload["expires_at"]))
         except (ValueError, TypeError) as e:
             raise LicenseFormatError(
                 f"License contains invalid date format: {e}. "
@@ -440,7 +465,7 @@ class LicenseValidator:
         # UI have at various points emitted features=["full"] as a wildcard
         # placeholder. Without this remap, schema-v2 licenses with "full"
         # silently disable every paid feature at runtime (the bug that
-        # bricked a client's first license — Detection/Hunt/SOAR/Tickets
+        # bricked the first client license issued — Detection/Hunt/SOAR/Tickets
         # all 403 until reissued).
         raw_features = payload.get("features", defaults["features"])
         if isinstance(raw_features, list) and "full" in raw_features:

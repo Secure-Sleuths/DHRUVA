@@ -155,6 +155,10 @@ describe("caseContext — full blob", () => {
       hasAdmin: true,
       isServiceAccount: false,
       department: "engineering",
+      // No user_normal_hours / user_normal_ips / user_onboarded_date in this
+      // blob, so there is no proof the identity store matched the principal —
+      // the roles above may be the pre-seeded default rather than a lookup.
+      storeMatched: false,
     });
   });
 
@@ -239,14 +243,68 @@ describe("caseContext — full blob", () => {
 });
 
 describe("caseContext — degraded blobs", () => {
+  /**
+   * `degraded` is the WO-H86 `degraded_enrichers` list, not one of the nine
+   * dimension RECORDS — it is `[]` (nothing recorded as having raised), never
+   * null. The dimension records themselves must still all be null.
+   */
+  const dimensions = (ctx: ReturnType<typeof caseContext>) =>
+    Object.entries(ctx)
+      .filter(([k]) => k !== "degraded")
+      .map(([, v]) => v);
+
   it("missing blob → every dimension null (the UI empty state)", () => {
     const ctx = caseContext(alertWith(null));
-    expect(Object.values(ctx).every((v) => v === null)).toBe(true);
+    expect(dimensions(ctx).every((v) => v === null)).toBe(true);
+    expect(ctx.degraded).toEqual([]);
   });
 
   it("malformed JSON → every dimension null, never a throw", () => {
     const ctx = caseContext(alertWith("{definitely not json"));
-    expect(Object.values(ctx).every((v) => v === null)).toBe(true);
+    expect(dimensions(ctx).every((v) => v === null)).toBe(true);
+    expect(ctx.degraded).toEqual([]);
+  });
+
+  it("reads degraded_enrichers — the one provable 'this check errored' state", () => {
+    const ctx = caseContext(
+      alertWith(
+        JSON.stringify({
+          asset_tier: "unknown",
+          degraded_enrichers: ["asset", "threat_intel"],
+        }),
+      ),
+    );
+    expect(ctx.degraded).toEqual(["asset", "threat_intel"]);
+  });
+
+  it("a non-list / junk degraded_enrichers never throws and yields []", () => {
+    const ctx = caseContext(
+      alertWith(JSON.stringify({ asset_tier: "x", degraded_enrichers: "asset" })),
+    );
+    expect(ctx.degraded).toEqual([]);
+  });
+
+  it("carries the historical proof-of-query keys through", () => {
+    const ctx = caseContext(
+      alertWith(
+        JSON.stringify({
+          historical_fp_rate: 0.25,
+          historical_occurrence_count: 40,
+          historical_window_days: 14,
+        }),
+      ),
+    );
+    expect(ctx.historical?.occurrenceCount).toBe(40);
+    expect(ctx.historical?.windowDays).toBe(14);
+  });
+
+  it("leaves the proof-of-query keys null when the enricher had no db handle", () => {
+    // fp_rate is pre-seeded to 0.0 and survives a missing db handle, so it
+    // alone can never prove the lookup ran.
+    const ctx = caseContext(alertWith(JSON.stringify({ historical_fp_rate: 0.0 })));
+    expect(ctx.historical?.fpRate).toBe(0);
+    expect(ctx.historical?.occurrenceCount).toBeNull();
+    expect(ctx.historical?.windowDays).toBeNull();
   });
 
   it("partial blob → only the present dimensions, honest field defaults", () => {
@@ -273,7 +331,9 @@ describe("caseContext — degraded blobs", () => {
         }),
       ),
     );
-    expect(ctx.ti?.hits).toBe(0);
+    // A wrong-typed count is NOT a measured zero. This used to be `?? 0`,
+    // which turned junk into a confident "0 feed hits".
+    expect(ctx.ti?.hits).toBeNull();
     expect(ctx.ti?.sources).toEqual(["42"]);
     expect(ctx.anomaly?.isAnomaly).toBe(false);
     expect(ctx.anomaly?.details).toEqual([]);

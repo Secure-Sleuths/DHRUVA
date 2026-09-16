@@ -3,6 +3,7 @@
 import structlog
 from datetime import datetime, timezone, timedelta
 
+from src.timestamps import parse_iso8601_or_none
 from src.enrichment.threat_intel.feeds.threatfox import ThreatFoxCollector
 from src.enrichment.threat_intel.feeds.urlhaus import URLhausCollector
 from src.enrichment.threat_intel.feeds.feodo import FeodoCollector
@@ -105,9 +106,35 @@ class ThreatIntelCollector:
         statuses = self.db.get_feed_statuses()
         for s in statuses:
             if s["feed_name"] == feed.FEED_NAME and s.get("last_success_at"):
-                last = datetime.fromisoformat(s["last_success_at"])
-                if last.tzinfo is None:
-                    last = last.replace(tzinfo=timezone.utc)
+                # WO-H116: read back from the DB. An unparseable value means
+                # "we cannot tell when it last ran" -> collect now.
+                #
+                # qa-audit L4: an earlier version of this comment said that is
+                # "what the old code did by raising into the caller's handler".
+                # There is no such handler. ``if not self._is_due(feed)`` sits
+                # OUTSIDE the per-feed ``try`` below, so on the previous code a
+                # single corrupted ``last_success_at`` row raised straight out
+                # of ``collect_all`` and aborted the ENTIRE collection cycle —
+                # every other feed included — leaving only a generic
+                # ``ti_collection_failed`` from ``main._run_ti_collection``.
+                # Every cycle, until someone repaired the row by hand. So this
+                # change does more than the comment claimed: it contains the
+                # blast radius to the one feed whose status row is corrupt.
+                last = parse_iso8601_or_none(s["last_success_at"])
+                if last is None:
+                    # qa-audit F4: this used to be silent. "Collect now" on a
+                    # corrupted status row is not a one-off — the row is never
+                    # repaired by this path, so the feed re-fetches on EVERY
+                    # cycle, forever, burning the provider's rate limit and the
+                    # client's API quota while every dashboard still shows the
+                    # feed as healthy. Say so once per cycle so it is findable.
+                    logger.warning("feed_last_success_unparseable",
+                                   feed=feed.FEED_NAME,
+                                   value=str(s["last_success_at"])[:64],
+                                   detail="collecting now; this feed will "
+                                          "re-collect every cycle until the "
+                                          "stored timestamp is repaired")
+                    return True
                 next_due = last + timedelta(minutes=feed.interval)
                 if datetime.now(timezone.utc) < next_due:
                     return False

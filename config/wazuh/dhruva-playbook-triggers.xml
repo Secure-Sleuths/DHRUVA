@@ -31,7 +31,7 @@
     120000-120199 is RESERVED for DHRUVA playbook triggers.
     (Detection Agent proposals use 100000+; SETUP-GUIDE examples use 110000+.)
 
-  VALIDATION STATUS — PARTIALLY VERIFIED (2026-07-20, test server v4.14.5)
+  VALIDATION STATUS — PARTIALLY VERIFIED (2026-07-20, Wazuh manager v4.14.5)
 
     ✅ VERIFIED on a live manager:
        - The ruleset COMPILES with this file installed. `wazuh-logtest -v`

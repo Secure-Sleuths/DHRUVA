@@ -348,6 +348,22 @@ sentinel (tenant id → only that tenant's child rows; sentinel → all; unset �
 → fail-closed). Same NON-superuser / NON-BYPASSRLS role requirement applies — no
 new role requirement is introduced.
 
+**Migration `0013` (WO-H85) adds a third FK-scoped table**, `decision_reviews`
+— the append-only review history for an alert's human verdicts. It carries no
+`client_id` either; its tenant owner is defined transitively through
+`decision_id` → `agent_decisions`, so it gets the same subquery policy shape
+against the `0006`-scoped parent:
+
+```sql
+USING      (decision_id IN (SELECT id FROM agent_decisions))
+WITH CHECK (decision_id IN (SELECT id FROM agent_decisions))
+```
+
+It is in `SOCDatabase.FK_SCOPED_TABLES` alongside the other two, and every DAO
+read joins `agent_decisions` so the app-layer `_tenant_filter()` (`AND client_id
+= %s`) resolves to the parent's column — there is no `client_id` on
+`decision_reviews` to collide with it.
+
 ### ⚠️ CRITICAL: DHRUVA must connect as a NON-superuser, NON-BYPASSRLS role
 
 **PostgreSQL superusers and roles with `BYPASSRLS` skip RLS entirely — even with

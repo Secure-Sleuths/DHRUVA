@@ -350,3 +350,50 @@ def require_deploy_authority():
             )
         return user
     return _check
+
+
+def require_cross_tenant_authority():
+    """Mode-aware dependency for endpoints that run inside ``db.cross_tenant()`` (WO-S5).
+
+    ``cross_tenant()`` sets the ``__CROSS_TENANT__`` sentinel, which disables
+    BOTH the app-layer tenant guard (``store._assert_tenant_scoped_query``) and
+    the Postgres RLS ``tenant_isolation`` backstop from migration 0006. Any
+    endpoint that opens that scope is, by construction, a provider-level
+    operation — it must never be reachable by a per-tenant CUSTOMER
+    administrator.
+
+    Same mode-awareness as ``require_deploy_authority`` and for the same
+    reason:
+
+      * MULTI-TENANT — ``mssp_admin`` ONLY. A plain ``admin`` is a per-tenant
+        administrator; letting one read or rewrite other tenants' rows is a
+        tenant-isolation break.
+      * SINGLE-TENANT — there is exactly one customer and NO ``mssp_admin``
+        role (the top role is ``admin``), so ``cross_tenant()`` spans nothing
+        the caller does not already own. Gating on ``mssp_admin`` there would
+        make the endpoint unreachable by anybody.
+
+    FAIL CLOSED: if the deployment mode cannot be determined, treat the install
+    as multi-tenant (``mssp_admin`` only) — the strictest posture.
+    """
+    async def _check(user: dict = Depends(verify_jwt)) -> dict:
+        if not _auth_enabled:
+            return user
+        if user.get("role") == "mssp_admin":
+            return user
+        try:
+            from src.database.store import is_multi_tenant
+            multi = is_multi_tenant()
+        except Exception:
+            multi = True  # fail closed → strictest (mssp_admin only)
+        allowed = ("mssp_admin",) if multi else ("admin", "mssp_admin")
+        if user.get("role") not in allowed:
+            logger.warning("cross_tenant_authority_denied",
+                           actor=user.get("sub"), role=user.get("role"),
+                           multi_tenant=multi)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Requires one of: {', '.join(allowed)}",
+            )
+        return user
+    return _check

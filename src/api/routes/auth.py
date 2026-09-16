@@ -9,6 +9,7 @@ from src.api.auth import (
     LoginRequest, TokenResponse,
 )
 from src.api.dependencies import get_db, get_platform_users, get_platform_roles, limiter
+from src.database.store import TenantRecordUnavailable
 
 router = APIRouter(prefix="/api/auth")
 security = HTTPBearer()
@@ -43,7 +44,20 @@ async def login(request: Request, body: LoginRequest):
                 client_id = user_row.get("client_id") or None
                 tenant_name = None
                 if client_id and _db:
-                    tenant = _db.get_tenant(client_id)
+                    # WO-H91: get_tenant now raises TenantRecordUnavailable
+                    # when the read fails (as opposed to returning {} for a
+                    # tenant that is genuinely absent). Tolerated HERE, and
+                    # only here: tenant_name is a display label on the token.
+                    # The isolation-critical field is client_id, which came
+                    # from the user row we already read — so a failed label
+                    # lookup must not become a login outage, and it cannot
+                    # widen anyone's access.
+                    try:
+                        tenant = _db.get_tenant(client_id)
+                    except TenantRecordUnavailable as e:
+                        logger.warning("login_tenant_name_lookup_failed",
+                                       error=str(e)[:200])
+                        tenant = {}
                     if tenant:
                         tenant_name = tenant.get("name")
                 token = create_token(body.username, role=role,

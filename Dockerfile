@@ -48,6 +48,7 @@ RUN if [ "$BUILD_TIER" = "community" ]; then \
         src/agents/hunt_agent.py \
         src/agents/hunt_techniques \
         src/agents/query_agent.py \
+        src/agents/prompts/paid.py \
         src/detection \
         src/feedback \
         src/soar \
@@ -119,16 +120,51 @@ COPY config/ config/
 COPY alembic.ini VERSION docker-entrypoint.sh ./
 COPY scripts/backfill_incidents.py scripts/
 
-# WO-H130: no client/tenant/install identifier may reach the image.
+# WO-H138: config/guidance/community/ is an OVERLAY, not a shipped directory. It
+# holds GENERIC versions of the two guidance files whose repo copies are
+# estate-derived — escalation_logic.yaml (measured alert volumes, a real
+# estate's custom rule ids) and rule_guidance.yaml (one estate's incident
+# written up as detection content). This is the THIRD lane that ships config/,
+# alongside build-source-package.sh and build-client-package.sh, and the
+# community image is published to GHCR, so it needs the same swap.
 #
-# Copied to /usr/local/bin rather than into /build ON PURPOSE, for two reasons:
-# the guard would otherwise scan itself (its term list is literally the list of
-# names) and it must not end up in the runtime layer. Runs AFTER compileall,
-# because .pyc is what this stage actually ships and compileall preserves
-# docstrings verbatim — a name in a module docstring survives into the
-# bytecode. Non-zero exit fails `docker build`.
-COPY scripts/check_no_client_names.py /usr/local/bin/check_no_client_names.py
-RUN python3 /usr/local/bin/check_no_client_names.py /build
+# Deliberately NOT folded into the community strip block above: that block runs
+# before `COPY config/`, so there is nothing to swap there yet. The overlay
+# directory is removed in EVERY tier, so no image carries a stray
+# config/guidance/community/ path.
+#
+# GATED ON THE OVERLAY DIRECTORY, and that is load-bearing — WO-H137 all over
+# again if you change it. This Dockerfile is built in TWO different trees:
+#
+#   * THIS repository, where config/guidance/community/ exists and
+#     config/guidance/*.yaml are the estate versions. The swap must happen, and
+#     a listed file missing from an overlay that IS there is tampering — abort.
+#   * A SHIPPED community tarball, where build-source-package.sh already did the
+#     swap and then deleted the overlay. `docker compose up -d --build` on that
+#     tree is INSTALL.md's Option B, and CI runs exactly that (`A SHIPPED tree's
+#     Dockerfile really builds`). An unconditional `test -f overlay/...` would
+#     abort there, on a tree that is already correct — a shipped Dockerfile that
+#     cannot be built, which is the precise defect WO-H137 existed to fix.
+#
+# So: no overlay directory means the swap has already happened (or there is no
+# guidance at all) and this is a no-op. If someone deletes the overlay from THIS
+# repo to dodge the check, the artefact is still caught — by
+# scripts/check_community_tree.py in the publish gate and in CI, which asserts
+# on what came out rather than on what the build meant to do.
+RUN if [ "$BUILD_TIER" = "community" ] && [ -d config/guidance/community ]; then \
+      for g in escalation_logic.yaml rule_guidance.yaml; do \
+        test -f "config/guidance/$g" || continue; \
+        test -f "config/guidance/community/$g" || { \
+          echo "ERROR: community guidance overlay missing $g — refusing to ship the estate-derived config/guidance/$g"; \
+          exit 1; }; \
+        cp "config/guidance/community/$g" "config/guidance/$g"; \
+      done; \
+    fi; \
+    rm -rf config/guidance/community
+
+# (A private build-time integrity step runs here in the source repository.
+#  It is not part of a shipped tree: what you received was verified at the
+#  point it was composed, before publication.)
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM python:3.13-slim

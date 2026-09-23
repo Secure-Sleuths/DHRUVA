@@ -195,7 +195,15 @@ echo -e "${GREEN}$(printf '%.0s─' {1..50})${NC}"
 # the AR script it was first installed with. That mattered for WO-H68, where
 # the fix to that script is the entire work item. Fresh installs were fine;
 # upgrades silently were not.
-for dir in src scripts deploy; do
+# `web/` joined this list with WO-H137. The tarball now ships the SPA SOURCE,
+# because the Dockerfile's stage 0 is `COPY web/ ./` + `npm ci && npm run
+# build` and a package without it cannot be built at all. An install directory
+# is expected to stay image-buildable (this script already replaces Dockerfile,
+# docker-compose.yml and .dockerignore in it), so web/ has to be refreshed here
+# too — otherwise `docker compose up -d --build` after an upgrade rebuilds the
+# NEW backend around the OLD dashboard. Nothing user-editable lives in web/;
+# guarded by `-d` on the NEW tree, exactly like src/ and deploy/.
+for dir in src scripts deploy web; do
     if [[ -d "${NEW_DIR}/${dir}" ]]; then
         rm -rf "${INSTALL_DIR}/${dir}"
         cp -r "${NEW_DIR}/${dir}" "${INSTALL_DIR}/${dir}"

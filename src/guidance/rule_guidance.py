@@ -266,6 +266,28 @@ class RuleGuidance:
                     path=str(self.path), rules=len(self.rules),
                     signals=sum(len(r.signals) for r in self.rules.values()),
                     rejected=len(self.rejected))
+        if not self.rules:
+            # WO-H138. A file that parses but configures nothing is the shape of
+            # bug this module already has one of: config/guidance/shift_schedule
+            # ships `shifts: []` on purpose, and the silent `[]` it returned from
+            # get_on_duty_analysts() stopped incident auto-assignment with no
+            # word anywhere. The Community edition ships `rules: {}` here for the
+            # same honest reason — per-rule guidance is the most estate-specific
+            # knowledge in the platform and cannot be written against somebody
+            # else's network — so it must NOT repeat the silence.
+            #
+            # WARNING, not info: `loaded` and `loaded-but-empty` are operationally
+            # different states, and the second one means every `escalate` signal
+            # this file could carry is inactive. It is also reachable by accident
+            # — a paid install whose entries were all rejected lands here too,
+            # which is why `rejected` is on the event.
+            logger.warning(
+                "rule_guidance_empty",
+                path=str(self.path), rules=0, rejected=len(self.rejected),
+                detail="per-rule guidance loaded but configures no rules; "
+                       "deterministic per-rule signals are inactive until "
+                       "entries are added to this file",
+            )
         return self.state
 
     reload = load

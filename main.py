@@ -64,7 +64,7 @@ from src.database.tenant_registry import (
 # boot. Not paid-stripped, so a plain top-level import is safe.
 from src.database.tenant_crypto import encrypt_config, TenantCryptoError
 from src.guidance.loader import GuidanceLoader
-from src.api.server import app, init_api
+from src.api.server import app, init_api, register_shutdown_hook
 
 # Optional paid modules — imported at runtime if available
 def _try_import(module, name, *, paid: bool = False):
@@ -92,6 +92,19 @@ if AlertBuffer is None:
     # Community build — src/pipeline/ is stripped. Fall back to the bounded
     # in-memory ring so transient OpenSearch failures don't drop alerts.
     from src.enrichment.inmem_buffer import InMemoryAlertBuffer as AlertBuffer
+
+
+# WO-H9: how long ``stop()`` waits for in-flight triage to finish and
+# checkpoint itself. BOTH ENDS matter. Too short and an alert loses its
+# decision and its checkpoint; UNBOUNDED and systemd's TimeoutStopSec (90s by
+# default) SIGKILLs the process mid-write, which is the failure that kept the
+# unit landing in `failed`. 15s covers a normal in-flight triage with room to
+# spare and still leaves the systemd budget untouched.
+TRIAGE_DRAIN_TIMEOUT_S = 15.0
+
+#: systemd's default ``TimeoutStopSec``. The drain deadline must stay under it
+#: — see ``tests/test_graceful_shutdown_no_db.py``.
+SYSTEMD_DEFAULT_TIMEOUT_STOP_S = 90.0
 
 
 class AISocPlatform:
@@ -2043,10 +2056,16 @@ class AISocPlatform:
         # TimeoutStopSec and SIGKILLed the process ("Failed with result
         # 'timeout'"), which is why the unit kept landing in `failed`.
         #
-        # Registering stop() as an ASGI shutdown handler is the reliable hook:
-        # uvicorn runs it during graceful shutdown regardless of who owns the
-        # signal handlers.
-        app.add_event_handler("shutdown", self.stop)
+        # Registering stop() as an ASGI shutdown hook is the reliable answer:
+        # uvicorn runs the lifespan's shutdown during graceful shutdown
+        # regardless of who owns the signal handlers.
+        #
+        # WO-H136: this used to be `app.add_event_handler("shutdown", ...)`,
+        # which starlette 1.x REMOVED — an AttributeError on the line before
+        # uvicorn.run(), i.e. after the dispatcher and the alert loop are
+        # already running: ingesting but not serving. The hook list is ours
+        # now (src/api/app.py), and src/api/app.py's lifespan runs it.
+        register_shutdown_hook(app, self.stop)
 
         uvicorn.run(app, **uvicorn_kwargs)
 
@@ -2067,7 +2086,8 @@ class AISocPlatform:
         # restart — never silently dropped).
         if hasattr(self, "triage_dispatcher"):
             try:
-                self.triage_dispatcher.stop(drain=True, timeout=15.0)
+                self.triage_dispatcher.stop(drain=True,
+                                            timeout=TRIAGE_DRAIN_TIMEOUT_S)
             except Exception:
                 pass
         logger.info("platform_stopped")

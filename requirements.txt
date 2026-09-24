@@ -34,7 +34,15 @@ apscheduler==3.10.4
 
 # API Server
 fastapi==0.136.1
-starlette==0.49.1
+# WO-H136: 1.3.1 clears all five open starlette advisories (GHSA-82w8-qh3p-5jfq
+# is the one that needs 1.3.1 exactly; the others patch at 1.0.1/1.1.0/1.3.0).
+# It was held at 0.49.1 because 1.x removed add_event_handler, which main.py
+# used to register the WO-H9 drain -- that registration now goes through
+# src.api.app.register_shutdown_hook and depends on no removed API. fastapi
+# declares starlette>=0.46.0 with NO upper bound, so nothing here is checked by
+# the resolver: tests/test_dependency_floors_h133.py runs the drain against the
+# INSTALLED starlette instead.
+starlette==1.3.1
 uvicorn[standard]==0.34.0
 PyJWT==2.13.0
 python-multipart==0.0.31

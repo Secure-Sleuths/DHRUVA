@@ -1,6 +1,6 @@
 platform:
   name: SecureSleuths DHRUVA
-  version: 5.3.1
+  version: 5.3.2
   log_level: INFO
   data_dir: /var/lib/ai-soc
 licensing:

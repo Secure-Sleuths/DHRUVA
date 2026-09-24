@@ -5,6 +5,8 @@ and includes all route modules.
 
 import contextlib
 import os
+from typing import Any, Callable
+
 import structlog
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -71,37 +73,95 @@ def _cap_thread_limiter(intended: int) -> int:
         return _ANYIO_DEFAULT_THREADS
 
 
-async def _run_event_handlers(app: FastAPI, phase: str) -> None:
-    """Run handlers registered via ``app.add_event_handler(phase, ...)``.
+# ---------------------------------------------------------------------------
+# Shutdown hooks (WO-H136, replacing the WO-H67/H78 event-handler indirection)
+# ---------------------------------------------------------------------------
+# THE TRAP, which is the same one it always was:
+#
+#   Supplying a custom ``lifespan=`` REPLACES Starlette's ``_DefaultLifespan``,
+#   and that default is the ONLY thing that runs the router's ``on_startup`` /
+#   ``on_shutdown`` lists. So the moment this module grew a lifespan (for the
+#   anyio threadpool cap), anything registered the legacy way was silently
+#   unregistered — including ``main.py``'s shutdown hook, the WO-H9 bounded
+#   drain of the triage worker pool, whose absence cost alerts their decision
+#   AND their checkpoint and then had systemd SIGKILL the process on
+#   TimeoutStopSec. Nothing failed loudly. The server booted, served, and lost
+#   work only on the way out.
+#
+# It used to be answered by replaying ``app.router.on_{phase}`` from inside the
+# lifespan — which kept the drain alive but kept us tied to the legacy
+# registration API. Measured on fastapi 0.136.1 + starlette 1.3.1:
+#
+#   app.add_event_handler        REMOVED  -> AttributeError at registration
+#   app.on_event                 present, still fires (FastAPI shim, deprecated)
+#   app.router.on_startup/_down  present, still fire (FastAPI shim, deprecated)
+#   Starlette(on_shutdown=[...]) REJECTED: unexpected keyword argument
+#
+# The registration half is fatal on 1.x, and everything still standing is a
+# deprecated FastAPI compatibility shim over an API starlette itself deleted.
+# So the hook list is ours now: registered on ``app.state``, run by the
+# lifespan below. No removed API on either side of the handshake, and the
+# lifespan owns startup/shutdown outright rather than racing a default it has
+# already replaced.
+_SHUTDOWN_HOOKS = "dhruva_shutdown_hooks"
 
-    Supplying a custom ``lifespan=`` REPLACES Starlette's ``_DefaultLifespan``,
-    and that default is the only thing that runs the router's ``on_startup`` /
-    ``on_shutdown`` lists. Without this, adding a lifespan here would silently
-    unregister ``main.py``'s shutdown hook — the WO-H9 bounded drain of the
-    triage worker pool, whose absence previously cost alerts their decision and
-    their checkpoint, then had systemd SIGKILL the process on TimeoutStopSec.
 
-    Nothing would have failed loudly. The server would boot, serve, and lose
-    work only on the way out.
+def register_shutdown_hook(app: FastAPI, hook: Callable[[], Any]) -> None:
+    """Register ``hook`` to run during the app's ASGI shutdown phase.
+
+    This is how ``main.py`` attaches the WO-H9 bounded drain: uvicorn runs the
+    lifespan's shutdown on graceful stop regardless of who owns the process
+    signal handlers, which ``uvicorn.run()`` itself takes over (WO-H67).
+
+    Sync and async hooks are both accepted. Hooks run in registration order.
     """
+    hooks = getattr(app.state, _SHUTDOWN_HOOKS, None)
+    if hooks is None:
+        hooks = []
+        setattr(app.state, _SHUTDOWN_HOOKS, hooks)
+    hooks.append(hook)
+
+
+async def _run_shutdown_hooks(app: FastAPI) -> None:
+    """Run every hook registered via :func:`register_shutdown_hook`."""
     import inspect as _inspect
 
-    for handler in list(getattr(app.router, f"on_{phase}", []) or []):
+    for hook in list(getattr(app.state, _SHUTDOWN_HOOKS, None) or []):
         try:
-            result = handler()
+            result = hook()
             if _inspect.isawaitable(result):
                 await result
         except Exception as exc:                   # noqa: BLE001
             # Matches Starlette's own posture: one bad handler must not take
             # down the others, and on shutdown there is nothing left to abort.
-            logger.error("lifespan_event_handler_failed", phase=phase,
-                         handler=getattr(handler, "__name__", repr(handler)),
+            logger.error("shutdown_hook_failed",
+                         hook=getattr(hook, "__name__", repr(hook)),
                          error=str(exc)[:200])
+
+
+def _warn_about_legacy_event_handlers(app: FastAPI) -> None:
+    """Say so, loudly, if anyone registers a startup/shutdown the old way.
+
+    A custom ``lifespan=`` swallows ``@app.on_event`` / ``app.router.on_*``
+    registrations without a word. That silence is what nearly cost the WO-H9
+    drain twice. This cannot run them — doing so is the indirection WO-H136
+    deleted — but it refuses to let them disappear quietly.
+    """
+    for phase in ("startup", "shutdown"):
+        handlers = list(getattr(app.router, f"on_{phase}", None) or [])
+        if handlers:
+            logger.error(
+                "legacy_event_handlers_ignored", phase=phase,
+                handlers=[getattr(h, "__name__", repr(h)) for h in handlers],
+                msg="Registered via the deprecated on_event/router.on_* API, "
+                    "which this app's custom lifespan replaces — they will "
+                    "NOT run. Use src.api.app.register_shutdown_hook().")
 
 
 @contextlib.asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Apply the threadpool cap, then re-check the DB pool against reality."""
+    """Apply the threadpool cap, re-check the DB pool against reality, and run
+    the registered shutdown hooks on the way out (WO-H9's bounded drain)."""
     from src.api import dependencies as deps
 
     cfg = deps._config or {}
@@ -121,11 +181,11 @@ async def _lifespan(app: FastAPI):
                                       .get("max_workers", 10)),
             )
 
-    await _run_event_handlers(app, "startup")
+    _warn_about_legacy_event_handlers(app)
     try:
         yield
     finally:
-        await _run_event_handlers(app, "shutdown")
+        await _run_shutdown_hooks(app)
 
 
 # ---------------------------------------------------------------------------
